@@ -55,6 +55,22 @@ export interface FolderHubSettings {
 	branchDirections: Record<string, string>;
 	/** Colour-group queries this plugin wrote to graph.json (so it can replace them). */
 	managedGraphQueries: string[];
+
+	// Branch levels
+	branchLevels: boolean;
+
+	// Graph effects
+	fxEnabled: boolean;
+	fxColor: string;
+	fxInterval: number;
+	fxRing: boolean;
+	fxWave: boolean;
+	fxGlow: boolean;
+	linkFlow: "off" | "all" | "hubs";
+	linkFlowColor: string;
+	linkFlowSpeed: number;
+	graphGrow: boolean;
+	graphFreeze: boolean;
 }
 
 export const DEFAULT_NOTE_TEMPLATE = `---
@@ -112,6 +128,20 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	skillTreePinFiles: false,
 	branchDirections: {},
 	managedGraphQueries: [],
+
+	branchLevels: true,
+
+	fxEnabled: true,
+	fxColor: "#e5a50a",
+	fxInterval: 4,
+	fxRing: true,
+	fxWave: true,
+	fxGlow: false,
+	linkFlow: "hubs",
+	linkFlowColor: "#9a9a9a",
+	linkFlowSpeed: 30,
+	graphGrow: true,
+	graphFreeze: false,
 };
 
 export class FolderHubSettingTab extends PluginSettingTab {
@@ -612,6 +642,143 @@ export class FolderHubSettingTab extends PluginSettingTab {
 				);
 			}
 		}
+
+		// ------------------------------------------------------------------
+		new Setting(containerEl).setName("Граф: эффекты").setHeading();
+
+		new Setting(containerEl)
+			.setName("Эффекты в графе")
+			.setDesc("Рисуются поверх графа, сам граф не меняется. Отключаются вместе с общим переключателем «Анимации».")
+			.addToggle((t) =>
+				t.setValue(s.fxEnabled).onChange(async (v) => {
+					s.fxEnabled = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Цвет импульса")
+			.addColorPicker((c) =>
+				c.setValue(s.fxColor).onChange(async (v) => {
+					s.fxColor = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Интервал импульса, секунд")
+			.addSlider((sl) =>
+				sl
+					.setLimits(1, 20, 1)
+					.setValue(s.fxInterval)
+					.setDynamicTooltip()
+					.onChange(async (v) => {
+						s.fxInterval = v;
+						await save();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Кольцо")
+			.setDesc("От главного файла расходится кольцо.")
+			.addToggle((t) =>
+				t.setValue(s.fxRing).onChange(async (v) => {
+					s.fxRing = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Волна по ветке")
+			.setDesc("Искра бежит от главного файла по связям к файлам и подпапкам, дальше — глубже по ветке.")
+			.addToggle((t) =>
+				t.setValue(s.fxWave).onChange(async (v) => {
+					s.fxWave = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Свечение")
+			.setDesc("Главные файлы мягко «дышат» светом.")
+			.addToggle((t) =>
+				t.setValue(s.fxGlow).onChange(async (v) => {
+					s.fxGlow = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Анимация связей")
+			.setDesc("По линиям бегут штрихи в направлении ссылки — как анимированные стрелки.")
+			.addDropdown((d) =>
+				d
+					.addOptions({ off: "Статично", hubs: "Только от главных файлов", all: "Все связи" })
+					.setValue(s.linkFlow)
+					.onChange(async (v) => {
+						s.linkFlow = v as FolderHubSettings["linkFlow"];
+						await save();
+						this.display();
+					}),
+			);
+
+		if (s.linkFlow !== "off") {
+			new Setting(containerEl)
+				.setName("Цвет и скорость потока")
+				.addColorPicker((c) =>
+					c.setValue(s.linkFlowColor).onChange(async (v) => {
+						s.linkFlowColor = v;
+						await save();
+					}),
+				)
+				.addSlider((sl) =>
+					sl
+						.setLimits(5, 120, 5)
+						.setValue(s.linkFlowSpeed)
+						.setDynamicTooltip()
+						.onChange(async (v) => {
+							s.linkFlowSpeed = v;
+							await save();
+						}),
+				);
+		}
+
+		new Setting(containerEl)
+			.setName("Рост дерева при открытии")
+			.setDesc("Узлы вырастают из центра ветка за веткой, уровень за уровнем (нужна раскладка ветками).")
+			.addToggle((t) =>
+				t.setValue(s.graphGrow).onChange(async (v) => {
+					s.graphGrow = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Заморозить граф")
+			.setDesc("Когда узлы улягутся, они перестают двигаться. Меньше нагрузка на телефон. Эффекты продолжают работать.")
+			.addToggle((t) =>
+				t.setValue(s.graphFreeze).onChange(async (v) => {
+					s.graphFreeze = v;
+					await save();
+				}),
+			);
+
+		// ------------------------------------------------------------------
+		new Setting(containerEl).setName("Уровни веток").setHeading();
+
+		new Setting(containerEl)
+			.setName("Показывать уровень ветки")
+			.setDesc(
+				"Опыт ветки = слова во всех её заметках + 25 за каждую заметку. Карточка уровня появляется в начале списка " +
+					"главного файла, в панели календаря — список веток. При повышении уровня — уведомление и вспышка в графе.",
+			)
+			.addToggle((t) =>
+				t.setValue(s.branchLevels).onChange(async (v) => {
+					s.branchLevels = v;
+					await save();
+					await this.plugin.updateAll(false);
+				}),
+			);
 
 		// ------------------------------------------------------------------
 		new Setting(containerEl).setName("Действия").setHeading();

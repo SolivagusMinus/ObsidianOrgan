@@ -10,7 +10,7 @@ import { DIRECTIONS, LayoutOptions, Point, TreeNode, layoutSkillTree } from "./s
 // ---------------------------------------------------------------------------
 
 interface GraphRenderer {
-	nodes?: { id: string }[];
+	nodes?: { id: string; x: number; y: number }[];
 	nodeLookup?: Record<string, unknown>;
 	worker?: Worker;
 	setData?: (data: unknown) => void;
@@ -49,6 +49,12 @@ export class GraphTree {
 	private pinned = new Map<GraphRenderer, Set<string>>();
 	private timers = new Map<GraphRenderer, number>();
 	private refreshTimer: number | null = null;
+	/** Renderers that already played the "grow" animation. */
+	private grown = new WeakSet<GraphRenderer>();
+	private growing = new Map<GraphRenderer, number>();
+	private frozen = new Map<GraphRenderer, Set<string>>();
+	private freezeTimers = new Map<GraphRenderer, number>();
+	private depthCache: { hubs: Map<string, number>; all: Map<string, number> } | null = null;
 
 	constructor(private plugin: FolderHubPlugin) {}
 
@@ -60,7 +66,10 @@ export class GraphTree {
 		const p = this.plugin;
 		p.registerEvent(this.app.workspace.on("layout-change", () => this.scan()));
 		const onTreeChange = (f: unknown) => {
-			if (f instanceof TFolder || (f instanceof TFile && f.extension === "md")) this.refreshSoon();
+			if (f instanceof TFolder || (f instanceof TFile && f.extension === "md")) {
+				this.depthCache = null;
+				this.refreshSoon();
+			}
 		};
 		p.registerEvent(this.app.vault.on("create", onTreeChange));
 		p.registerEvent(this.app.vault.on("delete", onTreeChange));
@@ -71,7 +80,10 @@ export class GraphTree {
 	}
 
 	stop() {
+		this.growing.forEach((id) => window.cancelAnimationFrame(id));
+		this.freezeTimers.forEach((t) => window.clearTimeout(t));
 		for (const r of [...this.originals.keys()]) {
+			this.unfreeze(r);
 			this.unpinAll(r);
 			const orig = this.originals.get(r);
 			if (orig) r.setData = orig;
@@ -84,6 +96,7 @@ export class GraphTree {
 
 	/** Re-applies the layout to every open global graph. */
 	refresh() {
+		this.depthCache = null;
 		this.scan();
 		for (const r of this.originals.keys()) this.schedule(r);
 	}
@@ -156,8 +169,20 @@ export class GraphTree {
 			if (tries < 20) this.schedule(r, tries + 1, 250);
 			return;
 		}
+		const s = this.plugin.settings;
 		const prev = this.pinned.get(r) ?? new Set<string>();
-		const target = this.plugin.settings.skillTreeEnabled ? this.positions() : new Map<string, Point>();
+		const target = s.skillTreeEnabled ? this.positions() : new Map<string, Point>();
+
+		// First time this graph shows the tree: let it grow out of the centre.
+		const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+		if (target.size && !this.grown.has(r) && s.graphGrow && s.animations && !reduced) {
+			this.grown.add(r);
+			this.animateGrow(r, target);
+			return;
+		}
+		this.grown.add(r);
+		if (this.growing.has(r)) return; // the running animation will finish the job
+
 		const now = new Set<string>();
 		for (const [id, p] of target) {
 			if (!this.hasNode(r, id)) continue;
@@ -169,6 +194,72 @@ export class GraphTree {
 		}
 		this.pinned.set(r, now);
 		if (now.size || prev.size) this.reheat(r);
+		this.scheduleFreeze(r);
+	}
+
+	/** Branch by branch, level by level: nodes glide from the centre to their places. */
+	private animateGrow(r: GraphRenderer, target: Map<string, Point>) {
+		const depth = this.depths().all;
+		const ids = [...target.keys()].filter((id) => this.hasNode(r, id));
+		const pinned = new Set(ids);
+		for (const id of this.pinned.get(r) ?? []) {
+			if (!pinned.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+		}
+		this.pinned.set(r, pinned);
+		const DUR = 650;
+		const STAGGER = 380;
+		const t0 = performance.now();
+		const ease = (k: number) => 1 - Math.pow(1 - k, 3);
+		const step = (now: number) => {
+			let done = true;
+			for (const id of ids) {
+				const p = target.get(id)!;
+				const k = Math.min(1, Math.max(0, (now - t0 - ((depth.get(id) ?? 1) - 1) * STAGGER) / DUR));
+				if (k < 1) done = false;
+				const e = ease(k);
+				this.post(r, { forceNode: { id, x: p.x * e, y: p.y * e } });
+			}
+			if (done) {
+				this.growing.delete(r);
+				this.scheduleFreeze(r);
+			} else {
+				this.growing.set(r, window.requestAnimationFrame(step));
+			}
+		};
+		this.reheat(r);
+		this.growing.set(r, window.requestAnimationFrame(step));
+	}
+
+	/** "Frozen" graph: once nodes have settled, pin every node where it is. */
+	private scheduleFreeze(r: GraphRenderer) {
+		const t = this.freezeTimers.get(r);
+		if (t !== undefined) window.clearTimeout(t);
+		if (!this.plugin.settings.graphFreeze) {
+			this.unfreeze(r);
+			return;
+		}
+		this.freezeTimers.set(
+			r,
+			window.setTimeout(() => {
+				this.freezeTimers.delete(r);
+				const pins = this.pinned.get(r) ?? new Set<string>();
+				const set = new Set<string>();
+				for (const n of r.nodes ?? []) {
+					if (pins.has(n.id) || typeof n.x !== "number") continue;
+					this.post(r, { forceNode: { id: n.id, x: n.x, y: n.y } });
+					set.add(n.id);
+				}
+				this.frozen.set(r, set);
+			}, 3000),
+		);
+	}
+
+	private unfreeze(r: GraphRenderer) {
+		const set = this.frozen.get(r);
+		if (!set?.size) return;
+		for (const id of set) this.post(r, { forceNode: { id, x: null, y: null } });
+		this.frozen.delete(r);
+		this.reheat(r);
 	}
 
 	private unpinAll(r: GraphRenderer) {
@@ -228,6 +319,27 @@ export class GraphTree {
 			pinFiles: s.skillTreePinFiles,
 			directions,
 		};
+	}
+
+	/** Depth of every index note (1 = top-level branch) and of pinned files. */
+	private depths(): { hubs: Map<string, number>; all: Map<string, number> } {
+		if (this.depthCache) return this.depthCache;
+		const hubs = new Map<string, number>();
+		const all = new Map<string, number>();
+		const walk = (n: TreeNode, d: number) => {
+			hubs.set(n.id, d);
+			all.set(n.id, d);
+			for (const f of n.files) all.set(f, d + 0.5);
+			n.children.forEach((c) => walk(c, d + 1));
+		};
+		this.buildTree().forEach((r) => walk(r, 1));
+		this.depthCache = { hubs, all };
+		return this.depthCache;
+	}
+
+	/** Index notes and their depth in the folder tree (used by graph effects). */
+	hubDepths(): Map<string, number> {
+		return this.depths().hubs;
 	}
 
 	positions(): Map<string, Point> {

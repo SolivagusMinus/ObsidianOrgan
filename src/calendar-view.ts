@@ -31,6 +31,7 @@ export class CalendarView extends ItemView {
 	private weekEl!: HTMLElement;
 	private gridWrap!: HTMLElement;
 	private detailsEl!: HTMLElement;
+	private branchesEl: HTMLElement | null = null;
 	private cells = new Map<string, HTMLElement>();
 
 	constructor(leaf: WorkspaceLeaf, private plugin: FolderHubPlugin) {
@@ -86,6 +87,8 @@ export class CalendarView extends ItemView {
 		this.renderToday(root.createDiv({ cls: "fh-card fh-today" }));
 		this.weekEl = root.createDiv({ cls: "fh-card fh-week" });
 		this.renderWeek(true);
+		this.branchesEl = root.createDiv({ cls: "fh-card fh-branches" });
+		this.renderBranches(true);
 		const monthCard = root.createDiv({ cls: "fh-card fh-month" });
 		this.renderMonthHeader(monthCard);
 		this.gridWrap = monthCard.createDiv({ cls: "fh-grid-wrap" });
@@ -244,6 +247,46 @@ export class CalendarView extends ItemView {
 			bar.style.height = v > 0 ? `max(4px, ${(v / max) * 100}%)` : "0";
 			bar.toggleClass("is-done", goal > 0 && v >= goal);
 			setTooltip(col, `${moment(keys[i], KEY).format("dd, D MMM")}: ${v.toLocaleString()} ${pluralRu(v, WORDS)}`);
+		});
+	}
+
+	/** Top-level branches with their level and XP bar. */
+	renderBranches(initial = false) {
+		const el = this.branchesEl;
+		if (!el) return;
+		const list = this.plugin.settings.branchLevels ? this.plugin.levels.topBranches().slice(0, 10) : [];
+		el.toggle(list.length > 0);
+		if (!list.length) return;
+
+		el.empty();
+		const head = el.createDiv({ cls: "fh-row-between" });
+		head.createDiv({ cls: "fh-title", text: "Ветки" });
+		if (!this.plugin.tracker.ready) head.createDiv({ cls: "fh-muted", text: "подсчёт…" });
+
+		list.forEach((b, i) => {
+			const row = el.createDiv({ cls: "fh-branch-row" });
+			row.style.setProperty("--i", String(i));
+			row.createSpan({ cls: "fh-level-sub-badge", text: String(b.info.level) });
+			const mid = row.createDiv({ cls: "fh-branch-mid" });
+			mid.createDiv({ cls: "fh-branch-name", text: b.folder.name });
+			const fill = mid.createDiv({ cls: "fh-level-bar is-small" }).createDiv({ cls: "fh-level-fill" });
+			const pct = `${Math.round(b.info.progress * 100)}%`;
+			if (initial && this.animated) {
+				fill.style.width = "0%";
+				window.requestAnimationFrame(() => window.requestAnimationFrame(() => (fill.style.width = pct)));
+			} else {
+				fill.style.width = pct;
+			}
+			row.createSpan({ cls: "fh-muted fh-branch-xp", text: `${b.info.xp.toLocaleString()} XP` });
+			setTooltip(
+				row,
+				`Уровень ${b.info.level}: ${b.info.xp.toLocaleString()} / ${b.info.next.toLocaleString()} XP · ` +
+					`${b.notes} ${pluralRu(b.notes, NOTES)} · ${b.words.toLocaleString()} ${pluralRu(b.words, WORDS)}`,
+			);
+			row.addEventListener("click", () => {
+				const index = this.plugin.findIndex(b.folder);
+				if (index) void this.app.workspace.getLeaf(false).openFile(index);
+			});
 		});
 	}
 

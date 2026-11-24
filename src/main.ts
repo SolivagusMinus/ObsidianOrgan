@@ -11,7 +11,10 @@ import {
 	setTooltip,
 } from "obsidian";
 import { CalendarView, VIEW_TYPE_CALENDAR } from "./calendar-view";
+import { BranchLevels } from "./branch-levels";
 import { GraphTree } from "./graph";
+import { GraphFx } from "./graph-fx";
+import { LEVEL_FENCE, stripLevelFence } from "./levels";
 import { WordTracker } from "./tracker";
 import { StatsData, pluralRu } from "./words";
 import {
@@ -39,6 +42,8 @@ export default class FolderHubPlugin extends Plugin {
 	wordStats: StatsData = {};
 	tracker = new WordTracker(this);
 	graphTree = new GraphTree(this);
+	graphFx = new GraphFx(this);
+	levels = new BranchLevels(this);
 
 	private statusEl: HTMLElement | null = null;
 	private saveStatsTimer: number | null = null;
@@ -55,6 +60,8 @@ export default class FolderHubPlugin extends Plugin {
 
 		this.styleEl = document.head.createEl("style", { attr: { id: "folder-hub-dynamic" } });
 		this.register(() => this.styleEl?.remove());
+
+		this.levels.start();
 
 		// ---- Calendar & daily word counter
 		this.registerView(VIEW_TYPE_CALENDAR, (leaf) => new CalendarView(leaf, this));
@@ -157,6 +164,7 @@ export default class FolderHubPlugin extends Plugin {
 			this.tracker.start();
 			this.updateStatusBar();
 			this.graphTree.start();
+			this.graphFx.start();
 			// Catch up with changes made while Obsidian was closed.
 			void this.updateAll(false);
 			this.refreshHighlight();
@@ -194,6 +202,7 @@ export default class FolderHubPlugin extends Plugin {
 		await this.persist();
 		this.refreshHighlight();
 		this.updateStatusBar();
+		this.graphFx.sync();
 		const treeSig = this.treeSignature();
 		if (treeSig !== this.lastTreeSig) {
 			this.lastTreeSig = treeSig;
@@ -213,7 +222,7 @@ export default class FolderHubPlugin extends Plugin {
 		const s = this.settings;
 		return JSON.stringify([
 			s.skillTreeEnabled, s.skillTreeStyle, s.skillTreeStep, s.skillTreeSpread,
-			s.skillTreePinFiles, s.branchDirections, s.indexName, s.excludedFolders,
+			s.skillTreePinFiles, s.branchDirections, s.indexName, s.excludedFolders, s.graphFreeze,
 		]);
 	}
 	private calendarSignature(): string {
@@ -474,16 +483,20 @@ export default class FolderHubPlugin extends Plugin {
 
 	private computeBody(index: TFile, items: Item[], content: string, force: boolean): string[] {
 		const opts = this.renderOptions();
-		const existing = extractBlockBody(content);
+		const raw = extractBlockBody(content);
+		const existing = raw ? stripLevelFence(raw) : null;
 		const preserve =
 			!force && this.settings.preserveEdits && this.settings.layout !== "table" && existing !== null;
-		if (!preserve) return renderItems(items, opts);
-		return mergePreserving(
-			existing,
-			items,
-			(linkpath) => this.app.metadataCache.getFirstLinkpathDest(linkpath, index.path)?.path ?? null,
-			opts,
-		);
+		const body = preserve
+			? mergePreserving(
+					existing,
+					items,
+					(linkpath) => this.app.metadataCache.getFirstLinkpathDest(linkpath, index.path)?.path ?? null,
+					opts,
+				)
+			: renderItems(items, opts);
+		// The level card is a constant code block, so it never causes extra writes.
+		return this.settings.branchLevels ? [...LEVEL_FENCE, ...body] : body;
 	}
 
 	/** Rewrites the managed block of the folder's index note. Returns true if it changed. */

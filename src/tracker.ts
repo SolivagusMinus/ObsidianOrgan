@@ -14,6 +14,8 @@ export const todayKey = () => moment().format("YYYY-MM-DD");
  */
 export class WordTracker {
 	private baselines = new Map<string, number>();
+	/** True once every note in the vault has been counted (needed for branch levels). */
+	ready = false;
 
 	constructor(private plugin: FolderHubPlugin) {}
 
@@ -21,9 +23,19 @@ export class WordTracker {
 		const { app } = this.plugin;
 		const p = this.plugin;
 		p.registerEvent(app.workspace.on("file-open", (f) => f && void this.ensureBaseline(f)));
-		p.registerEvent(app.vault.on("create", (f) => void this.ensureBaseline(f)));
+		p.registerEvent(
+			app.vault.on("create", async (f) => {
+				await this.ensureBaseline(f);
+				if (f instanceof TFile) this.plugin.levels.onWordsUpdated(f);
+			}),
+		);
 		p.registerEvent(app.vault.on("modify", (f) => void this.onModify(f)));
-		p.registerEvent(app.vault.on("delete", (f) => this.baselines.delete(f.path)));
+		p.registerEvent(
+			app.vault.on("delete", (f) => {
+				this.baselines.delete(f.path);
+				this.plugin.levels.scheduleRefresh();
+			}),
+		);
 		p.registerEvent(
 			app.vault.on("rename", (f, old) => {
 				const v = this.baselines.get(old);
@@ -35,6 +47,23 @@ export class WordTracker {
 		app.workspace.iterateAllLeaves((leaf) => {
 			if (leaf.view instanceof MarkdownView && leaf.view.file) void this.ensureBaseline(leaf.view.file);
 		});
+		// Count every note in the background, a few at a time, for branch levels.
+		window.setTimeout(() => void this.warmUp(), 1500);
+	}
+
+	private async warmUp() {
+		const files = this.plugin.app.vault.getMarkdownFiles();
+		for (let i = 0; i < files.length; i++) {
+			await this.ensureBaseline(files[i]);
+			if (i % 40 === 39) await new Promise((r) => window.setTimeout(r, 0));
+		}
+		this.ready = true;
+		this.plugin.levels.onReady();
+	}
+
+	/** Last known word count of a note, or undefined if not counted yet. */
+	wordsOf(path: string): number | undefined {
+		return this.baselines.get(path);
 	}
 
 	today(): DayStat {
@@ -58,11 +87,13 @@ export class WordTracker {
 	}
 
 	private async onModify(f: TAbstractFile) {
-		if (!this.isMd(f) || !this.plugin.settings.wordCountEnabled) return;
+		if (!this.isMd(f)) return;
 		const n = countWords(await this.plugin.app.vault.read(f));
 		const prev = this.baselines.get(f.path);
 		this.baselines.set(f.path, n);
-		if (prev === undefined || n === prev) return;
+		if (n === prev) return;
+		this.plugin.levels.onWordsUpdated(f);
+		if (prev === undefined || !this.plugin.settings.wordCountEnabled) return;
 		if (!this.isOpenInEditor(f) || this.plugin.isIndexNote(f)) return;
 
 		const key = todayKey();

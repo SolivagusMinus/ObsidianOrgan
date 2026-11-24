@@ -193,3 +193,28 @@ test("up style grows upward, files fan when pinned", () => {
 	assert.ok(pos.has("A1/f0.md") && pos.has("A1/f2.md"));
 	assert.ok(pos.get("A1/f1.md")!.y < pos.get("A1/A1.md")!.y, "files above their node");
 });
+
+// ---------------------------------------------------------------- levels
+import { LEVEL_FENCE, branchXp, levelFromXp, stripLevelFence, xpForLevel } from "../src/levels";
+
+test("level thresholds grow and progress is inside the level", () => {
+	assert.deepEqual([1, 2, 3, 4, 5].map(xpForLevel), [200, 600, 1200, 2000, 3000]);
+	assert.equal(levelFromXp(0).level, 0);
+	assert.equal(levelFromXp(199).level, 0);
+	assert.equal(levelFromXp(200).level, 1);
+	assert.equal(levelFromXp(1999).level, 3);
+	const l = levelFromXp(1600);
+	assert.equal(l.level, 3);
+	assert.equal(l.progress, 0.5);
+	assert.equal(branchXp(1000, 4), 1100);
+	for (let xp = 0; xp < 50000; xp += 137) {
+		const i = levelFromXp(xp);
+		assert.ok(i.floor <= xp && xp < i.next && i.progress >= 0 && i.progress < 1);
+	}
+});
+
+test("level fence is stripped wherever it is, other lines kept", () => {
+	const body = ["- [[A]]", ...LEVEL_FENCE, "text", ...LEVEL_FENCE];
+	assert.deepEqual(stripLevelFence([...LEVEL_FENCE, ...body]), ["- [[A]]", "text"]);
+	assert.deepEqual(stripLevelFence(["```", "```folder-hub-level"]), ["```", "```folder-hub-level"]);
+});

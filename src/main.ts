@@ -65,7 +65,7 @@ export default class FolderHubPlugin extends Plugin {
 
 		// ---- Calendar & daily word counter
 		this.registerView(VIEW_TYPE_CALENDAR, (leaf) => new CalendarView(leaf, this));
-		this.addRibbonIcon("calendar-days", "Календарь и счётчик слов", () => void this.activateCalendar());
+		this.addRibbonIcon("calendar-days", "ObsOrg: календарь и счётчик слов", () => void this.activateCalendar());
 		this.addCommand({
 			id: "toggle-skill-tree",
 			name: "Граф: включить/выключить дерево прокачки",
@@ -77,7 +77,7 @@ export default class FolderHubPlugin extends Plugin {
 		});
 		this.addCommand({
 			id: "open-calendar",
-			name: "Открыть календарь и счётчик слов",
+			name: "Календарь: открыть календарь и счётчик слов",
 			callback: () => void this.activateCalendar(),
 		});
 		this.statusEl = this.addStatusBarItem();
@@ -86,7 +86,7 @@ export default class FolderHubPlugin extends Plugin {
 
 		this.addCommand({
 			id: "create-index-current-folder",
-			name: "Создать/обновить главный файл в папке текущей заметки",
+			name: "Папки: создать/обновить главный файл в папке текущей заметки",
 			checkCallback: (checking) => {
 				const folder = this.app.workspace.getActiveFile()?.parent;
 				if (!folder || folder.isRoot()) return false;
@@ -96,7 +96,7 @@ export default class FolderHubPlugin extends Plugin {
 		});
 		this.addCommand({
 			id: "open-index-current-folder",
-			name: "Открыть главный файл текущей папки",
+			name: "Папки: открыть главный файл текущей папки",
 			checkCallback: (checking) => {
 				const folder = this.app.workspace.getActiveFile()?.parent;
 				const index = folder && !folder.isRoot() ? this.findIndex(folder) : null;
@@ -107,23 +107,23 @@ export default class FolderHubPlugin extends Plugin {
 		});
 		this.addCommand({
 			id: "create-index-all-folders",
-			name: "Создать главные файлы во всех папках хранилища",
+			name: "Папки: создать главные файлы во всех папках хранилища",
 			callback: () => void this.createAll(),
 		});
 		this.addCommand({
 			id: "update-all-indexes",
-			name: "Обновить все главные файлы",
+			name: "Папки: обновить все главные файлы",
 			callback: async () => {
 				const n = await this.updateAll(false);
-				new Notice(`Folder Hub: обновлено файлов — ${n}`);
+				new Notice(`ObsOrg: обновлено файлов — ${n}`);
 			},
 		});
 		this.addCommand({
 			id: "rebuild-all-indexes",
-			name: "Перестроить все главные файлы заново (сбросить правки внутри блока)",
+			name: "Папки: перестроить все главные файлы заново (сбросить правки внутри блока)",
 			callback: async () => {
 				const n = await this.updateAll(true);
-				new Notice(`Folder Hub: перестроено файлов — ${n}`);
+				new Notice(`ObsOrg: перестроено файлов — ${n}`);
 			},
 		});
 
@@ -345,7 +345,7 @@ export default class FolderHubPlugin extends Plugin {
 			// fileManager.renameFile also rewrites links to the note.
 			await this.app.fileManager.renameFile(oldIndex, newPath);
 		} catch (e) {
-			console.error("Folder Hub: failed to rename index", e);
+			console.error("ObsOrg: failed to rename index", e);
 		}
 	}
 
@@ -553,8 +553,8 @@ export default class FolderHubPlugin extends Plugin {
 				// Most likely the file appeared in the meantime (sync, double event).
 				const existing = this.app.vault.getAbstractFileByPath(path);
 				if (!(existing instanceof TFile)) {
-					console.error("Folder Hub: failed to create index", e);
-					new Notice(`Folder Hub: не удалось создать ${path}`);
+					console.error("ObsOrg: failed to create index", e);
+					new Notice(`ObsOrg: не удалось создать ${path}`);
 					return null;
 				}
 				index = existing;
@@ -598,7 +598,7 @@ export default class FolderHubPlugin extends Plugin {
 			if (this.isExcluded(folder) || this.findIndex(folder)) continue;
 			if (await this.createIndex(folder, false)) created++;
 		}
-		new Notice(`Folder Hub: создано главных файлов — ${created}`);
+		new Notice(`ObsOrg: создано главных файлов — ${created}`);
 	}
 
 	// ------------------------------------------------------------ highlight

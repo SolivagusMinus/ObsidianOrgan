@@ -154,7 +154,7 @@ export class GraphTree {
 		try {
 			r.worker?.postMessage(msg);
 		} catch (e) {
-			console.warn("Folder Hub: graph worker message failed", e);
+			console.warn("ObsOrg: graph worker message failed", e);
 		}
 	}
 
@@ -357,7 +357,7 @@ export class GraphTree {
 		const s = this.plugin.settings;
 		const tag = s.tag.replace(/^#/, "").trim();
 		if (addIndexGroup && !tag) {
-			if (notify) new Notice("Folder Hub: сначала укажите тег главных файлов.");
+			if (notify) new Notice("ObsOrg: сначала укажите тег главных файлов.");
 			return;
 		}
 		const adapter = this.app.vault.adapter;
@@ -366,8 +366,8 @@ export class GraphTree {
 		try {
 			if (await adapter.exists(path)) cfg = JSON.parse(await adapter.read(path));
 		} catch (e) {
-			console.error("Folder Hub: cannot read graph.json", e);
-			if (notify) new Notice("Folder Hub: не удалось прочитать настройки графа.");
+			console.error("ObsOrg: cannot read graph.json", e);
+			if (notify) new Notice("ObsOrg: не удалось прочитать настройки графа.");
 			return;
 		}
 
@@ -396,7 +396,7 @@ export class GraphTree {
 			await this.plugin.saveSettings();
 		}
 		if (notify) {
-			new Notice("Folder Hub: цвет главных файлов добавлен в граф. Закройте и снова откройте граф.", 8000);
+			new Notice("ObsOrg: цвет главных файлов добавлен в граф. Закройте и снова откройте граф.", 8000);
 		}
 	}
 }

@@ -1059,7 +1059,7 @@ var GraphTree = class {
     try {
       r.worker?.postMessage(msg);
     } catch (e) {
-      console.warn("Folder Hub: graph worker message failed", e);
+      console.warn("ObsOrg: graph worker message failed", e);
     }
   }
   hasNode(r, id) {
@@ -1238,7 +1238,7 @@ var GraphTree = class {
     const s = this.plugin.settings;
     const tag = s.tag.replace(/^#/, "").trim();
     if (addIndexGroup && !tag) {
-      if (notify) new import_obsidian5.Notice("Folder Hub: \u0441\u043D\u0430\u0447\u0430\u043B\u0430 \u0443\u043A\u0430\u0436\u0438\u0442\u0435 \u0442\u0435\u0433 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432.");
+      if (notify) new import_obsidian5.Notice("ObsOrg: \u0441\u043D\u0430\u0447\u0430\u043B\u0430 \u0443\u043A\u0430\u0436\u0438\u0442\u0435 \u0442\u0435\u0433 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432.");
       return;
     }
     const adapter = this.app.vault.adapter;
@@ -1247,8 +1247,8 @@ var GraphTree = class {
     try {
       if (await adapter.exists(path)) cfg = JSON.parse(await adapter.read(path));
     } catch (e) {
-      console.error("Folder Hub: cannot read graph.json", e);
-      if (notify) new import_obsidian5.Notice("Folder Hub: \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u0440\u043E\u0447\u0438\u0442\u0430\u0442\u044C \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438 \u0433\u0440\u0430\u0444\u0430.");
+      console.error("ObsOrg: cannot read graph.json", e);
+      if (notify) new import_obsidian5.Notice("ObsOrg: \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u0440\u043E\u0447\u0438\u0442\u0430\u0442\u044C \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438 \u0433\u0440\u0430\u0444\u0430.");
       return;
     }
     const managed = new Set(s.managedGraphQueries);
@@ -1274,7 +1274,7 @@ var GraphTree = class {
       await this.plugin.saveSettings();
     }
     if (notify) {
-      new import_obsidian5.Notice("Folder Hub: \u0446\u0432\u0435\u0442 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u0434\u043E\u0431\u0430\u0432\u043B\u0435\u043D \u0432 \u0433\u0440\u0430\u0444. \u0417\u0430\u043A\u0440\u043E\u0439\u0442\u0435 \u0438 \u0441\u043D\u043E\u0432\u0430 \u043E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0433\u0440\u0430\u0444.", 8e3);
+      new import_obsidian5.Notice("ObsOrg: \u0446\u0432\u0435\u0442 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u0434\u043E\u0431\u0430\u0432\u043B\u0435\u043D \u0432 \u0433\u0440\u0430\u0444. \u0417\u0430\u043A\u0440\u043E\u0439\u0442\u0435 \u0438 \u0441\u043D\u043E\u0432\u0430 \u043E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0433\u0440\u0430\u0444.", 8e3);
     }
   }
 };
@@ -2136,7 +2136,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     this.register(() => this.styleEl?.remove());
     this.levels.start();
     this.registerView(VIEW_TYPE_CALENDAR, (leaf) => new CalendarView(leaf, this));
-    this.addRibbonIcon("calendar-days", "\u041A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C \u0438 \u0441\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432", () => void this.activateCalendar());
+    this.addRibbonIcon("calendar-days", "ObsOrg: \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C \u0438 \u0441\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432", () => void this.activateCalendar());
     this.addCommand({
       id: "toggle-skill-tree",
       name: "\u0413\u0440\u0430\u0444: \u0432\u043A\u043B\u044E\u0447\u0438\u0442\u044C/\u0432\u044B\u043A\u043B\u044E\u0447\u0438\u0442\u044C \u0434\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438",
@@ -2148,7 +2148,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     });
     this.addCommand({
       id: "open-calendar",
-      name: "\u041E\u0442\u043A\u0440\u044B\u0442\u044C \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C \u0438 \u0441\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432",
+      name: "\u041A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C: \u043E\u0442\u043A\u0440\u044B\u0442\u044C \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C \u0438 \u0441\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432",
       callback: () => void this.activateCalendar()
     });
     this.statusEl = this.addStatusBarItem();
@@ -2156,7 +2156,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     this.statusEl.addEventListener("click", () => void this.activateCalendar());
     this.addCommand({
       id: "create-index-current-folder",
-      name: "\u0421\u043E\u0437\u0434\u0430\u0442\u044C/\u043E\u0431\u043D\u043E\u0432\u0438\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u0432 \u043F\u0430\u043F\u043A\u0435 \u0442\u0435\u043A\u0443\u0449\u0435\u0439 \u0437\u0430\u043C\u0435\u0442\u043A\u0438",
+      name: "\u041F\u0430\u043F\u043A\u0438: \u0441\u043E\u0437\u0434\u0430\u0442\u044C/\u043E\u0431\u043D\u043E\u0432\u0438\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u0432 \u043F\u0430\u043F\u043A\u0435 \u0442\u0435\u043A\u0443\u0449\u0435\u0439 \u0437\u0430\u043C\u0435\u0442\u043A\u0438",
       checkCallback: (checking) => {
         const folder = this.app.workspace.getActiveFile()?.parent;
         if (!folder || folder.isRoot()) return false;
@@ -2166,7 +2166,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     });
     this.addCommand({
       id: "open-index-current-folder",
-      name: "\u041E\u0442\u043A\u0440\u044B\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u0442\u0435\u043A\u0443\u0449\u0435\u0439 \u043F\u0430\u043F\u043A\u0438",
+      name: "\u041F\u0430\u043F\u043A\u0438: \u043E\u0442\u043A\u0440\u044B\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u0442\u0435\u043A\u0443\u0449\u0435\u0439 \u043F\u0430\u043F\u043A\u0438",
       checkCallback: (checking) => {
         const folder = this.app.workspace.getActiveFile()?.parent;
         const index = folder && !folder.isRoot() ? this.findIndex(folder) : null;
@@ -2177,23 +2177,23 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     });
     this.addCommand({
       id: "create-index-all-folders",
-      name: "\u0421\u043E\u0437\u0434\u0430\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0432\u043E \u0432\u0441\u0435\u0445 \u043F\u0430\u043F\u043A\u0430\u0445 \u0445\u0440\u0430\u043D\u0438\u043B\u0438\u0449\u0430",
+      name: "\u041F\u0430\u043F\u043A\u0438: \u0441\u043E\u0437\u0434\u0430\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0432\u043E \u0432\u0441\u0435\u0445 \u043F\u0430\u043F\u043A\u0430\u0445 \u0445\u0440\u0430\u043D\u0438\u043B\u0438\u0449\u0430",
       callback: () => void this.createAll()
     });
     this.addCommand({
       id: "update-all-indexes",
-      name: "\u041E\u0431\u043D\u043E\u0432\u0438\u0442\u044C \u0432\u0441\u0435 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B",
+      name: "\u041F\u0430\u043F\u043A\u0438: \u043E\u0431\u043D\u043E\u0432\u0438\u0442\u044C \u0432\u0441\u0435 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B",
       callback: async () => {
         const n = await this.updateAll(false);
-        new import_obsidian8.Notice(`Folder Hub: \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u043E \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${n}`);
+        new import_obsidian8.Notice(`ObsOrg: \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u043E \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${n}`);
       }
     });
     this.addCommand({
       id: "rebuild-all-indexes",
-      name: "\u041F\u0435\u0440\u0435\u0441\u0442\u0440\u043E\u0438\u0442\u044C \u0432\u0441\u0435 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0437\u0430\u043D\u043E\u0432\u043E (\u0441\u0431\u0440\u043E\u0441\u0438\u0442\u044C \u043F\u0440\u0430\u0432\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438 \u0431\u043B\u043E\u043A\u0430)",
+      name: "\u041F\u0430\u043F\u043A\u0438: \u043F\u0435\u0440\u0435\u0441\u0442\u0440\u043E\u0438\u0442\u044C \u0432\u0441\u0435 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0437\u0430\u043D\u043E\u0432\u043E (\u0441\u0431\u0440\u043E\u0441\u0438\u0442\u044C \u043F\u0440\u0430\u0432\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438 \u0431\u043B\u043E\u043A\u0430)",
       callback: async () => {
         const n = await this.updateAll(true);
-        new import_obsidian8.Notice(`Folder Hub: \u043F\u0435\u0440\u0435\u0441\u0442\u0440\u043E\u0435\u043D\u043E \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${n}`);
+        new import_obsidian8.Notice(`ObsOrg: \u043F\u0435\u0440\u0435\u0441\u0442\u0440\u043E\u0435\u043D\u043E \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${n}`);
       }
     });
     this.registerEvent(
@@ -2378,7 +2378,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     try {
       await this.app.fileManager.renameFile(oldIndex, newPath);
     } catch (e) {
-      console.error("Folder Hub: failed to rename index", e);
+      console.error("ObsOrg: failed to rename index", e);
     }
   }
   // ------------------------------------------------------------ scheduling
@@ -2545,8 +2545,8 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
       } catch (e) {
         const existing = this.app.vault.getAbstractFileByPath(path);
         if (!(existing instanceof import_obsidian8.TFile)) {
-          console.error("Folder Hub: failed to create index", e);
-          new import_obsidian8.Notice(`Folder Hub: \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0441\u043E\u0437\u0434\u0430\u0442\u044C ${path}`);
+          console.error("ObsOrg: failed to create index", e);
+          new import_obsidian8.Notice(`ObsOrg: \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0441\u043E\u0437\u0434\u0430\u0442\u044C ${path}`);
           return null;
         }
         index = existing;
@@ -2583,7 +2583,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
       if (this.isExcluded(folder) || this.findIndex(folder)) continue;
       if (await this.createIndex(folder, false)) created++;
     }
-    new import_obsidian8.Notice(`Folder Hub: \u0441\u043E\u0437\u0434\u0430\u043D\u043E \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${created}`);
+    new import_obsidian8.Notice(`ObsOrg: \u0441\u043E\u0437\u0434\u0430\u043D\u043E \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${created}`);
   }
   // ------------------------------------------------------------ highlight
   refreshHighlight() {

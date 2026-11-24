@@ -2537,6 +2537,18 @@ function baseName(path) {
 function cssString(value) {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\a ")}"`;
 }
+function removeBlock(content) {
+  const start = content.indexOf(BLOCK_START);
+  if (start < 0) return content;
+  const end = content.indexOf(BLOCK_END, start + BLOCK_START.length);
+  if (end < 0) return content;
+  const before = content.slice(0, start).replace(/[ \t]*\n?[ \t]*$/, "");
+  const after = content.slice(end + BLOCK_END.length).replace(/^[ \t]*\n?/, "");
+  const joined = before && after ? `${before.replace(/\n+$/, "")}
+
+${after.replace(/^\n+/, "")}` : before + after;
+  return joined.replace(/\n{3,}/g, "\n\n");
+}
 
 // src/settings.ts
 var import_obsidian8 = require("obsidian");
@@ -3202,6 +3214,10 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
     this.styleEl = null;
     this.lastCalendarSig = "";
     this.lastTreeSig = "";
+    /** Folder path → index note path (null = none). Cleared on any vault/metadata change. */
+    this.indexCache = /* @__PURE__ */ new Map();
+    /** Choices made in this session, before the metadata cache has caught up. */
+    this.indexOverride = /* @__PURE__ */ new Map();
   }
   async onload() {
     await this.loadSettings();
@@ -3210,8 +3226,24 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
     this.register(() => this.styleEl?.remove());
     this.levels.start();
     this.modules.start();
+    const clearIndex = () => this.invalidateIndexCache();
+    this.registerEvent(this.app.vault.on("create", clearIndex));
+    this.registerEvent(this.app.vault.on("delete", clearIndex));
+    this.registerEvent(this.app.vault.on("rename", clearIndex));
+    this.registerEvent(this.app.metadataCache.on("changed", clearIndex));
     this.registerView(VIEW_TYPE_CALENDAR, (leaf) => new CalendarView(leaf, this));
     this.addRibbonIcon("calendar-days", "ObsOrg: \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C \u0438 \u0441\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432", () => void this.activateCalendar());
+    this.addCommand({
+      id: "set-current-note-as-index",
+      name: "\u041F\u0430\u043F\u043A\u0438: \u0441\u0434\u0435\u043B\u0430\u0442\u044C \u0442\u0435\u043A\u0443\u0449\u0443\u044E \u0437\u0430\u043C\u0435\u0442\u043A\u0443 \u0433\u043B\u0430\u0432\u043D\u044B\u043C \u0444\u0430\u0439\u043B\u043E\u043C \u043F\u0430\u043F\u043A\u0438",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== "md" || !file.parent || file.parent.isRoot()) return false;
+        if (this.findIndex(file.parent) === file) return false;
+        if (!checking) void this.setAsIndex(file);
+        return true;
+      }
+    });
     this.addCommand({
       id: "module-from-current-folder",
       name: "\u0413\u0440\u0430\u0444: \u0441\u0434\u0435\u043B\u0430\u0442\u044C \u043F\u0430\u043F\u043A\u0443 \u0442\u0435\u043A\u0443\u0449\u0435\u0439 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u043C\u043E\u0434\u0443\u043B\u0435\u043C",
@@ -3292,6 +3324,10 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
     });
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
+        if (file instanceof import_obsidian10.TFile) {
+          this.fileMenuForNote(menu, file);
+          return;
+        }
         if (!(file instanceof import_obsidian10.TFolder) || file.isRoot()) return;
         const index = this.findIndex(file);
         if (index) {
@@ -3304,6 +3340,11 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
         } else {
           menu.addItem(
             (i) => i.setTitle("\u0421\u043E\u0437\u0434\u0430\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043F\u0430\u043F\u043A\u0438").setIcon("star").onClick(() => this.createIndex(file, true))
+          );
+        }
+        if (file.children.some((c) => c instanceof import_obsidian10.TFile && c.extension === "md")) {
+          menu.addItem(
+            (i) => i.setTitle("\u0412\u044B\u0431\u0440\u0430\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B\u2026").setIcon("list-checks").onClick(() => new ChooseIndexModal(this, file).open())
           );
         }
         const isModule = !!this.modules.findFolderModule(file);
@@ -3539,16 +3580,112 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
   expectedIndexPath(folder) {
     return (0, import_obsidian10.normalizePath)(`${folder.path}/${this.indexNameFor(folder.name)}.md`);
   }
+  /**
+   * The folder's index note. An explicit choice wins (frontmatter
+   * `folder-index: true`, or a choice just made from the menu); otherwise
+   * the note named after the folder, unless it was explicitly demoted
+   * (`folder-index: false`).
+   */
   findIndex(folder) {
     if (folder.isRoot()) return null;
-    const byName = this.app.vault.getAbstractFileByPath(this.expectedIndexPath(folder));
-    if (byName instanceof import_obsidian10.TFile) return byName;
-    for (const child of folder.children) {
-      if (child instanceof import_obsidian10.TFile && child.extension === "md" && this.app.metadataCache.getFileCache(child)?.frontmatter?.[INDEX_KEY] === true) {
-        return child;
-      }
+    const cached = this.indexCache.get(folder.path);
+    if (cached !== void 0) {
+      if (cached === null) return null;
+      const f = this.app.vault.getAbstractFileByPath(cached);
+      if (f instanceof import_obsidian10.TFile && f.parent === folder) return f;
     }
+    const found = this.computeIndex(folder);
+    this.indexCache.set(folder.path, found?.path ?? null);
+    return found;
+  }
+  computeIndex(folder) {
+    const flag = (f) => this.app.metadataCache.getFileCache(f)?.frontmatter?.[INDEX_KEY];
+    const override = this.indexOverride.get(folder.path);
+    if (override) {
+      const f = this.app.vault.getAbstractFileByPath(override);
+      if (f instanceof import_obsidian10.TFile && f.parent === folder && flag(f) !== false) return f;
+      this.indexOverride.delete(folder.path);
+    }
+    const expected = this.expectedIndexPath(folder);
+    const flagged = [];
+    for (const child of folder.children) {
+      if (child instanceof import_obsidian10.TFile && child.extension === "md" && flag(child) === true) flagged.push(child);
+    }
+    if (flagged.length) return flagged.find((f) => f.path === expected) ?? flagged[0];
+    const byName = this.app.vault.getAbstractFileByPath(expected);
+    if (byName instanceof import_obsidian10.TFile && flag(byName) !== false) return byName;
     return null;
+  }
+  invalidateIndexCache() {
+    this.indexCache.clear();
+  }
+  /** Makes `file` the index note of its folder; the previous one becomes a plain note. */
+  async setAsIndex(file) {
+    const folder = file.parent;
+    if (!folder || folder.isRoot() || file.extension !== "md") return;
+    const old = this.findIndex(folder);
+    if (old === file) {
+      new import_obsidian10.Notice(`\xAB${file.basename}\xBB \u0443\u0436\u0435 \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043F\u0430\u043F\u043A\u0438 \xAB${folder.name}\xBB`);
+      return;
+    }
+    this.indexOverride.set(folder.path, file.path);
+    this.invalidateIndexCache();
+    if (old) await this.demoteIndex(old);
+    await this.adoptExisting(file);
+    this.invalidateIndexCache();
+    await this.enqueue(() => this.updateFolder(folder, false));
+    this.scheduleAncestors(parentPath(folder.path));
+    this.afterIndexChange();
+    new import_obsidian10.Notice(`\u0413\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043F\u0430\u043F\u043A\u0438 \xAB${folder.name}\xBB: ${file.basename}`);
+  }
+  /** Stops `file` from being an index note (its list is removed, the rest of the note stays). */
+  async unsetIndex(file) {
+    const folder = file.parent;
+    if (!folder) return;
+    this.indexOverride.delete(folder.path);
+    await this.demoteIndex(file);
+    this.invalidateIndexCache();
+    this.scheduleAncestors(parentPath(folder.path));
+    this.afterIndexChange();
+    new import_obsidian10.Notice(`\xAB${file.basename}\xBB \u0431\u043E\u043B\u044C\u0448\u0435 \u043D\u0435 \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043F\u0430\u043F\u043A\u0438 \xAB${folder.name}\xBB`);
+  }
+  async demoteIndex(file) {
+    const tag = this.settings.tag.replace(/^#/, "").trim();
+    await this.app.fileManager.processFrontMatter(file, (fm) => {
+      fm[INDEX_KEY] = false;
+      if (tag && fm.tags !== void 0) {
+        const list = Array.isArray(fm.tags) ? fm.tags.map(String) : String(fm.tags).split(/[,\s]+/).filter(Boolean);
+        const rest = list.filter((t) => t.replace(/^#/, "") !== tag);
+        if (rest.length) fm.tags = rest;
+        else delete fm.tags;
+      }
+      if (Array.isArray(fm.cssclasses)) {
+        const rest = fm.cssclasses.filter((c) => c !== "folder-hub-index");
+        if (rest.length) fm.cssclasses = rest;
+        else delete fm.cssclasses;
+      }
+    });
+    await this.app.vault.process(file, (data) => removeBlock(data));
+  }
+  /** Right-click / long-press on a note: make it (or stop it being) the folder's index. */
+  fileMenuForNote(menu, file) {
+    const folder = file.parent;
+    if (file.extension !== "md" || !folder || folder.isRoot() || this.isExcluded(folder)) return;
+    if (this.findIndex(folder) === file) {
+      menu.addItem(
+        (i) => i.setTitle("\u041F\u0435\u0440\u0435\u0441\u0442\u0430\u0442\u044C \u0431\u044B\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u043C \u0444\u0430\u0439\u043B\u043E\u043C").setIcon("star-off").onClick(() => this.unsetIndex(file))
+      );
+    } else {
+      menu.addItem(
+        (i) => i.setTitle(`\u0421\u0434\u0435\u043B\u0430\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u043C \u0444\u0430\u0439\u043B\u043E\u043C \u043F\u0430\u043F\u043A\u0438 \xAB${folder.name}\xBB`).setIcon("star").onClick(() => this.setAsIndex(file))
+      );
+    }
+  }
+  /** Everything that depends on which notes are index notes. */
+  afterIndexChange() {
+    this.refreshHighlight();
+    this.graphTree.refresh();
+    this.levels.scheduleRefresh();
   }
   isExcluded(folder) {
     if (folder.isRoot()) return true;
@@ -3693,6 +3830,9 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
         if (!list.map((t) => t.replace(/^#/, "")).includes(tag)) list.push(tag);
         fm.tags = list;
       }
+      const css = Array.isArray(fm.cssclasses) ? fm.cssclasses.map(String) : fm.cssclasses ? [String(fm.cssclasses)] : [];
+      if (!css.includes("folder-hub-index")) css.push("folder-hub-index");
+      fm.cssclasses = css;
     });
     const content = await this.app.vault.read(index);
     if (!content.includes(BLOCK_START)) {
@@ -3747,5 +3887,23 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
   /** Adds the index-note colour group ("tag:#<tag>") to the graph. */
   async addGraphColorGroup() {
     await this.graphTree.syncColorGroups(true, true);
+  }
+};
+var ChooseIndexModal = class extends import_obsidian10.FuzzySuggestModal {
+  constructor(plugin, folder) {
+    super(plugin.app);
+    this.plugin = plugin;
+    this.folder = folder;
+    this.setPlaceholder(`\u0413\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043F\u0430\u043F\u043A\u0438 \xAB${folder.name}\xBB`);
+  }
+  getItems() {
+    const current = this.plugin.findIndex(this.folder);
+    return this.folder.children.filter((c) => c instanceof import_obsidian10.TFile && c.extension === "md").sort((a, b) => a === current ? -1 : b === current ? 1 : a.basename.localeCompare(b.basename));
+  }
+  getItemText(file) {
+    return file === this.plugin.findIndex(this.folder) ? `\u2605 ${file.basename} (\u0441\u0435\u0439\u0447\u0430\u0441 \u0433\u043B\u0430\u0432\u043D\u044B\u0439)` : file.basename;
+  }
+  onChooseItem(file) {
+    void this.plugin.setAsIndex(file);
   }
 };

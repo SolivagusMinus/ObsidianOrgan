@@ -236,3 +236,15 @@ export function baseName(path: string): string {
 export function cssString(value: string): string {
 	return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\a ")}"`;
 }
+
+/** Removes the managed block (markers included) and the blank lines it leaves behind. */
+export function removeBlock(content: string): string {
+	const start = content.indexOf(BLOCK_START);
+	if (start < 0) return content;
+	const end = content.indexOf(BLOCK_END, start + BLOCK_START.length);
+	if (end < 0) return content;
+	const before = content.slice(0, start).replace(/[ \t]*\n?[ \t]*$/, "");
+	const after = content.slice(end + BLOCK_END.length).replace(/^[ \t]*\n?/, "");
+	const joined = before && after ? `${before.replace(/\n+$/, "")}\n\n${after.replace(/^\n+/, "")}` : before + after;
+	return joined.replace(/\n{3,}/g, "\n\n");
+}

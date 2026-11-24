@@ -1,5 +1,6 @@
 import {
 	App,
+	FuzzySuggestModal,
 	Menu,
 	Notice,
 	Plugin,
@@ -29,6 +30,7 @@ import {
 	extractBlockBody,
 	fillNoteTemplate,
 	mergePreserving,
+	removeBlock,
 	parentPath,
 	renderItems,
 	sortItems,
@@ -67,9 +69,27 @@ export default class FolderHubPlugin extends Plugin {
 		this.levels.start();
 		this.modules.start();
 
+		// Index lookups are cached; any change to files or frontmatter clears the cache.
+		const clearIndex = () => this.invalidateIndexCache();
+		this.registerEvent(this.app.vault.on("create", clearIndex));
+		this.registerEvent(this.app.vault.on("delete", clearIndex));
+		this.registerEvent(this.app.vault.on("rename", clearIndex));
+		this.registerEvent(this.app.metadataCache.on("changed", clearIndex));
+
 		// ---- Calendar & daily word counter
 		this.registerView(VIEW_TYPE_CALENDAR, (leaf) => new CalendarView(leaf, this));
 		this.addRibbonIcon("calendar-days", "ObsOrg: календарь и счётчик слов", () => void this.activateCalendar());
+		this.addCommand({
+			id: "set-current-note-as-index",
+			name: "Папки: сделать текущую заметку главным файлом папки",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file || file.extension !== "md" || !file.parent || file.parent.isRoot()) return false;
+				if (this.findIndex(file.parent) === file) return false;
+				if (!checking) void this.setAsIndex(file);
+				return true;
+			},
+		});
 		this.addCommand({
 			id: "module-from-current-folder",
 			name: "Граф: сделать папку текущей заметки модулем",
@@ -152,6 +172,10 @@ export default class FolderHubPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.workspace.on("file-menu", (menu: Menu, file: TAbstractFile) => {
+				if (file instanceof TFile) {
+					this.fileMenuForNote(menu, file);
+					return;
+				}
 				if (!(file instanceof TFolder) || file.isRoot()) return;
 				const index = this.findIndex(file);
 				if (index) {
@@ -173,6 +197,14 @@ export default class FolderHubPlugin extends Plugin {
 							.setTitle("Создать главный файл папки")
 							.setIcon("star")
 							.onClick(() => this.createIndex(file, true)),
+					);
+				}
+				if (file.children.some((c) => c instanceof TFile && c.extension === "md")) {
+					menu.addItem((i) =>
+						i
+							.setTitle("Выбрать главный файл…")
+							.setIcon("list-checks")
+							.onClick(() => new ChooseIndexModal(this, file).open()),
 					);
 				}
 				const isModule = !!this.modules.findFolderModule(file);
@@ -449,20 +481,130 @@ export default class FolderHubPlugin extends Plugin {
 		return normalizePath(`${folder.path}/${this.indexNameFor(folder.name)}.md`);
 	}
 
+	/** Folder path → index note path (null = none). Cleared on any vault/metadata change. */
+	private indexCache = new Map<string, string | null>();
+	/** Choices made in this session, before the metadata cache has caught up. */
+	private indexOverride = new Map<string, string>();
+
+	/**
+	 * The folder's index note. An explicit choice wins (frontmatter
+	 * `folder-index: true`, or a choice just made from the menu); otherwise
+	 * the note named after the folder, unless it was explicitly demoted
+	 * (`folder-index: false`).
+	 */
 	findIndex(folder: TFolder): TFile | null {
 		if (folder.isRoot()) return null;
-		const byName = this.app.vault.getAbstractFileByPath(this.expectedIndexPath(folder));
-		if (byName instanceof TFile) return byName;
-		for (const child of folder.children) {
-			if (
-				child instanceof TFile &&
-				child.extension === "md" &&
-				this.app.metadataCache.getFileCache(child)?.frontmatter?.[INDEX_KEY] === true
-			) {
-				return child;
-			}
+		const cached = this.indexCache.get(folder.path);
+		if (cached !== undefined) {
+			if (cached === null) return null;
+			const f = this.app.vault.getAbstractFileByPath(cached);
+			if (f instanceof TFile && f.parent === folder) return f;
 		}
+		const found = this.computeIndex(folder);
+		this.indexCache.set(folder.path, found?.path ?? null);
+		return found;
+	}
+
+	private computeIndex(folder: TFolder): TFile | null {
+		const flag = (f: TFile) => this.app.metadataCache.getFileCache(f)?.frontmatter?.[INDEX_KEY];
+		const override = this.indexOverride.get(folder.path);
+		if (override) {
+			const f = this.app.vault.getAbstractFileByPath(override);
+			if (f instanceof TFile && f.parent === folder && flag(f) !== false) return f;
+			this.indexOverride.delete(folder.path);
+		}
+		const expected = this.expectedIndexPath(folder);
+		const flagged: TFile[] = [];
+		for (const child of folder.children) {
+			if (child instanceof TFile && child.extension === "md" && flag(child) === true) flagged.push(child);
+		}
+		if (flagged.length) return flagged.find((f) => f.path === expected) ?? flagged[0];
+		const byName = this.app.vault.getAbstractFileByPath(expected);
+		if (byName instanceof TFile && flag(byName) !== false) return byName;
 		return null;
+	}
+
+	invalidateIndexCache() {
+		this.indexCache.clear();
+	}
+
+	/** Makes `file` the index note of its folder; the previous one becomes a plain note. */
+	async setAsIndex(file: TFile) {
+		const folder = file.parent;
+		if (!folder || folder.isRoot() || file.extension !== "md") return;
+		const old = this.findIndex(folder);
+		if (old === file) {
+			new Notice(`«${file.basename}» уже главный файл папки «${folder.name}»`);
+			return;
+		}
+		this.indexOverride.set(folder.path, file.path);
+		this.invalidateIndexCache();
+		if (old) await this.demoteIndex(old);
+		await this.adoptExisting(file);
+		this.invalidateIndexCache();
+		await this.enqueue(() => this.updateFolder(folder, false));
+		this.scheduleAncestors(parentPath(folder.path));
+		this.afterIndexChange();
+		new Notice(`Главный файл папки «${folder.name}»: ${file.basename}`);
+	}
+
+	/** Stops `file` from being an index note (its list is removed, the rest of the note stays). */
+	async unsetIndex(file: TFile) {
+		const folder = file.parent;
+		if (!folder) return;
+		this.indexOverride.delete(folder.path);
+		await this.demoteIndex(file);
+		this.invalidateIndexCache();
+		this.scheduleAncestors(parentPath(folder.path));
+		this.afterIndexChange();
+		new Notice(`«${file.basename}» больше не главный файл папки «${folder.name}»`);
+	}
+
+	private async demoteIndex(file: TFile) {
+		const tag = this.settings.tag.replace(/^#/, "").trim();
+		await this.app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
+			fm[INDEX_KEY] = false;
+			if (tag && fm.tags !== undefined) {
+				const list = Array.isArray(fm.tags) ? fm.tags.map(String) : String(fm.tags).split(/[,\s]+/).filter(Boolean);
+				const rest = list.filter((t) => t.replace(/^#/, "") !== tag);
+				if (rest.length) fm.tags = rest;
+				else delete fm.tags;
+			}
+			if (Array.isArray(fm.cssclasses)) {
+				const rest = fm.cssclasses.filter((c) => c !== "folder-hub-index");
+				if (rest.length) fm.cssclasses = rest;
+				else delete fm.cssclasses;
+			}
+		});
+		await this.app.vault.process(file, (data) => removeBlock(data));
+	}
+
+	/** Right-click / long-press on a note: make it (or stop it being) the folder's index. */
+	private fileMenuForNote(menu: Menu, file: TFile) {
+		const folder = file.parent;
+		if (file.extension !== "md" || !folder || folder.isRoot() || this.isExcluded(folder)) return;
+		if (this.findIndex(folder) === file) {
+			menu.addItem((i) =>
+				i
+					.setTitle("Перестать быть главным файлом")
+					.setIcon("star-off")
+					.onClick(() => this.unsetIndex(file)),
+			);
+		} else {
+			menu.addItem((i) =>
+				i
+					.setTitle(`Сделать главным файлом папки «${folder.name}»`)
+					.setIcon("star")
+					.onClick(() => this.setAsIndex(file)),
+			);
+		}
+	}
+
+	/** Everything that depends on which notes are index notes. */
+	private afterIndexChange() {
+		this.refreshHighlight();
+		this.graphTree.refresh();
+		this.levels.scheduleRefresh();
 	}
 
 	isExcluded(folder: TFolder): boolean {
@@ -642,6 +784,9 @@ export default class FolderHubPlugin extends Plugin {
 				if (!list.map((t) => t.replace(/^#/, "")).includes(tag)) list.push(tag);
 				fm.tags = list;
 			}
+			const css = Array.isArray(fm.cssclasses) ? fm.cssclasses.map(String) : fm.cssclasses ? [String(fm.cssclasses)] : [];
+			if (!css.includes("folder-hub-index")) css.push("folder-hub-index");
+			fm.cssclasses = css;
 		});
 		const content = await this.app.vault.read(index);
 		if (!content.includes(BLOCK_START)) {
@@ -710,5 +855,31 @@ export default class FolderHubPlugin extends Plugin {
 	/** Adds the index-note colour group ("tag:#<tag>") to the graph. */
 	async addGraphColorGroup() {
 		await this.graphTree.syncColorGroups(true, true);
+	}
+}
+
+/** Picker of notes in a folder, to choose its index note. */
+class ChooseIndexModal extends FuzzySuggestModal<TFile> {
+	constructor(
+		private plugin: FolderHubPlugin,
+		private folder: TFolder,
+	) {
+		super(plugin.app);
+		this.setPlaceholder(`Главный файл папки «${folder.name}»`);
+	}
+
+	getItems(): TFile[] {
+		const current = this.plugin.findIndex(this.folder);
+		return this.folder.children
+			.filter((c): c is TFile => c instanceof TFile && c.extension === "md")
+			.sort((a, b) => (a === current ? -1 : b === current ? 1 : a.basename.localeCompare(b.basename)));
+	}
+
+	getItemText(file: TFile): string {
+		return file === this.plugin.findIndex(this.folder) ? `★ ${file.basename} (сейчас главный)` : file.basename;
+	}
+
+	onChooseItem(file: TFile): void {
+		void this.plugin.setAsIndex(file);
 	}
 }

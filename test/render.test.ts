@@ -267,3 +267,13 @@ test("resampleClosed spaces points evenly around the outline", () => {
 		assert.ok(d > 7 && d <= 10.01, `step ${d}`);
 	}
 });
+
+// ---------------------------------------------------------------- choosing a main file
+import { removeBlock } from "../src/render";
+
+test("removeBlock strips the managed list and keeps the user's text", () => {
+	const note = `---\ntags: [x]\n---\n\nМоё описание\n\n${BLOCK_START}\n\`\`\`folder-hub-level\n\`\`\`\n- [[A]]\n${BLOCK_END}\n\nТекст после`;
+	assert.equal(removeBlock(note), "---\ntags: [x]\n---\n\nМоё описание\n\nТекст после");
+	assert.equal(removeBlock(`${BLOCK_START}\n- [[A]]\n${BLOCK_END}\n`), "");
+	assert.equal(removeBlock("без блока"), "без блока");
+});

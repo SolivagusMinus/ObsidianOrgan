@@ -66,6 +66,8 @@ export default class FolderHubPlugin extends Plugin {
 		this.styleEl = document.head.createEl("style", { attr: { id: "folder-hub-dynamic" } });
 		this.register(() => this.styleEl?.remove());
 
+		document.body.toggleClass("fh-reduce-motion", this.motionReduced());
+		this.register(() => document.body.removeClass("fh-reduce-motion"));
 		this.levels.start();
 		this.modules.start();
 
@@ -108,6 +110,11 @@ export default class FolderHubPlugin extends Plugin {
 				await this.saveSettings();
 				new Notice(`Модули в графе ${this.settings.modulesEnabled ? "показаны" : "скрыты"}`);
 			},
+		});
+		this.addCommand({
+			id: "diagnose-graph-effects",
+			name: "Граф: проверить, почему не видно эффектов",
+			callback: () => new Notice(this.graphFx.diagnose().join("\n"), 20000),
 		});
 		this.addCommand({
 			id: "toggle-skill-tree",
@@ -261,7 +268,13 @@ export default class FolderHubPlugin extends Plugin {
 		await this.saveData({ ...this.settings, wordStats: this.wordStats });
 	}
 
+	/** True when animations should be off because the OS asks for reduced motion and the user wants that respected. */
+	motionReduced(): boolean {
+		return this.settings.respectReducedMotion && !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+	}
+
 	async saveSettings() {
+		document.body.toggleClass("fh-reduce-motion", this.motionReduced());
 		await this.persist();
 		this.refreshHighlight();
 		this.updateStatusBar();

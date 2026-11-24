@@ -145,6 +145,11 @@ export class GraphFx {
 	private lastFrame = 0;
 	private fpsEma = 60;
 
+	// Diagnostics
+	private lastMapping = "";
+	private lastSkip = "";
+	private framesDrawn = 0;
+
 	// Colour caches
 	private colorKey = "";
 	private colorFn: (a: number) => string = () => "";
@@ -160,9 +165,8 @@ export class GraphFx {
 	/** Pulses, rays, flow and glow (animations). */
 	private get effectsOn(): boolean {
 		const s = this.plugin.settings;
-		const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 		const anything = s.fxRing || s.fxWave || s.fxGlow || s.linkFlow !== "off" || s.fxShowFps;
-		return s.fxEnabled && s.animations && !reduced && anything;
+		return s.fxEnabled && s.animations && !this.plugin.motionReduced() && anything;
 	}
 
 	/** Module barriers are structure, not decoration: shown even with animations off. */
@@ -230,6 +234,35 @@ export class GraphFx {
 			window.cancelAnimationFrame(this.raf);
 			this.raf = null;
 		}
+	}
+
+	/** Human-readable report: what is on, what was found, why nothing may be drawn. */
+	diagnose(): string[] {
+		const s = this.plugin.settings;
+		const os = !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+		const kinds = [s.fxRing && "кольцо", s.fxWave && `лучи (${s.rayStyle})`, s.fxGlow && "свечение", s.linkFlow !== "off" && `поток (${s.linkFlow === "all" ? "все связи" : "от главных"})`].filter(Boolean);
+		const leaves = [...this.app.workspace.getLeavesOfType("graph"), ...this.app.workspace.getLeavesOfType("localgraph")];
+		const renderers = leaves.map((l) => (l.view as View & { renderer?: FxRenderer }).renderer).filter((r): r is FxRenderer => !!r);
+		const hubs = this.plugin.graphTree.hubDepths();
+		const r = renderers[0];
+		const nodes = r?.nodes ?? [];
+		const hubCount = nodes.filter((n) => hubs.has(n.id)).length;
+		const out = [
+			"ObsOrg — эффекты графа:",
+			`• Эффекты: ${s.fxEnabled ? "вкл" : "ВЫКЛ — Настройки → Граф: эффекты"}`,
+			`• Анимации плагина: ${s.animations ? "вкл" : "ВЫКЛ — Настройки → Счётчик слов и календарь → Анимации"}`,
+			`• Системное «уменьшить движение»: ${os ? (s.respectReducedMotion ? "включено и учитывается → эффекты выключены" : "включено, но игнорируется") : "нет"}`,
+			`• Виды: ${kinds.length ? kinds.join(", ") : "все выключены"}`,
+			`• Открыто графов: ${leaves.length}, с доступом к движку: ${renderers.length}, слоёв эффектов: ${this.layers.size}`,
+			`• Узлов в графе: ${nodes.length}, главных файлов среди них: ${hubCount}` +
+				(nodes.length && !hubCount ? " — кольца и лучи идут от главных файлов; создайте их или включите «Анимация связей: Все связи»" : ""),
+			`• Привязка координат: ${this.lastMapping || "ещё не было кадров"}`,
+			`• Нарисовано кадров: ${this.framesDrawn}, кадр ${this.costEma.toFixed(1)} мс, ${Math.round(this.fpsEma)} FPS, качество ${["низкое", "среднее", "высокое"][this.quality]}`,
+		];
+		if (this.lastSkip) out.push(`• Последний кадр пропущен: ${this.lastSkip}`);
+		if (!leaves.length) out.push("Откройте граф и запустите проверку ещё раз.");
+		else if (!renderers.length) out.push("Не удалось получить доступ к движку графа — возможно, изменился Obsidian. Напишите версию Obsidian.");
+		return out;
 	}
 
 	/** Big celebratory pulse on one node (e.g. a branch levelled up). */
@@ -449,7 +482,12 @@ export class GraphFx {
 				S = cS;
 				ox = cx;
 				oy = cy;
+				this.lastMapping = "по узлам графа";
+			} else {
+				this.lastMapping = "по pan/scale (узлы не сошлись)";
 			}
+		} else {
+			this.lastMapping = "по pan/scale (нет данных узлов)";
 		}
 		return { S: S * ratio, ox: ox * ratio, oy: oy * ratio };
 	}
@@ -459,7 +497,12 @@ export class GraphFx {
 		const host = r.containerEl!;
 		const w = host.clientWidth;
 		const h = host.clientHeight;
-		if (!w || !h || host.offsetParent === null) return; // hidden tab
+		// Hidden tab (getClientRects is empty for display:none, unlike offsetParent it
+		// also works inside position:fixed containers).
+		if (!w || !h || host.getClientRects().length === 0) {
+			this.lastSkip = !w || !h ? "у графа нулевой размер" : "вкладка графа скрыта";
+			return;
+		}
 
 		const s = this.plugin.settings;
 		const t = (now - this.t0) / 1000;
@@ -502,7 +545,12 @@ export class GraphFx {
 		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 		ctx.clearRect(0, 0, w, h);
 		layer.dirty = true;
-		if (!nodes.length) return;
+		if (!nodes.length) {
+			this.lastSkip = "в графе нет узлов";
+			return;
+		}
+		this.lastSkip = "";
+		this.framesDrawn++;
 
 		const color = this.colors();
 		const ratio = w / (r.px?.screen?.width || w);

@@ -250,7 +250,7 @@ var CalendarView = class extends import_obsidian3.ItemView {
     return "calendar-days";
   }
   get animated() {
-    return this.plugin.settings.animations && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    return this.plugin.settings.animations && !this.plugin.motionReduced();
   }
   async onOpen() {
     this.render();
@@ -1396,7 +1396,7 @@ var GraphTree = class {
     const prev = this.pinned.get(r) ?? /* @__PURE__ */ new Set();
     const base = s.skillTreeEnabled ? this.positions() : /* @__PURE__ */ new Map();
     const target = this.withModules(r, base);
-    const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const reduced = this.plugin.motionReduced();
     if (target.size && !this.grown.has(r) && s.graphGrow && s.animations && !reduced) {
       this.grown.add(r);
       this.animateGrow(r, target);
@@ -1974,6 +1974,10 @@ var GraphFx = class {
     // FPS meter
     this.lastFrame = 0;
     this.fpsEma = 60;
+    // Diagnostics
+    this.lastMapping = "";
+    this.lastSkip = "";
+    this.framesDrawn = 0;
     // Colour caches
     this.colorKey = "";
     this.colorFn = () => "";
@@ -2007,9 +2011,8 @@ var GraphFx = class {
   /** Pulses, rays, flow and glow (animations). */
   get effectsOn() {
     const s = this.plugin.settings;
-    const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     const anything = s.fxRing || s.fxWave || s.fxGlow || s.linkFlow !== "off" || s.fxShowFps;
-    return s.fxEnabled && s.animations && !reduced && anything;
+    return s.fxEnabled && s.animations && !this.plugin.motionReduced() && anything;
   }
   /** Module barriers are structure, not decoration: shown even with animations off. */
   get modulesOn() {
@@ -2070,6 +2073,33 @@ var GraphFx = class {
       window.cancelAnimationFrame(this.raf);
       this.raf = null;
     }
+  }
+  /** Human-readable report: what is on, what was found, why nothing may be drawn. */
+  diagnose() {
+    const s = this.plugin.settings;
+    const os = !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const kinds = [s.fxRing && "\u043A\u043E\u043B\u044C\u0446\u043E", s.fxWave && `\u043B\u0443\u0447\u0438 (${s.rayStyle})`, s.fxGlow && "\u0441\u0432\u0435\u0447\u0435\u043D\u0438\u0435", s.linkFlow !== "off" && `\u043F\u043E\u0442\u043E\u043A (${s.linkFlow === "all" ? "\u0432\u0441\u0435 \u0441\u0432\u044F\u0437\u0438" : "\u043E\u0442 \u0433\u043B\u0430\u0432\u043D\u044B\u0445"})`].filter(Boolean);
+    const leaves = [...this.app.workspace.getLeavesOfType("graph"), ...this.app.workspace.getLeavesOfType("localgraph")];
+    const renderers = leaves.map((l) => l.view.renderer).filter((r2) => !!r2);
+    const hubs = this.plugin.graphTree.hubDepths();
+    const r = renderers[0];
+    const nodes = r?.nodes ?? [];
+    const hubCount = nodes.filter((n) => hubs.has(n.id)).length;
+    const out = [
+      "ObsOrg \u2014 \u044D\u0444\u0444\u0435\u043A\u0442\u044B \u0433\u0440\u0430\u0444\u0430:",
+      `\u2022 \u042D\u0444\u0444\u0435\u043A\u0442\u044B: ${s.fxEnabled ? "\u0432\u043A\u043B" : "\u0412\u042B\u041A\u041B \u2014 \u041D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438 \u2192 \u0413\u0440\u0430\u0444: \u044D\u0444\u0444\u0435\u043A\u0442\u044B"}`,
+      `\u2022 \u0410\u043D\u0438\u043C\u0430\u0446\u0438\u0438 \u043F\u043B\u0430\u0433\u0438\u043D\u0430: ${s.animations ? "\u0432\u043A\u043B" : "\u0412\u042B\u041A\u041B \u2014 \u041D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438 \u2192 \u0421\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432 \u0438 \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C \u2192 \u0410\u043D\u0438\u043C\u0430\u0446\u0438\u0438"}`,
+      `\u2022 \u0421\u0438\u0441\u0442\u0435\u043C\u043D\u043E\u0435 \xAB\u0443\u043C\u0435\u043D\u044C\u0448\u0438\u0442\u044C \u0434\u0432\u0438\u0436\u0435\u043D\u0438\u0435\xBB: ${os ? s.respectReducedMotion ? "\u0432\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u0438 \u0443\u0447\u0438\u0442\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u2192 \u044D\u0444\u0444\u0435\u043A\u0442\u044B \u0432\u044B\u043A\u043B\u044E\u0447\u0435\u043D\u044B" : "\u0432\u043A\u043B\u044E\u0447\u0435\u043D\u043E, \u043D\u043E \u0438\u0433\u043D\u043E\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044F" : "\u043D\u0435\u0442"}`,
+      `\u2022 \u0412\u0438\u0434\u044B: ${kinds.length ? kinds.join(", ") : "\u0432\u0441\u0435 \u0432\u044B\u043A\u043B\u044E\u0447\u0435\u043D\u044B"}`,
+      `\u2022 \u041E\u0442\u043A\u0440\u044B\u0442\u043E \u0433\u0440\u0430\u0444\u043E\u0432: ${leaves.length}, \u0441 \u0434\u043E\u0441\u0442\u0443\u043F\u043E\u043C \u043A \u0434\u0432\u0438\u0436\u043A\u0443: ${renderers.length}, \u0441\u043B\u043E\u0451\u0432 \u044D\u0444\u0444\u0435\u043A\u0442\u043E\u0432: ${this.layers.size}`,
+      `\u2022 \u0423\u0437\u043B\u043E\u0432 \u0432 \u0433\u0440\u0430\u0444\u0435: ${nodes.length}, \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u0441\u0440\u0435\u0434\u0438 \u043D\u0438\u0445: ${hubCount}` + (nodes.length && !hubCount ? " \u2014 \u043A\u043E\u043B\u044C\u0446\u0430 \u0438 \u043B\u0443\u0447\u0438 \u0438\u0434\u0443\u0442 \u043E\u0442 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432; \u0441\u043E\u0437\u0434\u0430\u0439\u0442\u0435 \u0438\u0445 \u0438\u043B\u0438 \u0432\u043A\u043B\u044E\u0447\u0438\u0442\u0435 \xAB\u0410\u043D\u0438\u043C\u0430\u0446\u0438\u044F \u0441\u0432\u044F\u0437\u0435\u0439: \u0412\u0441\u0435 \u0441\u0432\u044F\u0437\u0438\xBB" : ""),
+      `\u2022 \u041F\u0440\u0438\u0432\u044F\u0437\u043A\u0430 \u043A\u043E\u043E\u0440\u0434\u0438\u043D\u0430\u0442: ${this.lastMapping || "\u0435\u0449\u0451 \u043D\u0435 \u0431\u044B\u043B\u043E \u043A\u0430\u0434\u0440\u043E\u0432"}`,
+      `\u2022 \u041D\u0430\u0440\u0438\u0441\u043E\u0432\u0430\u043D\u043E \u043A\u0430\u0434\u0440\u043E\u0432: ${this.framesDrawn}, \u043A\u0430\u0434\u0440 ${this.costEma.toFixed(1)} \u043C\u0441, ${Math.round(this.fpsEma)} FPS, \u043A\u0430\u0447\u0435\u0441\u0442\u0432\u043E ${["\u043D\u0438\u0437\u043A\u043E\u0435", "\u0441\u0440\u0435\u0434\u043D\u0435\u0435", "\u0432\u044B\u0441\u043E\u043A\u043E\u0435"][this.quality]}`
+    ];
+    if (this.lastSkip) out.push(`\u2022 \u041F\u043E\u0441\u043B\u0435\u0434\u043D\u0438\u0439 \u043A\u0430\u0434\u0440 \u043F\u0440\u043E\u043F\u0443\u0449\u0435\u043D: ${this.lastSkip}`);
+    if (!leaves.length) out.push("\u041E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0433\u0440\u0430\u0444 \u0438 \u0437\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u0435 \u043F\u0440\u043E\u0432\u0435\u0440\u043A\u0443 \u0435\u0449\u0451 \u0440\u0430\u0437.");
+    else if (!renderers.length) out.push("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u044C \u0434\u043E\u0441\u0442\u0443\u043F \u043A \u0434\u0432\u0438\u0436\u043A\u0443 \u0433\u0440\u0430\u0444\u0430 \u2014 \u0432\u043E\u0437\u043C\u043E\u0436\u043D\u043E, \u0438\u0437\u043C\u0435\u043D\u0438\u043B\u0441\u044F Obsidian. \u041D\u0430\u043F\u0438\u0448\u0438\u0442\u0435 \u0432\u0435\u0440\u0441\u0438\u044E Obsidian.");
+    return out;
   }
   /** Big celebratory pulse on one node (e.g. a branch levelled up). */
   burst(id) {
@@ -2246,7 +2276,12 @@ var GraphFx = class {
         S = cS;
         ox = cx;
         oy = cy;
+        this.lastMapping = "\u043F\u043E \u0443\u0437\u043B\u0430\u043C \u0433\u0440\u0430\u0444\u0430";
+      } else {
+        this.lastMapping = "\u043F\u043E pan/scale (\u0443\u0437\u043B\u044B \u043D\u0435 \u0441\u043E\u0448\u043B\u0438\u0441\u044C)";
       }
+    } else {
+      this.lastMapping = "\u043F\u043E pan/scale (\u043D\u0435\u0442 \u0434\u0430\u043D\u043D\u044B\u0445 \u0443\u0437\u043B\u043E\u0432)";
     }
     return { S: S * ratio, ox: ox * ratio, oy: oy * ratio };
   }
@@ -2255,7 +2290,10 @@ var GraphFx = class {
     const host = r.containerEl;
     const w = host.clientWidth;
     const h = host.clientHeight;
-    if (!w || !h || host.offsetParent === null) return;
+    if (!w || !h || host.getClientRects().length === 0) {
+      this.lastSkip = !w || !h ? "\u0443 \u0433\u0440\u0430\u0444\u0430 \u043D\u0443\u043B\u0435\u0432\u043E\u0439 \u0440\u0430\u0437\u043C\u0435\u0440" : "\u0432\u043A\u043B\u0430\u0434\u043A\u0430 \u0433\u0440\u0430\u0444\u0430 \u0441\u043A\u0440\u044B\u0442\u0430";
+      return;
+    }
     const s = this.plugin.settings;
     const t = (now - this.t0) / 1e3;
     const interval = Math.max(1, s.fxInterval);
@@ -2286,7 +2324,12 @@ var GraphFx = class {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
     layer.dirty = true;
-    if (!nodes.length) return;
+    if (!nodes.length) {
+      this.lastSkip = "\u0432 \u0433\u0440\u0430\u0444\u0435 \u043D\u0435\u0442 \u0443\u0437\u043B\u043E\u0432";
+      return;
+    }
+    this.lastSkip = "";
+    this.framesDrawn++;
     const color = this.colors();
     const ratio = w / (r.px?.screen?.width || w);
     const { S, ox, oy } = this.mapping(r, nodes, ratio);
@@ -2861,6 +2904,7 @@ var DEFAULT_SETTINGS = {
   graphGrow: true,
   graphFreeze: false,
   fxShowFps: false,
+  respectReducedMotion: false,
   modulesEnabled: true,
   modules: [],
   moduleShape: "cloud",
@@ -3265,6 +3309,15 @@ var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
         await save();
       })
     );
+    const osReduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    new import_obsidian8.Setting(containerEl).setName("\u0423\u0447\u0438\u0442\u044B\u0432\u0430\u0442\u044C \u0441\u0438\u0441\u0442\u0435\u043C\u043D\u043E\u0435 \xAB\u0423\u043C\u0435\u043D\u044C\u0448\u0438\u0442\u044C \u0434\u0432\u0438\u0436\u0435\u043D\u0438\u0435\xBB").setDesc(
+      (osReduced ? "\u26A0 \u0421\u0435\u0439\u0447\u0430\u0441 \u0432 \u0441\u0438\u0441\u0442\u0435\u043C\u0435 \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u043E \xAB\u0443\u043C\u0435\u043D\u044C\u0448\u0438\u0442\u044C \u0434\u0432\u0438\u0436\u0435\u043D\u0438\u0435\xBB (\u0432 Windows \u2014 \u0432\u044B\u043A\u043B\u044E\u0447\u0435\u043D\u044B \xAB\u042D\u0444\u0444\u0435\u043A\u0442\u044B \u0430\u043D\u0438\u043C\u0430\u0446\u0438\u0438\xBB). " : "") + "\u0412\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u2014 \u0430\u043D\u0438\u043C\u0430\u0446\u0438\u0438 \u043F\u043B\u0430\u0433\u0438\u043D\u0430 \u0432\u044B\u043A\u043B\u044E\u0447\u0430\u044E\u0442\u0441\u044F, \u043A\u043E\u0433\u0434\u0430 \u0441\u0438\u0441\u0442\u0435\u043C\u0430 \u043F\u0440\u043E\u0441\u0438\u0442 \u043C\u0435\u043D\u044C\u0448\u0435 \u0434\u0432\u0438\u0436\u0435\u043D\u0438\u044F. \u0412\u044B\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u2014 \u0440\u0430\u0431\u043E\u0442\u0430\u044E\u0442 \u0432\u0441\u0435\u0433\u0434\u0430, \u043F\u043E\u043A\u0430 \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u044B \u0437\u0434\u0435\u0441\u044C."
+    ).addToggle(
+      (t) => t.setValue(s.respectReducedMotion).onChange(async (v) => {
+        s.respectReducedMotion = v;
+        await save();
+      })
+    );
     new import_obsidian8.Setting(containerEl).setName("\u041F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C FPS").setDesc(
       "\u0421\u0447\u0451\u0442\u0447\u0438\u043A \u043A\u0430\u0434\u0440\u043E\u0432 \u0432 \u0443\u0433\u043B\u0443 \u0433\u0440\u0430\u0444\u0430 \u0438 \u0442\u0435\u043A\u0443\u0449\u0435\u0435 \u043A\u0430\u0447\u0435\u0441\u0442\u0432\u043E \u044D\u0444\u0444\u0435\u043A\u0442\u043E\u0432. \u041A\u0430\u0447\u0435\u0441\u0442\u0432\u043E \u043F\u043E\u0434\u0441\u0442\u0440\u0430\u0438\u0432\u0430\u0435\u0442\u0441\u044F \u0441\u0430\u043C\u043E: \u0435\u0441\u043B\u0438 \u043A\u0430\u0434\u0440 \u0440\u0438\u0441\u0443\u0435\u0442\u0441\u044F \u0441\u043B\u0438\u0448\u043A\u043E\u043C \u0434\u043E\u043B\u0433\u043E, \u044D\u0444\u0444\u0435\u043A\u0442\u044B \u0443\u043F\u0440\u043E\u0449\u0430\u044E\u0442\u0441\u044F, \u0447\u0442\u043E\u0431\u044B \u0434\u0435\u0440\u0436\u0430\u0442\u044C 60 FPS."
     ).addToggle(
@@ -3489,6 +3542,8 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
     this.addSettingTab(new FolderHubSettingTab(this.app, this));
     this.styleEl = document.head.createEl("style", { attr: { id: "folder-hub-dynamic" } });
     this.register(() => this.styleEl?.remove());
+    document.body.toggleClass("fh-reduce-motion", this.motionReduced());
+    this.register(() => document.body.removeClass("fh-reduce-motion"));
     this.levels.start();
     this.modules.start();
     const clearIndex = () => this.invalidateIndexCache();
@@ -3527,6 +3582,11 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
         await this.saveSettings();
         new import_obsidian10.Notice(`\u041C\u043E\u0434\u0443\u043B\u0438 \u0432 \u0433\u0440\u0430\u0444\u0435 ${this.settings.modulesEnabled ? "\u043F\u043E\u043A\u0430\u0437\u0430\u043D\u044B" : "\u0441\u043A\u0440\u044B\u0442\u044B"}`);
       }
+    });
+    this.addCommand({
+      id: "diagnose-graph-effects",
+      name: "\u0413\u0440\u0430\u0444: \u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C, \u043F\u043E\u0447\u0435\u043C\u0443 \u043D\u0435 \u0432\u0438\u0434\u043D\u043E \u044D\u0444\u0444\u0435\u043A\u0442\u043E\u0432",
+      callback: () => new import_obsidian10.Notice(this.graphFx.diagnose().join("\n"), 2e4)
     });
     this.addCommand({
       id: "toggle-skill-tree",
@@ -3654,7 +3714,12 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
   async persist() {
     await this.saveData({ ...this.settings, wordStats: this.wordStats });
   }
+  /** True when animations should be off because the OS asks for reduced motion and the user wants that respected. */
+  motionReduced() {
+    return this.settings.respectReducedMotion && !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  }
   async saveSettings() {
+    document.body.toggleClass("fh-reduce-motion", this.motionReduced());
     await this.persist();
     this.refreshHighlight();
     this.updateStatusBar();

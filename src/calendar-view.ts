@@ -49,7 +49,7 @@ export class CalendarView extends ItemView {
 	}
 
 	private get animated(): boolean {
-		return this.plugin.settings.animations && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+		return this.plugin.settings.animations && !this.plugin.motionReduced();
 	}
 
 	async onOpen() {

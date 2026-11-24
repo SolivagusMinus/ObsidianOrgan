@@ -209,7 +209,7 @@ export class GraphTree {
 		const target = this.withModules(r, base);
 
 		// First time this graph shows the tree: let it grow out of the centre.
-		const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+		const reduced = this.plugin.motionReduced();
 		if (target.size && !this.grown.has(r) && s.graphGrow && s.animations && !reduced) {
 			this.grown.add(r);
 			this.animateGrow(r, target);

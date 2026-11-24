@@ -79,6 +79,8 @@ export interface FolderHubSettings {
 	graphGrow: boolean;
 	graphFreeze: boolean;
 	fxShowFps: boolean;
+	/** Turn animations off when the OS asks for reduced motion (Windows "Animation effects" off etc.). */
+	respectReducedMotion: boolean;
 
 	// Graph modules
 	modulesEnabled: boolean;
@@ -169,6 +171,7 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	graphGrow: true,
 	graphFreeze: false,
 	fxShowFps: false,
+	respectReducedMotion: false,
 
 	modulesEnabled: true,
 	modules: [],
@@ -834,6 +837,21 @@ export class FolderHubSettingTab extends PluginSettingTab {
 			.addToggle((t) =>
 				t.setValue(s.graphGrow).onChange(async (v) => {
 					s.graphGrow = v;
+					await save();
+				}),
+			);
+
+		const osReduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+		new Setting(containerEl)
+			.setName("Учитывать системное «Уменьшить движение»")
+			.setDesc(
+				(osReduced
+					? "⚠ Сейчас в системе включено «уменьшить движение» (в Windows — выключены «Эффекты анимации»). "
+					: "") + "Включено — анимации плагина выключаются, когда система просит меньше движения. Выключено — работают всегда, пока включены здесь.",
+			)
+			.addToggle((t) =>
+				t.setValue(s.respectReducedMotion).onChange(async (v) => {
+					s.respectReducedMotion = v;
 					await save();
 				}),
 			);

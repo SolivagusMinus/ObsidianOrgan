@@ -285,9 +285,8 @@
 	animation: none !important;
 	transition: none !important;
 }
-@media (prefers-reduced-motion: reduce) {
-	.fh-cal *, .fh-cal, .fh-status { animation: none !important; transition: none !important; }
-}
+/* OS asks for reduced motion and the user chose to respect it (body class set by the plugin) */
+.fh-reduce-motion .fh-cal *, .fh-reduce-motion .fh-cal, .fh-reduce-motion .fh-status { animation: none !important; transition: none !important; }
 
 /* Settings: sub-heading for per-branch directions */
 .fh-subheading { margin: 12px 0 4px; font-weight: 600; }
@@ -406,14 +405,17 @@
 	width: 100%;
 	height: 100%;
 	pointer-events: none;
-	z-index: 1;
+	z-index: 4;
 }
 
-@media (prefers-reduced-motion: reduce) {
-	.fh-level-card, .fh-level-badge, .fh-level-fill, .fh-level-fill::after, .fh-level-sub, .fh-branch-row {
-		animation: none !important;
-		transition: none !important;
-	}
+.fh-reduce-motion .fh-level-card,
+.fh-reduce-motion .fh-level-badge,
+.fh-reduce-motion .fh-level-fill,
+.fh-reduce-motion .fh-level-fill::after,
+.fh-reduce-motion .fh-level-sub,
+.fh-reduce-motion .fh-branch-row {
+	animation: none !important;
+	transition: none !important;
 }
 .fh-no-anim, .fh-no-anim * { animation: none !important; transition: none !important; }
 

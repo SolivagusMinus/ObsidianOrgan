@@ -55,6 +55,9 @@ export class GraphTree {
 	private frozen = new Map<GraphRenderer, Set<string>>();
 	private freezeTimers = new Map<GraphRenderer, number>();
 	private depthCache: { hubs: Map<string, number>; all: Map<string, number> } | null = null;
+	private posCache: Map<string, Point> | null = null;
+	/** Target positions last sent to each graph, to skip no-op updates. */
+	private sent = new Map<GraphRenderer, Map<string, Point>>();
 
 	constructor(private plugin: FolderHubPlugin) {}
 
@@ -68,6 +71,7 @@ export class GraphTree {
 		const onTreeChange = (f: unknown) => {
 			if (f instanceof TFolder || (f instanceof TFile && f.extension === "md")) {
 				this.depthCache = null;
+				this.posCache = null;
 				this.refreshSoon();
 			}
 		};
@@ -97,6 +101,7 @@ export class GraphTree {
 	/** Re-applies the layout to every open global graph. */
 	refresh() {
 		this.depthCache = null;
+		this.posCache = null;
 		this.scan();
 		for (const r of this.originals.keys()) this.schedule(r);
 	}
@@ -135,6 +140,7 @@ export class GraphTree {
 			this.originals.delete(r);
 			this.views.delete(r);
 			this.pinned.delete(r);
+			this.sent.delete(r);
 		}
 	}
 
@@ -183,18 +189,34 @@ export class GraphTree {
 		this.grown.add(r);
 		if (this.growing.has(r)) return; // the running animation will finish the job
 
+		// Obsidian reloads graph data on every save. Pins are re-sent (cheap and
+		// safe if the worker dropped them), but the physics is only woken up
+		// when something actually moved — otherwise the graph would keep
+		// re-simulating while you type.
+		const last = this.sent.get(r) ?? new Map<string, Point>();
 		const now = new Set<string>();
+		let moved = false;
 		for (const [id, p] of target) {
 			if (!this.hasNode(r, id)) continue;
 			this.post(r, { forceNode: { id, x: p.x, y: p.y } });
 			now.add(id);
+			const q = last.get(id);
+			if (!q || Math.abs(q.x - p.x) > 0.5 || Math.abs(q.y - p.y) > 0.5) moved = true;
 		}
 		for (const id of prev) {
-			if (!now.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+			if (!now.has(id)) {
+				this.post(r, { forceNode: { id, x: null, y: null } });
+				moved = true;
+			}
 		}
 		this.pinned.set(r, now);
-		if (now.size || prev.size) this.reheat(r);
-		this.scheduleFreeze(r);
+		this.sent.set(r, new Map([...now].map((id) => [id, target.get(id)!])));
+		if (moved) {
+			this.reheat(r);
+			this.scheduleFreeze(r);
+		} else if (this.plugin.settings.graphFreeze && !this.frozen.has(r)) {
+			this.scheduleFreeze(r);
+		}
 	}
 
 	/** Branch by branch, level by level: nodes glide from the centre to their places. */
@@ -221,6 +243,7 @@ export class GraphTree {
 			}
 			if (done) {
 				this.growing.delete(r);
+				this.sent.set(r, new Map(ids.map((id) => [id, target.get(id)!])));
 				this.scheduleFreeze(r);
 			} else {
 				this.growing.set(r, window.requestAnimationFrame(step));
@@ -272,16 +295,8 @@ export class GraphTree {
 
 	/** Wakes the simulation up so nodes glide to their new places. */
 	private reheat(r: GraphRenderer) {
-		this.post(r, { alpha: 0.6, run: true });
+		this.post(r, { alpha: 0.3, run: true });
 		try {
-			const opts = this.views.get(r)?.dataEngine?.getOptions?.();
-			if (opts && typeof r.setForces === "function") {
-				const forces: Record<string, number> = {};
-				for (const k of ["centerStrength", "linkStrength", "linkDistance", "repelStrength"]) {
-					if (typeof opts[k] === "number") forces[k] = opts[k] as number;
-				}
-				if (Object.keys(forces).length) r.setForces(forces);
-			}
 			r.changed?.();
 		} catch {
 			/* ignore */
@@ -343,7 +358,8 @@ export class GraphTree {
 	}
 
 	positions(): Map<string, Point> {
-		return layoutSkillTree(this.buildTree(), this.layoutOptions());
+		if (!this.posCache) this.posCache = layoutSkillTree(this.buildTree(), this.layoutOptions());
+		return this.posCache;
 	}
 
 	// ------------------------------------------------------------- colours

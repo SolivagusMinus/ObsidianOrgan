@@ -1,23 +1,32 @@
 import { Platform, View } from "obsidian";
 import type FolderHubPlugin from "./main";
-import { drawRay } from "./rays";
+import { Quality, drawRay } from "./rays";
 
 // ---------------------------------------------------------------------------
 // Visual effects drawn on a transparent canvas laid over the graph view:
-// pulses from index notes, a wave that runs down each branch, link flow,
-// level-up bursts. The graph itself is never modified; we only read node
-// positions (undocumented renderer fields, all feature-checked).
+// pulses from index notes, rays down each branch, link flow, level-up bursts.
+// The graph itself is never modified; we only read node positions
+// (undocumented renderer fields, all feature-checked).
+//
+// Performance notes (the loop runs every frame, 60 fps):
+//  - no PIXI calls per node: one calibration per frame maps world → screen,
+//    then positions are plain arithmetic;
+//  - hub/link lists are cached and rebuilt only when the graph data changes;
+//  - no canvas shadowBlur (very slow); glow is additive blending + a cached sprite;
+//  - frames with nothing to draw are skipped entirely;
+//  - adaptive quality: if a frame takes too long, resolution and detail drop.
 // ---------------------------------------------------------------------------
+
+interface WorldTransform {
+	tx: number;
+	ty: number;
+}
 
 interface FxNode {
 	id: string;
 	x: number;
 	y: number;
-	circle?: {
-		getGlobalPosition?: () => { x: number; y: number };
-		getBounds?: () => { width: number };
-		visible?: boolean;
-	} | null;
+	circle?: { worldTransform?: WorldTransform } | null;
 	getSize?: () => number;
 }
 
@@ -36,9 +45,27 @@ interface FxRenderer {
 	px?: { screen?: { width: number } };
 }
 
+/** Per-graph cached lists, rebuilt only when the graph data changes. */
+interface Lists {
+	nodesRef: FxNode[] | undefined;
+	linksRef: FxLink[] | undefined;
+	nodeCount: number;
+	linkCount: number;
+	hubsRef: Map<string, number>;
+	hubNodes: FxNode[];
+	/** depth of each entry in hubNodes */
+	hubDepth: number[];
+	hubLinks: FxLink[];
+	hubLinkDepth: number[];
+	byId: Map<string, FxNode>;
+}
+
 interface Layer {
 	canvas: HTMLCanvasElement;
 	ctx: CanvasRenderingContext2D;
+	lists: Lists | null;
+	/** Whether the canvas currently has something drawn on it. */
+	dirty: boolean;
 }
 
 interface Burst {
@@ -46,18 +73,22 @@ interface Burst {
 	start: number;
 }
 
-const MAX_LINKS = 1500;
-const TRAVEL = 0.9; // seconds for a wave to cross one link
+const TRAVEL = 0.9; // seconds for a pulse to cross one link
 const LINGER = 0.35; // seconds a ray stays visible after arriving
-const MAX_RAYS = 400;
 const RING = 1.4; // seconds a ring lives
 
-function rgba(hex: string, alpha: number): string {
+/** Limits per quality level: [low, medium, high]. */
+const MAX_RAYS = [60, 180, 400];
+const MAX_FLOW = [250, 700, 1500];
+/** Canvas resolution cap. Effects are soft glows, so a lower resolution is barely visible but much cheaper. */
+const DPR_CAP = [0.75, 1, 1.5];
+
+function parseHex(hex: string): [number, number, number] {
 	const h = hex.replace("#", "");
 	const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h.slice(0, 6);
 	const n = parseInt(full, 16);
-	if (Number.isNaN(n)) return `rgba(229,165,10,${alpha})`;
-	return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+	if (Number.isNaN(n)) return [229, 165, 10];
+	return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
 const easeInOut = (k: number) => (k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2);
@@ -67,7 +98,22 @@ export class GraphFx {
 	private raf: number | null = null;
 	private t0 = performance.now();
 	private bursts: Burst[] = [];
-	private frame = 0;
+
+	// Adaptive quality
+	// Phones start at medium detail; desktops at high. Adjusted every 1.5 s.
+	private quality: Quality = Platform.isMobile ? 1 : 2;
+	private costEma = 0;
+	private lastQualityChange = 0;
+
+	// FPS meter
+	private lastFrame = 0;
+	private fpsEma = 60;
+
+	// Colour caches
+	private colorKey = "";
+	private colorFn: (a: number) => string = () => "";
+	private flowStyle = "";
+	private glowSprite: HTMLCanvasElement | null = null;
 
 	constructor(private plugin: FolderHubPlugin) {}
 
@@ -78,7 +124,7 @@ export class GraphFx {
 	get active(): boolean {
 		const s = this.plugin.settings;
 		const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-		const anything = s.fxRing || s.fxWave || s.fxGlow || s.linkFlow !== "off";
+		const anything = s.fxRing || s.fxWave || s.fxGlow || s.linkFlow !== "off" || s.fxShowFps;
 		return s.fxEnabled && s.animations && !reduced && anything;
 	}
 
@@ -111,12 +157,12 @@ export class GraphFx {
 				if (!this.layers.has(r)) {
 					if (getComputedStyle(host).position === "static") host.style.position = "relative";
 					const canvas = host.createEl("canvas", { cls: "fh-graph-fx" });
-					const ctx = canvas.getContext("2d");
+					const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true }) as CanvasRenderingContext2D | null;
 					if (!ctx) {
 						canvas.remove();
 						continue;
 					}
-					this.layers.set(r, { canvas, ctx });
+					this.layers.set(r, { canvas, ctx, lists: null, dirty: false });
 				}
 			}
 		}
@@ -125,6 +171,10 @@ export class GraphFx {
 			l.canvas.remove();
 			this.layers.delete(r);
 		}
+		// Settings may have changed: drop caches.
+		this.colorKey = "";
+		for (const l of this.layers.values()) l.lists = null;
+
 		if (this.layers.size && this.raf === null) this.raf = window.requestAnimationFrame(this.loop);
 		if (!this.layers.size && this.raf !== null) {
 			window.cancelAnimationFrame(this.raf);
@@ -139,173 +189,337 @@ export class GraphFx {
 
 	private loop = (now: number) => {
 		this.raf = window.requestAnimationFrame(this.loop);
+		if (this.lastFrame) {
+			const dt = now - this.lastFrame;
+			if (dt > 0 && dt < 1000) this.fpsEma = this.fpsEma * 0.92 + (1000 / dt) * 0.08;
+		}
+		this.lastFrame = now;
 		if (document.hidden) return;
-		// Phones: ~30 fps is plenty and saves battery.
-		if (Platform.isMobile && this.frame++ % 2) return;
-		this.bursts = this.bursts.filter((b) => now - b.start < 2600);
+		if (this.bursts.length) this.bursts = this.bursts.filter((b) => now - b.start < 2600);
+
+		const start = performance.now();
 		for (const [r, layer] of this.layers) {
 			try {
 				this.draw(r, layer, now);
 			} catch (e) {
-				console.warn("Folder Hub: graph effects failed, turning them off for this view", e);
+				console.warn("ObsOrg: graph effects failed, turning them off for this view", e);
 				layer.canvas.remove();
 				this.layers.delete(r);
 			}
 		}
+		this.adapt(performance.now() - start, now);
 	};
 
-	private draw(r: FxRenderer, { canvas, ctx }: Layer, now: number) {
+	/**
+	 * Lowers detail when frames get expensive or the frame rate drops below
+	 * ~50 fps (the GPU can be the bottleneck even when our code is fast),
+	 * raises it again when there's clear headroom.
+	 */
+	private adapt(cost: number, now: number) {
+		this.costEma = this.costEma * 0.9 + cost * 0.1;
+		if (now - this.lastQualityChange < 1500) return;
+		if ((this.costEma > 6 || this.fpsEma < 50) && this.quality > 0) {
+			this.quality = (this.quality - 1) as Quality;
+			this.lastQualityChange = now;
+		} else if (this.costEma < 2 && this.fpsEma > 57 && this.quality < 2) {
+			this.quality = (this.quality + 1) as Quality;
+			this.lastQualityChange = now;
+		}
+	}
+
+	private colors() {
+		const s = this.plugin.settings;
+		const key = `${s.fxColor}|${s.linkFlowColor}`;
+		if (key !== this.colorKey) {
+			this.colorKey = key;
+			const [r, g, b] = parseHex(s.fxColor);
+			this.colorFn = (a: number) => `rgba(${r},${g},${b},${a < 0 ? 0 : a > 1 ? 1 : a.toFixed(3)})`;
+			const [fr, fg, fb] = parseHex(s.linkFlowColor);
+			this.flowStyle = `rgba(${fr},${fg},${fb},0.7)`;
+			// Soft glow sprite, drawn once and stamped with drawImage.
+			const sprite = document.createElement("canvas");
+			sprite.width = sprite.height = 64;
+			const sc = sprite.getContext("2d");
+			if (sc) {
+				const grad = sc.createRadialGradient(32, 32, 0, 32, 32, 32);
+				grad.addColorStop(0, `rgba(${r},${g},${b},1)`);
+				grad.addColorStop(0.4, `rgba(${r},${g},${b},0.45)`);
+				grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+				sc.fillStyle = grad;
+				sc.fillRect(0, 0, 64, 64);
+			}
+			this.glowSprite = sprite;
+		}
+		return this.colorFn;
+	}
+
+	private lists(layer: Layer, r: FxRenderer): Lists {
+		const hubs = this.plugin.graphTree.hubDepths();
+		const nodes = r.nodes;
+		const links = r.links;
+		const l = layer.lists;
+		if (
+			l &&
+			l.nodesRef === nodes &&
+			l.linksRef === links &&
+			l.nodeCount === (nodes?.length ?? 0) &&
+			l.linkCount === (links?.length ?? 0) &&
+			l.hubsRef === hubs
+		) {
+			return l;
+		}
+		const byId = new Map<string, FxNode>();
+		const hubNodes: FxNode[] = [];
+		const hubDepth: number[] = [];
+		for (const n of nodes ?? []) {
+			byId.set(n.id, n);
+			const d = hubs.get(n.id);
+			if (d !== undefined) {
+				hubNodes.push(n);
+				hubDepth.push(d);
+			}
+		}
+		const hubLinks: FxLink[] = [];
+		const hubLinkDepth: number[] = [];
+		for (const link of links ?? []) {
+			const d = hubs.get(link.source.id);
+			if (d !== undefined) {
+				hubLinks.push(link);
+				hubLinkDepth.push(d);
+			}
+		}
+		layer.lists = {
+			nodesRef: nodes,
+			linksRef: links,
+			nodeCount: nodes?.length ?? 0,
+			linkCount: links?.length ?? 0,
+			hubsRef: hubs,
+			hubNodes,
+			hubDepth,
+			hubLinks,
+			hubLinkDepth,
+			byId,
+		};
+		return layer.lists;
+	}
+
+	/**
+	 * World → screen mapping for this frame: screen = world · S + offset.
+	 * Calibrated from the node sprites' world transforms (read-only, no PIXI
+	 * calls), checked against a second node; falls back to pan/scale.
+	 */
+	private mapping(r: FxRenderer, nodes: FxNode[], ratio: number) {
+		let S = r.scale ?? 1;
+		let ox = r.panX ?? 0;
+		let oy = r.panY ?? 0;
+		const samples: FxNode[] = [];
+		for (let i = 0; i < nodes.length && samples.length < 4; i++) {
+			const n = nodes[i] as FxNode & { rendered?: boolean };
+			const wt = n.circle?.worldTransform;
+			if (n.rendered !== false && wt && Number.isFinite(wt.tx) && Number.isFinite(wt.ty)) samples.push(n);
+		}
+		if (samples.length) {
+			const a = samples[0];
+			const wa = a.circle!.worldTransform!;
+			let cS = S;
+			const b = samples.find((n) => Math.abs(n.x - a.x) > 1);
+			if (b) {
+				const s2 = (b.circle!.worldTransform!.tx - wa.tx) / (b.x - a.x);
+				if (Number.isFinite(s2) && s2 > 0) cS = s2;
+			}
+			const cx = wa.tx - a.x * cS;
+			const cy = wa.ty - a.y * cS;
+			// Every sample must agree with the mapping, otherwise keep pan/scale.
+			const ok = samples.every((n) => {
+				const wt = n.circle!.worldTransform!;
+				return Math.abs(n.x * cS + cx - wt.tx) < 2 && Math.abs(n.y * cS + cy - wt.ty) < 2;
+			});
+			if (ok) {
+				S = cS;
+				ox = cx;
+				oy = cy;
+			}
+		}
+		return { S: S * ratio, ox: ox * ratio, oy: oy * ratio };
+	}
+
+	private draw(r: FxRenderer, layer: Layer, now: number) {
+		const { canvas, ctx } = layer;
 		const host = r.containerEl!;
 		const w = host.clientWidth;
 		const h = host.clientHeight;
-		if (!w || !h) return;
-		const dpr = window.devicePixelRatio || 1;
-		if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
-			canvas.width = Math.round(w * dpr);
-			canvas.height = Math.round(h * dpr);
-		}
-		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-		ctx.clearRect(0, 0, w, h);
+		if (!w || !h || host.offsetParent === null) return; // hidden tab
 
 		const s = this.plugin.settings;
-		const nodes = r.nodes ?? [];
-		if (!nodes.length) return;
-		const ratio = w / (r.px?.screen?.width || w);
-		const scale = r.scale ?? 1;
-
-		// Screen position of each node, computed once per frame.
-		const cache = new Map<FxNode, { x: number; y: number }>();
-		const pos = (n: FxNode) => {
-			let p = cache.get(n);
-			if (!p) {
-				const g = n.circle?.getGlobalPosition?.();
-				p = g
-					? { x: g.x * ratio, y: g.y * ratio }
-					: { x: (n.x * scale + (r.panX ?? 0)) * ratio, y: (n.y * scale + (r.panY ?? 0)) * ratio };
-				cache.set(n, p);
-			}
-			return p;
-		};
-		const radius = (n: FxNode) => {
-			try {
-				const b = n.circle?.getBounds?.();
-				if (b && b.width > 0) return (b.width / 2) * ratio;
-			} catch {
-				/* ignore */
-			}
-			return (n.getSize?.() ?? 6) * scale * ratio;
-		};
-		const onScreen = (p: { x: number; y: number }, pad = 120) =>
-			p.x > -pad && p.y > -pad && p.x < w + pad && p.y < h + pad;
-
-		const hubs = this.plugin.graphTree.hubDepths();
 		const t = (now - this.t0) / 1000;
 		const interval = Math.max(1, s.fxInterval);
 		const phase = t % interval;
-		const links = r.links ?? [];
+		const nodes = r.nodes ?? [];
+		const lists = this.lists(layer, r);
+		const q = this.quality;
 
-		// ---- link flow (moving dashes, source → target)
-		if (s.linkFlow !== "off" && links.length) {
-			ctx.save();
+		// Is anything visible this frame? Pulse-only setups are idle most of the time.
+		const maxDepth = lists.hubDepth.length ? Math.max(...lists.hubDepth) : 1;
+		const pulseWindow = (maxDepth - 1) * (s.fxWave ? TRAVEL : 0) + Math.max(RING, TRAVEL + LINGER);
+		const busy =
+			s.fxGlow ||
+			s.fxShowFps ||
+			s.linkFlow !== "off" ||
+			(s.fxWave && s.rayMode === "constant") ||
+			this.bursts.length > 0 ||
+			((s.fxRing || s.fxWave) && phase < pulseWindow);
+		if (!busy) {
+			if (layer.dirty) {
+				ctx.setTransform(1, 0, 0, 1, 0, 0);
+				ctx.clearRect(0, 0, canvas.width, canvas.height);
+				layer.dirty = false;
+			}
+			return;
+		}
+
+		const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP[q]);
+		const cw = Math.round(w * dpr);
+		const ch = Math.round(h * dpr);
+		if (canvas.width !== cw || canvas.height !== ch) {
+			canvas.width = cw;
+			canvas.height = ch;
+		}
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		ctx.clearRect(0, 0, w, h);
+		layer.dirty = true;
+		if (!nodes.length) return;
+
+		const color = this.colors();
+		const ratio = w / (r.px?.screen?.width || w);
+		const { S, ox, oy } = this.mapping(r, nodes, ratio);
+		const X = (n: FxNode) => n.x * S + ox;
+		const Y = (n: FxNode) => n.y * S + oy;
+		const radius = (n: FxNode) => Math.max(3, (n.getSize?.() ?? 6) * S);
+		const PAD = 120;
+		const visible = (x: number, y: number) => x > -PAD && y > -PAD && x < w + PAD && y < h + PAD;
+		const segVisible = (ax: number, ay: number, bx: number, by: number) =>
+			!((ax < -PAD && bx < -PAD) || (ay < -PAD && by < -PAD) || (ax > w + PAD && bx > w + PAD) || (ay > h + PAD && by > h + PAD));
+		const emitAt = (depth: number) => (depth - 1) * (s.fxWave ? TRAVEL : 0);
+
+		// ---- link flow: moving dashes (one batched path)
+		if (s.linkFlow !== "off") {
+			const source = s.linkFlow === "hubs" ? lists.hubLinks : r.links ?? [];
+			const limit = MAX_FLOW[q];
 			ctx.beginPath();
 			let count = 0;
-			for (const l of links) {
-				if (count >= MAX_LINKS) break;
-				if (s.linkFlow === "hubs" && !hubs.has(l.source.id)) continue;
-				const a = pos(l.source);
-				const b = pos(l.target);
-				if (!onScreen(a, 0) && !onScreen(b, 0)) continue;
-				ctx.moveTo(a.x, a.y);
-				ctx.lineTo(b.x, b.y);
+			for (let i = 0; i < source.length && count < limit; i++) {
+				const l = source[i];
+				const ax = X(l.source);
+				const ay = Y(l.source);
+				const bx = X(l.target);
+				const by = Y(l.target);
+				if (!segVisible(ax, ay, bx, by)) continue;
+				ctx.moveTo(ax, ay);
+				ctx.lineTo(bx, by);
 				count++;
 			}
-			ctx.setLineDash([3, 9]);
-			ctx.lineDashOffset = -((t * s.linkFlowSpeed) % 12);
-			ctx.strokeStyle = rgba(s.linkFlowColor, 0.7);
-			ctx.lineWidth = 1.4;
-			ctx.lineCap = "round";
-			ctx.stroke();
-			ctx.restore();
-		}
-
-		const hubNodes = nodes.filter((n) => hubs.has(n.id));
-
-		// ---- breathing glow
-		if (s.fxGlow) {
-			const a = 0.18 + 0.14 * Math.sin((t * Math.PI * 2) / 2.6);
-			for (const n of hubNodes) {
-				const p = pos(n);
-				if (!onScreen(p)) continue;
-				const rr = radius(n) * 2.8 + 6;
-				const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, rr);
-				g.addColorStop(0, rgba(s.fxColor, a));
-				g.addColorStop(1, rgba(s.fxColor, 0));
-				ctx.fillStyle = g;
-				ctx.beginPath();
-				ctx.arc(p.x, p.y, rr, 0, Math.PI * 2);
-				ctx.fill();
+			if (count) {
+				ctx.setLineDash([3, 9]);
+				ctx.lineDashOffset = -((t * s.linkFlowSpeed) % 12);
+				ctx.strokeStyle = this.flowStyle;
+				ctx.lineWidth = 1.4;
+				ctx.lineCap = "round";
+				ctx.stroke();
+				ctx.setLineDash([]);
 			}
 		}
 
-		// Each hub fires when the wave reaches its depth: top-level first, then deeper.
-		const emitAt = (id: string) => ((hubs.get(id) ?? 1) - 1) * (s.fxWave ? TRAVEL : 0);
+		ctx.globalCompositeOperation = "lighter"; // additive light: cheap glow
+
+		// ---- breathing glow (cached sprite)
+		if (s.fxGlow && this.glowSprite) {
+			ctx.globalAlpha = 0.3 + 0.2 * Math.sin((t * Math.PI * 2) / 2.6);
+			for (const n of lists.hubNodes) {
+				const x = X(n);
+				const y = Y(n);
+				if (!visible(x, y)) continue;
+				const rr = radius(n) * 3 + 8;
+				ctx.drawImage(this.glowSprite, x - rr, y - rr, rr * 2, rr * 2);
+			}
+			ctx.globalAlpha = 1;
+		}
 
 		// ---- pulse rings
 		if (s.fxRing) {
-			for (const n of hubNodes) {
-				const age = phase - emitAt(n.id);
+			for (let i = 0; i < lists.hubNodes.length; i++) {
+				const age = phase - emitAt(lists.hubDepth[i]);
 				if (age < 0 || age > RING) continue;
-				const p = pos(n);
-				if (!onScreen(p)) continue;
+				const n = lists.hubNodes[i];
+				const x = X(n);
+				const y = Y(n);
+				if (!visible(x, y)) continue;
 				const k = age / RING;
 				const base = radius(n);
 				ctx.beginPath();
-				ctx.arc(p.x, p.y, base + 4 + k * (28 + base * 1.5), 0, Math.PI * 2);
-				ctx.strokeStyle = rgba(s.fxColor, (1 - k) * 0.85);
+				ctx.arc(x, y, base + 4 + k * (28 + base * 1.5), 0, Math.PI * 2);
+				ctx.strokeStyle = color((1 - k) * 0.85);
 				ctx.lineWidth = 2.5 * (1 - k) + 0.6;
 				ctx.stroke();
 			}
 		}
 
 		// ---- rays: spark / beam / energy / electricity from each hub along its links
-		if (s.fxWave && links.length) {
-			const color = (a: number) => rgba(s.fxColor, a);
+		if (s.fxWave) {
 			const constant = s.rayMode === "constant";
+			const limit = MAX_RAYS[q];
 			let count = 0;
-			links.forEach((l, i) => {
-				if (count >= MAX_RAYS || !hubs.has(l.source.id)) return;
+			const a = { x: 0, y: 0 };
+			const b = { x: 0, y: 0 };
+			for (let i = 0; i < lists.hubLinks.length && count < limit; i++) {
 				let head = 1;
 				let alpha = 1;
 				if (!constant) {
-					const age = phase - emitAt(l.source.id);
-					if (age < 0 || age > TRAVEL + LINGER) return;
+					const age = phase - emitAt(lists.hubLinkDepth[i]);
+					if (age < 0 || age > TRAVEL + LINGER) continue;
 					head = easeInOut(Math.min(1, age / TRAVEL));
 					alpha = age <= TRAVEL ? 1 : 1 - (age - TRAVEL) / LINGER;
 				}
-				const a = pos(l.source);
-				const b = pos(l.target);
-				if (!onScreen(a) && !onScreen(b)) return;
+				const l = lists.hubLinks[i];
+				a.x = X(l.source);
+				a.y = Y(l.source);
+				b.x = X(l.target);
+				b.y = Y(l.target);
+				if (!segVisible(a.x, a.y, b.x, b.y)) continue;
 				count++;
-				drawRay(ctx, a, b, { style: s.rayStyle, head, alpha, t, seed: i, color, width: s.rayWidth, constant });
-			});
+				drawRay(ctx, a, b, { style: s.rayStyle, head, alpha, t, seed: i, color, width: s.rayWidth, constant, quality: q });
+			}
 		}
 
 		// ---- level-up bursts: three big rings
-		for (const b of this.bursts) {
-			const n = nodes.find((x) => x.id === b.id);
+		for (const burst of this.bursts) {
+			const n = lists.byId.get(burst.id);
 			if (!n) continue;
-			const p = pos(n);
+			const x = X(n);
+			const y = Y(n);
 			const base = radius(n);
 			for (let i = 0; i < 3; i++) {
-				const age = (now - b.start) / 1000 - i * 0.35;
+				const age = (now - burst.start) / 1000 - i * 0.35;
 				if (age < 0 || age > 1.6) continue;
 				const k = age / 1.6;
 				ctx.beginPath();
-				ctx.arc(p.x, p.y, base + 6 + k * 110, 0, Math.PI * 2);
-				ctx.strokeStyle = rgba(s.fxColor, (1 - k) * 0.95);
+				ctx.arc(x, y, base + 6 + k * 110, 0, Math.PI * 2);
+				ctx.strokeStyle = color((1 - k) * 0.95);
 				ctx.lineWidth = 4 * (1 - k) + 1;
 				ctx.stroke();
 			}
+		}
+		ctx.globalCompositeOperation = "source-over";
+
+		// ---- FPS meter
+		if (s.fxShowFps) {
+			const fps = Math.round(this.fpsEma);
+			const label = `${fps} FPS · ${["низкое", "среднее", "высокое"][q]}`;
+			ctx.font = "600 12px var(--font-interface, sans-serif)";
+			const tw = ctx.measureText(label).width;
+			ctx.fillStyle = "rgba(0,0,0,0.55)";
+			ctx.fillRect(w - tw - 22, 8, tw + 14, 22);
+			ctx.fillStyle = fps >= 55 ? "#44cf6e" : fps >= 40 ? "#e0de71" : "#fb464c";
+			ctx.fillText(label, w - tw - 15, 23);
 		}
 	}
 }

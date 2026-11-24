@@ -1,7 +1,14 @@
 // Animated "rays" drawn along graph links: spark, beam, energy, electricity.
 // Pure canvas drawing, no Obsidian dependency.
+//
+// Performance: no shadowBlur anywhere (it is the slowest thing canvas can do,
+// especially on phones). Glow comes from a wide, faint stroke under a thin
+// bright core, drawn with additive blending by the caller.
 
 export type RayStyle = "spark" | "beam" | "energy" | "lightning";
+
+/** 0 = low, 1 = medium, 2 = high detail. */
+export type Quality = 0 | 1 | 2;
 
 export const RAY_STYLES: Record<RayStyle, string> = {
 	spark: "Искра",
@@ -31,6 +38,8 @@ export interface RayParams {
 	width: number;
 	/** True when the ray is shown permanently rather than as a travelling pulse. */
 	constant: boolean;
+	/** Detail level (adaptive). Defaults to high. */
+	quality?: Quality;
 }
 
 /** Small deterministic PRNG (mulberry32). */
@@ -45,18 +54,16 @@ export function rng(seed: number): () => number {
 	};
 }
 
-const lerp = (a: Pt, b: Pt, k: number): Pt => ({ x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k });
-const WHITE = (a: number) => `rgba(255,255,255,${a})`;
+const WHITE = (a: number) => `rgba(255,255,255,${a < 0 ? 0 : a > 1 ? 1 : a.toFixed(3)})`;
 
 export function drawRay(ctx: CanvasRenderingContext2D, a: Pt, b: Pt, p: RayParams) {
 	const len = Math.hypot(b.x - a.x, b.y - a.y);
 	if (len < 2 || p.alpha <= 0.01 || p.head <= 0) return;
-	ctx.save();
 	ctx.lineCap = "round";
 	ctx.lineJoin = "round";
 	switch (p.style) {
 		case "beam":
-			drawBeam(ctx, a, b, len, p);
+			drawBeam(ctx, a, b, p);
 			break;
 		case "energy":
 			drawEnergy(ctx, a, b, len, p);
@@ -67,154 +74,152 @@ export function drawRay(ctx: CanvasRenderingContext2D, a: Pt, b: Pt, p: RayParam
 		default:
 			drawSpark(ctx, a, b, p);
 	}
-	ctx.restore();
+}
+
+function dot(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, style: string) {
+	ctx.fillStyle = style;
+	ctx.beginPath();
+	ctx.arc(x, y, r, 0, Math.PI * 2);
+	ctx.fill();
+}
+
+function line(ctx: CanvasRenderingContext2D, ax: number, ay: number, bx: number, by: number, width: number, style: string | CanvasGradient) {
+	ctx.strokeStyle = style;
+	ctx.lineWidth = width;
+	ctx.beginPath();
+	ctx.moveTo(ax, ay);
+	ctx.lineTo(bx, by);
+	ctx.stroke();
 }
 
 function drawSpark(ctx: CanvasRenderingContext2D, a: Pt, b: Pt, p: RayParams) {
 	// In constant mode the spark loops along the link forever.
 	const k = p.constant ? (p.t * 0.55 + p.seed * 0.137) % 1 : p.head;
-	const h = lerp(a, b, k);
-	ctx.shadowColor = p.color(0.9 * p.alpha);
-	ctx.shadowBlur = 10;
-	ctx.fillStyle = p.color(0.95 * p.alpha);
-	ctx.beginPath();
-	ctx.arc(h.x, h.y, 2.6 * p.width, 0, Math.PI * 2);
-	ctx.fill();
+	const x = a.x + (b.x - a.x) * k;
+	const y = a.y + (b.y - a.y) * k;
+	dot(ctx, x, y, 6 * p.width, p.color(0.25 * p.alpha)); // halo
+	dot(ctx, x, y, 2.6 * p.width, p.color(0.95 * p.alpha));
 }
 
 /** A laser beam: glowing line with a white-hot head and a fading tail. */
-function drawBeam(ctx: CanvasRenderingContext2D, a: Pt, b: Pt, _len: number, p: RayParams) {
+function drawBeam(ctx: CanvasRenderingContext2D, a: Pt, b: Pt, p: RayParams) {
 	let alpha = p.alpha;
 	if (p.constant) alpha *= 0.55 + 0.45 * Math.sin(p.t * 3.2 + p.seed);
-	const head = lerp(a, b, p.head);
-	const tail = p.constant ? a : lerp(a, b, Math.max(0, p.head - 0.5));
+	const hk = p.head;
+	const tk = p.constant ? 0 : Math.max(0, hk - 0.5);
+	const hx = a.x + (b.x - a.x) * hk;
+	const hy = a.y + (b.y - a.y) * hk;
+	const tx = a.x + (b.x - a.x) * tk;
+	const ty = a.y + (b.y - a.y) * tk;
 
-	// Outer glow
-	ctx.shadowColor = p.color(alpha);
-	ctx.shadowBlur = 14;
-	ctx.strokeStyle = p.color(0.22 * alpha);
-	ctx.lineWidth = 6 * p.width;
-	ctx.beginPath();
-	ctx.moveTo(tail.x, tail.y);
-	ctx.lineTo(head.x, head.y);
-	ctx.stroke();
-
-	// Core: transparent tail → colour → white head
-	const g = ctx.createLinearGradient(tail.x, tail.y, head.x, head.y);
+	if ((p.quality ?? 2) === 2) line(ctx, tx, ty, hx, hy, 7 * p.width, p.color(0.12 * alpha)); // wide glow
+	line(ctx, tx, ty, hx, hy, 3.5 * p.width, p.color(0.26 * alpha));
+	const g = ctx.createLinearGradient(tx, ty, hx, hy);
 	g.addColorStop(0, p.color(p.constant ? 0.5 * alpha : 0));
 	g.addColorStop(0.7, p.color(0.9 * alpha));
 	g.addColorStop(1, WHITE(alpha));
-	ctx.shadowBlur = 6;
-	ctx.strokeStyle = g;
-	ctx.lineWidth = 1.8 * p.width;
-	ctx.beginPath();
-	ctx.moveTo(tail.x, tail.y);
-	ctx.lineTo(head.x, head.y);
-	ctx.stroke();
+	line(ctx, tx, ty, hx, hy, 1.6 * p.width, g);
 
-	if (!p.constant && p.head < 1) {
-		ctx.fillStyle = WHITE(alpha);
-		ctx.shadowBlur = 12;
-		ctx.beginPath();
-		ctx.arc(head.x, head.y, 2.4 * p.width, 0, Math.PI * 2);
-		ctx.fill();
+	if (!p.constant && hk < 1) {
+		dot(ctx, hx, hy, 6 * p.width, p.color(0.3 * alpha));
+		dot(ctx, hx, hy, 2.2 * p.width, WHITE(alpha));
 	}
 }
 
 /** A wavy plasma stream with bright blobs running along it. */
 function drawEnergy(ctx: CanvasRenderingContext2D, a: Pt, b: Pt, len: number, p: RayParams) {
+	const q = p.quality ?? 2;
 	const ux = (b.x - a.x) / len;
 	const uy = (b.y - a.y) / len;
-	const nx = -uy;
-	const ny = ux;
 	const amp = 3.6 * p.width;
-	const steps = Math.max(10, Math.round((len * p.head) / 5));
-	const at = (s: number, phaseShift: number): Pt => {
-		const taper = Math.sin(Math.PI * Math.min(1, s)); // calm at both ends
-		const off = amp * taper * Math.sin((s * len) / 9 - p.t * 7 + p.seed + phaseShift);
-		return { x: a.x + ux * s * len + nx * off, y: a.y + uy * s * len + ny * off };
-	};
+	const steps = Math.min(q === 2 ? 36 : q === 1 ? 24 : 14, Math.max(8, Math.round((len * p.head) / 9)));
+	const wave = (s: number, shift: number) =>
+		amp * Math.sin(Math.PI * Math.min(1, s)) * Math.sin((s * len) / 9 - p.t * 7 + p.seed + shift);
 
-	// Two intertwined strands
-	for (const [shift, width, alpha] of [
-		[0, 4.5, 0.22],
-		[0, 1.6, 0.95],
-		[Math.PI, 1.1, 0.6],
-	] as const) {
-		ctx.shadowColor = p.color(p.alpha);
-		ctx.shadowBlur = width > 2 ? 16 : 8;
-		ctx.strokeStyle = p.color(alpha * p.alpha);
-		ctx.lineWidth = width * p.width;
+	const strand = (shift: number, width: number, style: string) => {
+		ctx.strokeStyle = style;
+		ctx.lineWidth = width;
 		ctx.beginPath();
 		for (let i = 0; i <= steps; i++) {
-			const pt = at((i / steps) * p.head, shift);
-			if (i === 0) ctx.moveTo(pt.x, pt.y);
-			else ctx.lineTo(pt.x, pt.y);
+			const s = (i / steps) * p.head;
+			const off = wave(s, shift);
+			const x = a.x + ux * s * len - uy * off;
+			const y = a.y + uy * s * len + ux * off;
+			if (i === 0) ctx.moveTo(x, y);
+			else ctx.lineTo(x, y);
 		}
 		ctx.stroke();
-	}
+	};
+
+	strand(0, (q === 2 ? 6 : 4) * p.width, p.color(0.16 * p.alpha)); // glow
+	strand(0, 1.6 * p.width, p.color(0.95 * p.alpha));
+	if (q > 0) strand(Math.PI, 1.1 * p.width, p.color(0.6 * p.alpha));
 
 	// Energy blobs
-	ctx.shadowBlur = 12;
-	for (let j = 0; j < 3; j++) {
+	const blobs = q === 0 ? 1 : 3;
+	for (let j = 0; j < blobs; j++) {
 		const s = (p.t * 0.7 + j / 3 + p.seed * 0.171) % 1;
 		if (s > p.head) continue;
-		const pt = at(s, 0);
-		ctx.fillStyle = WHITE(0.9 * p.alpha);
-		ctx.beginPath();
-		ctx.arc(pt.x, pt.y, 2.2 * p.width, 0, Math.PI * 2);
-		ctx.fill();
+		const off = wave(s, 0);
+		const x = a.x + ux * s * len - uy * off;
+		const y = a.y + uy * s * len + ux * off;
+		dot(ctx, x, y, 5 * p.width, p.color(0.3 * p.alpha));
+		dot(ctx, x, y, 2 * p.width, WHITE(0.9 * p.alpha));
 	}
 }
 
 /** A flickering lightning bolt with side branches, re-rolled ~18 times a second. */
 function drawLightning(ctx: CanvasRenderingContext2D, a: Pt, b: Pt, len: number, p: RayParams) {
+	const q = p.quality ?? 2;
 	const r = rng(Math.floor(p.t * 18) * 9973 + p.seed * 7919);
-	const end = lerp(a, b, p.head);
-	const segLen = Math.hypot(end.x - a.x, end.y - a.y);
+	const ex = a.x + (b.x - a.x) * p.head;
+	const ey = a.y + (b.y - a.y) * p.head;
+	const segLen = Math.hypot(ex - a.x, ey - a.y);
 	if (segLen < 2) return;
-	const ux = (end.x - a.x) / segLen;
-	const uy = (end.y - a.y) / segLen;
-	const nx = -uy;
-	const ny = ux;
-	const n = Math.max(4, Math.round(segLen / 13));
+	const ux = (ex - a.x) / segLen;
+	const uy = (ey - a.y) / segLen;
+	const n = Math.min(q === 2 ? 18 : q === 1 ? 12 : 7, Math.max(4, Math.round(segLen / 14)));
 	const jitter = Math.min(14, len * 0.08) * (0.7 + 0.3 * p.width);
 
-	const pts: Pt[] = [];
+	const xs = new Array<number>(n + 1);
+	const ys = new Array<number>(n + 1);
 	for (let i = 0; i <= n; i++) {
 		const s = i / n;
 		const off = i === 0 || i === n ? 0 : (r() * 2 - 1) * jitter * Math.sin(Math.PI * s);
-		pts.push({ x: a.x + ux * s * segLen + nx * off, y: a.y + uy * s * segLen + ny * off });
+		xs[i] = a.x + ux * s * segLen - uy * off;
+		ys[i] = a.y + uy * s * segLen + ux * off;
 	}
 	const alpha = p.alpha * (0.55 + r() * 0.45); // flicker
 
-	const stroke = (path: Pt[], width: number, style: string, blur: number) => {
-		ctx.shadowColor = p.color(alpha);
-		ctx.shadowBlur = blur;
+	const path = (px: number[], py: number[], width: number, style: string) => {
 		ctx.strokeStyle = style;
 		ctx.lineWidth = width;
 		ctx.beginPath();
-		path.forEach((pt, i) => (i ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y)));
+		ctx.moveTo(px[0], py[0]);
+		for (let i = 1; i < px.length; i++) ctx.lineTo(px[i], py[i]);
 		ctx.stroke();
 	};
 
-	stroke(pts, 4.5 * p.width, p.color(0.35 * alpha), 18);
-	stroke(pts, 1.3 * p.width, WHITE(0.95 * alpha), 6);
+	if (q === 2) path(xs, ys, 6 * p.width, p.color(0.16 * alpha)); // glow
+	path(xs, ys, 2.6 * p.width, p.color(0.45 * alpha));
+	path(xs, ys, 1.1 * p.width, WHITE(0.95 * alpha));
 
 	// Side branches
-	for (let i = 1; i < pts.length - 1; i++) {
-		if (r() > 0.2) continue;
+	if (q === 0) return;
+	const chance = q === 2 ? 0.2 : 0.1;
+	for (let i = 1; i < n; i++) {
+		if (r() > chance) continue;
 		const dir = Math.atan2(uy, ux) + (r() < 0.5 ? -1 : 1) * (0.4 + r() * 0.6);
-		const branch: Pt[] = [pts[i]];
-		let cur = pts[i];
+		const bx = [xs[i]];
+		const by = [ys[i]];
 		const parts = 2 + Math.floor(r() * 2);
 		for (let k = 0; k < parts; k++) {
 			const l = 6 + r() * 10;
 			const d = dir + (r() * 2 - 1) * 0.5;
-			cur = { x: cur.x + Math.cos(d) * l, y: cur.y + Math.sin(d) * l };
-			branch.push(cur);
+			bx.push(bx[bx.length - 1] + Math.cos(d) * l);
+			by.push(by[by.length - 1] + Math.sin(d) * l);
 		}
-		stroke(branch, 2.4 * p.width, p.color(0.3 * alpha), 10);
-		stroke(branch, 0.8 * p.width, WHITE(0.8 * alpha), 4);
+		path(bx, by, 2.4 * p.width, p.color(0.3 * alpha));
+		path(bx, by, 0.8 * p.width, WHITE(0.8 * alpha));
 	}
 }

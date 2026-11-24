@@ -75,6 +75,7 @@ export interface FolderHubSettings {
 	linkFlowSpeed: number;
 	graphGrow: boolean;
 	graphFreeze: boolean;
+	fxShowFps: boolean;
 }
 
 export const DEFAULT_NOTE_TEMPLATE = `---
@@ -149,6 +150,7 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	linkFlowSpeed: 30,
 	graphGrow: true,
 	graphFreeze: false,
+	fxShowFps: false,
 };
 
 export class FolderHubSettingTab extends PluginSettingTab {
@@ -800,6 +802,19 @@ export class FolderHubSettingTab extends PluginSettingTab {
 			.addToggle((t) =>
 				t.setValue(s.graphGrow).onChange(async (v) => {
 					s.graphGrow = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Показывать FPS")
+			.setDesc(
+				"Счётчик кадров в углу графа и текущее качество эффектов. Качество подстраивается само: " +
+					"если кадр рисуется слишком долго, эффекты упрощаются, чтобы держать 60 FPS.",
+			)
+			.addToggle((t) =>
+				t.setValue(s.fxShowFps).onChange(async (v) => {
+					s.fxShowFps = v;
 					await save();
 				}),
 			);

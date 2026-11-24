@@ -415,10 +415,10 @@ var CalendarView = class extends import_obsidian3.ItemView {
       });
     }
     this.weekEl.querySelector(".fh-week-total")?.setText(`${total.toLocaleString()} ${pluralRu(total, WORDS)}`);
-    const line = this.weekEl.querySelector(".fh-goal-line");
-    if (line) {
-      line.style.bottom = `${goal / max * 100}%`;
-      (0, import_obsidian3.setTooltip)(line, `\u0426\u0435\u043B\u044C: ${goal.toLocaleString()}`);
+    const line2 = this.weekEl.querySelector(".fh-goal-line");
+    if (line2) {
+      line2.style.bottom = `${goal / max * 100}%`;
+      (0, import_obsidian3.setTooltip)(line2, `\u0426\u0435\u043B\u044C: ${goal.toLocaleString()}`);
     }
     this.weekEl.querySelectorAll(".fh-bar-col").forEach((col, i) => {
       const v = values[i];
@@ -571,10 +571,10 @@ var CalendarView = class extends import_obsidian3.ItemView {
     }
     const title = date.format("D MMMM YYYY, dddd");
     el.createDiv({ cls: "fh-title", text: title.charAt(0).toUpperCase() + title.slice(1) });
-    const line = el.createDiv({ cls: "fh-detail-line" });
-    (0, import_obsidian3.setIcon)(line.createSpan({ cls: "fh-icon" }), "pencil");
-    line.createSpan({ text: `${stat.added.toLocaleString()} ${pluralRu(stat.added, WORDS)} \u043D\u0430\u043F\u0438\u0441\u0430\u043D\u043E` });
-    if (stat.removed) line.createSpan({ cls: "fh-muted", text: ` \xB7 ${stat.removed.toLocaleString()} \u0443\u0434\u0430\u043B\u0435\u043D\u043E` });
+    const line2 = el.createDiv({ cls: "fh-detail-line" });
+    (0, import_obsidian3.setIcon)(line2.createSpan({ cls: "fh-icon" }), "pencil");
+    line2.createSpan({ text: `${stat.added.toLocaleString()} ${pluralRu(stat.added, WORDS)} \u043D\u0430\u043F\u0438\u0441\u0430\u043D\u043E` });
+    if (stat.removed) line2.createSpan({ cls: "fh-muted", text: ` \xB7 ${stat.removed.toLocaleString()} \u0443\u0434\u0430\u043B\u0435\u043D\u043E` });
     const btn = el.createEl("button", { cls: "mod-cta fh-daily-btn" });
     (0, import_obsidian3.setIcon)(btn.createSpan(), daily ? "file-text" : "file-plus");
     btn.createSpan({ text: daily ? "\u041E\u0442\u043A\u0440\u044B\u0442\u044C \u0437\u0430\u043C\u0435\u0442\u043A\u0443 \u0434\u043D\u044F" : "\u0421\u043E\u0437\u0434\u0430\u0442\u044C \u0437\u0430\u043C\u0435\u0442\u043A\u0443 \u0434\u043D\u044F" });
@@ -972,6 +972,9 @@ var GraphTree = class {
     this.frozen = /* @__PURE__ */ new Map();
     this.freezeTimers = /* @__PURE__ */ new Map();
     this.depthCache = null;
+    this.posCache = null;
+    /** Target positions last sent to each graph, to skip no-op updates. */
+    this.sent = /* @__PURE__ */ new Map();
   }
   get app() {
     return this.plugin.app;
@@ -982,6 +985,7 @@ var GraphTree = class {
     const onTreeChange = (f) => {
       if (f instanceof import_obsidian5.TFolder || f instanceof import_obsidian5.TFile && f.extension === "md") {
         this.depthCache = null;
+        this.posCache = null;
         this.refreshSoon();
       }
     };
@@ -1008,6 +1012,7 @@ var GraphTree = class {
   /** Re-applies the layout to every open global graph. */
   refresh() {
     this.depthCache = null;
+    this.posCache = null;
     this.scan();
     for (const r of this.originals.keys()) this.schedule(r);
   }
@@ -1042,6 +1047,7 @@ var GraphTree = class {
       this.originals.delete(r);
       this.views.delete(r);
       this.pinned.delete(r);
+      this.sent.delete(r);
     }
   }
   schedule(r, tries = 0, delay = 120) {
@@ -1082,18 +1088,30 @@ var GraphTree = class {
     }
     this.grown.add(r);
     if (this.growing.has(r)) return;
+    const last = this.sent.get(r) ?? /* @__PURE__ */ new Map();
     const now = /* @__PURE__ */ new Set();
+    let moved = false;
     for (const [id, p] of target) {
       if (!this.hasNode(r, id)) continue;
       this.post(r, { forceNode: { id, x: p.x, y: p.y } });
       now.add(id);
+      const q = last.get(id);
+      if (!q || Math.abs(q.x - p.x) > 0.5 || Math.abs(q.y - p.y) > 0.5) moved = true;
     }
     for (const id of prev) {
-      if (!now.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+      if (!now.has(id)) {
+        this.post(r, { forceNode: { id, x: null, y: null } });
+        moved = true;
+      }
     }
     this.pinned.set(r, now);
-    if (now.size || prev.size) this.reheat(r);
-    this.scheduleFreeze(r);
+    this.sent.set(r, new Map([...now].map((id) => [id, target.get(id)])));
+    if (moved) {
+      this.reheat(r);
+      this.scheduleFreeze(r);
+    } else if (this.plugin.settings.graphFreeze && !this.frozen.has(r)) {
+      this.scheduleFreeze(r);
+    }
   }
   /** Branch by branch, level by level: nodes glide from the centre to their places. */
   animateGrow(r, target) {
@@ -1119,6 +1137,7 @@ var GraphTree = class {
       }
       if (done) {
         this.growing.delete(r);
+        this.sent.set(r, new Map(ids.map((id) => [id, target.get(id)])));
         this.scheduleFreeze(r);
       } else {
         this.growing.set(r, window.requestAnimationFrame(step));
@@ -1166,16 +1185,8 @@ var GraphTree = class {
   }
   /** Wakes the simulation up so nodes glide to their new places. */
   reheat(r) {
-    this.post(r, { alpha: 0.6, run: true });
+    this.post(r, { alpha: 0.3, run: true });
     try {
-      const opts = this.views.get(r)?.dataEngine?.getOptions?.();
-      if (opts && typeof r.setForces === "function") {
-        const forces = {};
-        for (const k of ["centerStrength", "linkStrength", "linkDistance", "repelStrength"]) {
-          if (typeof opts[k] === "number") forces[k] = opts[k];
-        }
-        if (Object.keys(forces).length) r.setForces(forces);
-      }
       r.changed?.();
     } catch {
     }
@@ -1226,7 +1237,8 @@ var GraphTree = class {
     return this.depths().hubs;
   }
   positions() {
-    return layoutSkillTree(this.buildTree(), this.layoutOptions());
+    if (!this.posCache) this.posCache = layoutSkillTree(this.buildTree(), this.layoutOptions());
+    return this.posCache;
   }
   // ------------------------------------------------------------- colours
   /**
@@ -1299,17 +1311,15 @@ function rng(seed) {
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
 }
-var lerp = (a, b, k) => ({ x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k });
-var WHITE = (a) => `rgba(255,255,255,${a})`;
+var WHITE = (a) => `rgba(255,255,255,${a < 0 ? 0 : a > 1 ? 1 : a.toFixed(3)})`;
 function drawRay(ctx, a, b, p) {
   const len = Math.hypot(b.x - a.x, b.y - a.y);
   if (len < 2 || p.alpha <= 0.01 || p.head <= 0) return;
-  ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   switch (p.style) {
     case "beam":
-      drawBeam(ctx, a, b, len, p);
+      drawBeam(ctx, a, b, p);
       break;
     case "energy":
       drawEnergy(ctx, a, b, len, p);
@@ -1320,148 +1330,147 @@ function drawRay(ctx, a, b, p) {
     default:
       drawSpark(ctx, a, b, p);
   }
-  ctx.restore();
+}
+function dot(ctx, x, y, r, style) {
+  ctx.fillStyle = style;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+}
+function line(ctx, ax, ay, bx, by, width, style) {
+  ctx.strokeStyle = style;
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  ctx.moveTo(ax, ay);
+  ctx.lineTo(bx, by);
+  ctx.stroke();
 }
 function drawSpark(ctx, a, b, p) {
   const k = p.constant ? (p.t * 0.55 + p.seed * 0.137) % 1 : p.head;
-  const h = lerp(a, b, k);
-  ctx.shadowColor = p.color(0.9 * p.alpha);
-  ctx.shadowBlur = 10;
-  ctx.fillStyle = p.color(0.95 * p.alpha);
-  ctx.beginPath();
-  ctx.arc(h.x, h.y, 2.6 * p.width, 0, Math.PI * 2);
-  ctx.fill();
+  const x = a.x + (b.x - a.x) * k;
+  const y = a.y + (b.y - a.y) * k;
+  dot(ctx, x, y, 6 * p.width, p.color(0.25 * p.alpha));
+  dot(ctx, x, y, 2.6 * p.width, p.color(0.95 * p.alpha));
 }
-function drawBeam(ctx, a, b, _len, p) {
+function drawBeam(ctx, a, b, p) {
   let alpha = p.alpha;
   if (p.constant) alpha *= 0.55 + 0.45 * Math.sin(p.t * 3.2 + p.seed);
-  const head = lerp(a, b, p.head);
-  const tail = p.constant ? a : lerp(a, b, Math.max(0, p.head - 0.5));
-  ctx.shadowColor = p.color(alpha);
-  ctx.shadowBlur = 14;
-  ctx.strokeStyle = p.color(0.22 * alpha);
-  ctx.lineWidth = 6 * p.width;
-  ctx.beginPath();
-  ctx.moveTo(tail.x, tail.y);
-  ctx.lineTo(head.x, head.y);
-  ctx.stroke();
-  const g = ctx.createLinearGradient(tail.x, tail.y, head.x, head.y);
+  const hk = p.head;
+  const tk = p.constant ? 0 : Math.max(0, hk - 0.5);
+  const hx = a.x + (b.x - a.x) * hk;
+  const hy = a.y + (b.y - a.y) * hk;
+  const tx = a.x + (b.x - a.x) * tk;
+  const ty = a.y + (b.y - a.y) * tk;
+  if ((p.quality ?? 2) === 2) line(ctx, tx, ty, hx, hy, 7 * p.width, p.color(0.12 * alpha));
+  line(ctx, tx, ty, hx, hy, 3.5 * p.width, p.color(0.26 * alpha));
+  const g = ctx.createLinearGradient(tx, ty, hx, hy);
   g.addColorStop(0, p.color(p.constant ? 0.5 * alpha : 0));
   g.addColorStop(0.7, p.color(0.9 * alpha));
   g.addColorStop(1, WHITE(alpha));
-  ctx.shadowBlur = 6;
-  ctx.strokeStyle = g;
-  ctx.lineWidth = 1.8 * p.width;
-  ctx.beginPath();
-  ctx.moveTo(tail.x, tail.y);
-  ctx.lineTo(head.x, head.y);
-  ctx.stroke();
-  if (!p.constant && p.head < 1) {
-    ctx.fillStyle = WHITE(alpha);
-    ctx.shadowBlur = 12;
-    ctx.beginPath();
-    ctx.arc(head.x, head.y, 2.4 * p.width, 0, Math.PI * 2);
-    ctx.fill();
+  line(ctx, tx, ty, hx, hy, 1.6 * p.width, g);
+  if (!p.constant && hk < 1) {
+    dot(ctx, hx, hy, 6 * p.width, p.color(0.3 * alpha));
+    dot(ctx, hx, hy, 2.2 * p.width, WHITE(alpha));
   }
 }
 function drawEnergy(ctx, a, b, len, p) {
+  const q = p.quality ?? 2;
   const ux = (b.x - a.x) / len;
   const uy = (b.y - a.y) / len;
-  const nx = -uy;
-  const ny = ux;
   const amp = 3.6 * p.width;
-  const steps = Math.max(10, Math.round(len * p.head / 5));
-  const at = (s, phaseShift) => {
-    const taper = Math.sin(Math.PI * Math.min(1, s));
-    const off = amp * taper * Math.sin(s * len / 9 - p.t * 7 + p.seed + phaseShift);
-    return { x: a.x + ux * s * len + nx * off, y: a.y + uy * s * len + ny * off };
-  };
-  for (const [shift, width, alpha] of [
-    [0, 4.5, 0.22],
-    [0, 1.6, 0.95],
-    [Math.PI, 1.1, 0.6]
-  ]) {
-    ctx.shadowColor = p.color(p.alpha);
-    ctx.shadowBlur = width > 2 ? 16 : 8;
-    ctx.strokeStyle = p.color(alpha * p.alpha);
-    ctx.lineWidth = width * p.width;
-    ctx.beginPath();
-    for (let i = 0; i <= steps; i++) {
-      const pt = at(i / steps * p.head, shift);
-      if (i === 0) ctx.moveTo(pt.x, pt.y);
-      else ctx.lineTo(pt.x, pt.y);
-    }
-    ctx.stroke();
-  }
-  ctx.shadowBlur = 12;
-  for (let j = 0; j < 3; j++) {
-    const s = (p.t * 0.7 + j / 3 + p.seed * 0.171) % 1;
-    if (s > p.head) continue;
-    const pt = at(s, 0);
-    ctx.fillStyle = WHITE(0.9 * p.alpha);
-    ctx.beginPath();
-    ctx.arc(pt.x, pt.y, 2.2 * p.width, 0, Math.PI * 2);
-    ctx.fill();
-  }
-}
-function drawLightning(ctx, a, b, len, p) {
-  const r = rng(Math.floor(p.t * 18) * 9973 + p.seed * 7919);
-  const end = lerp(a, b, p.head);
-  const segLen = Math.hypot(end.x - a.x, end.y - a.y);
-  if (segLen < 2) return;
-  const ux = (end.x - a.x) / segLen;
-  const uy = (end.y - a.y) / segLen;
-  const nx = -uy;
-  const ny = ux;
-  const n = Math.max(4, Math.round(segLen / 13));
-  const jitter = Math.min(14, len * 0.08) * (0.7 + 0.3 * p.width);
-  const pts = [];
-  for (let i = 0; i <= n; i++) {
-    const s = i / n;
-    const off = i === 0 || i === n ? 0 : (r() * 2 - 1) * jitter * Math.sin(Math.PI * s);
-    pts.push({ x: a.x + ux * s * segLen + nx * off, y: a.y + uy * s * segLen + ny * off });
-  }
-  const alpha = p.alpha * (0.55 + r() * 0.45);
-  const stroke = (path, width, style, blur) => {
-    ctx.shadowColor = p.color(alpha);
-    ctx.shadowBlur = blur;
+  const steps = Math.min(q === 2 ? 36 : q === 1 ? 24 : 14, Math.max(8, Math.round(len * p.head / 9)));
+  const wave = (s, shift) => amp * Math.sin(Math.PI * Math.min(1, s)) * Math.sin(s * len / 9 - p.t * 7 + p.seed + shift);
+  const strand = (shift, width, style) => {
     ctx.strokeStyle = style;
     ctx.lineWidth = width;
     ctx.beginPath();
-    path.forEach((pt, i) => i ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y));
+    for (let i = 0; i <= steps; i++) {
+      const s = i / steps * p.head;
+      const off = wave(s, shift);
+      const x = a.x + ux * s * len - uy * off;
+      const y = a.y + uy * s * len + ux * off;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
     ctx.stroke();
   };
-  stroke(pts, 4.5 * p.width, p.color(0.35 * alpha), 18);
-  stroke(pts, 1.3 * p.width, WHITE(0.95 * alpha), 6);
-  for (let i = 1; i < pts.length - 1; i++) {
-    if (r() > 0.2) continue;
+  strand(0, (q === 2 ? 6 : 4) * p.width, p.color(0.16 * p.alpha));
+  strand(0, 1.6 * p.width, p.color(0.95 * p.alpha));
+  if (q > 0) strand(Math.PI, 1.1 * p.width, p.color(0.6 * p.alpha));
+  const blobs = q === 0 ? 1 : 3;
+  for (let j = 0; j < blobs; j++) {
+    const s = (p.t * 0.7 + j / 3 + p.seed * 0.171) % 1;
+    if (s > p.head) continue;
+    const off = wave(s, 0);
+    const x = a.x + ux * s * len - uy * off;
+    const y = a.y + uy * s * len + ux * off;
+    dot(ctx, x, y, 5 * p.width, p.color(0.3 * p.alpha));
+    dot(ctx, x, y, 2 * p.width, WHITE(0.9 * p.alpha));
+  }
+}
+function drawLightning(ctx, a, b, len, p) {
+  const q = p.quality ?? 2;
+  const r = rng(Math.floor(p.t * 18) * 9973 + p.seed * 7919);
+  const ex = a.x + (b.x - a.x) * p.head;
+  const ey = a.y + (b.y - a.y) * p.head;
+  const segLen = Math.hypot(ex - a.x, ey - a.y);
+  if (segLen < 2) return;
+  const ux = (ex - a.x) / segLen;
+  const uy = (ey - a.y) / segLen;
+  const n = Math.min(q === 2 ? 18 : q === 1 ? 12 : 7, Math.max(4, Math.round(segLen / 14)));
+  const jitter = Math.min(14, len * 0.08) * (0.7 + 0.3 * p.width);
+  const xs = new Array(n + 1);
+  const ys = new Array(n + 1);
+  for (let i = 0; i <= n; i++) {
+    const s = i / n;
+    const off = i === 0 || i === n ? 0 : (r() * 2 - 1) * jitter * Math.sin(Math.PI * s);
+    xs[i] = a.x + ux * s * segLen - uy * off;
+    ys[i] = a.y + uy * s * segLen + ux * off;
+  }
+  const alpha = p.alpha * (0.55 + r() * 0.45);
+  const path = (px, py, width, style) => {
+    ctx.strokeStyle = style;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    ctx.moveTo(px[0], py[0]);
+    for (let i = 1; i < px.length; i++) ctx.lineTo(px[i], py[i]);
+    ctx.stroke();
+  };
+  if (q === 2) path(xs, ys, 6 * p.width, p.color(0.16 * alpha));
+  path(xs, ys, 2.6 * p.width, p.color(0.45 * alpha));
+  path(xs, ys, 1.1 * p.width, WHITE(0.95 * alpha));
+  if (q === 0) return;
+  const chance = q === 2 ? 0.2 : 0.1;
+  for (let i = 1; i < n; i++) {
+    if (r() > chance) continue;
     const dir = Math.atan2(uy, ux) + (r() < 0.5 ? -1 : 1) * (0.4 + r() * 0.6);
-    const branch = [pts[i]];
-    let cur = pts[i];
+    const bx = [xs[i]];
+    const by = [ys[i]];
     const parts = 2 + Math.floor(r() * 2);
     for (let k = 0; k < parts; k++) {
       const l = 6 + r() * 10;
       const d = dir + (r() * 2 - 1) * 0.5;
-      cur = { x: cur.x + Math.cos(d) * l, y: cur.y + Math.sin(d) * l };
-      branch.push(cur);
+      bx.push(bx[bx.length - 1] + Math.cos(d) * l);
+      by.push(by[by.length - 1] + Math.sin(d) * l);
     }
-    stroke(branch, 2.4 * p.width, p.color(0.3 * alpha), 10);
-    stroke(branch, 0.8 * p.width, WHITE(0.8 * alpha), 4);
+    path(bx, by, 2.4 * p.width, p.color(0.3 * alpha));
+    path(bx, by, 0.8 * p.width, WHITE(0.8 * alpha));
   }
 }
 
 // src/graph-fx.ts
-var MAX_LINKS = 1500;
 var TRAVEL = 0.9;
 var LINGER = 0.35;
-var MAX_RAYS = 400;
 var RING = 1.4;
-function rgba(hex, alpha) {
+var MAX_RAYS = [60, 180, 400];
+var MAX_FLOW = [250, 700, 1500];
+var DPR_CAP = [0.75, 1, 1.5];
+function parseHex(hex) {
   const h = hex.replace("#", "");
   const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h.slice(0, 6);
   const n = parseInt(full, 16);
-  if (Number.isNaN(n)) return `rgba(229,165,10,${alpha})`;
-  return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${alpha})`;
+  if (Number.isNaN(n)) return [229, 165, 10];
+  return [n >> 16 & 255, n >> 8 & 255, n & 255];
 }
 var easeInOut = (k) => k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
 var GraphFx = class {
@@ -1471,21 +1480,39 @@ var GraphFx = class {
     this.raf = null;
     this.t0 = performance.now();
     this.bursts = [];
-    this.frame = 0;
+    // Adaptive quality
+    // Phones start at medium detail; desktops at high. Adjusted every 1.5 s.
+    this.quality = import_obsidian6.Platform.isMobile ? 1 : 2;
+    this.costEma = 0;
+    this.lastQualityChange = 0;
+    // FPS meter
+    this.lastFrame = 0;
+    this.fpsEma = 60;
+    // Colour caches
+    this.colorKey = "";
+    this.colorFn = () => "";
+    this.flowStyle = "";
+    this.glowSprite = null;
     this.loop = (now) => {
       this.raf = window.requestAnimationFrame(this.loop);
+      if (this.lastFrame) {
+        const dt = now - this.lastFrame;
+        if (dt > 0 && dt < 1e3) this.fpsEma = this.fpsEma * 0.92 + 1e3 / dt * 0.08;
+      }
+      this.lastFrame = now;
       if (document.hidden) return;
-      if (import_obsidian6.Platform.isMobile && this.frame++ % 2) return;
-      this.bursts = this.bursts.filter((b) => now - b.start < 2600);
+      if (this.bursts.length) this.bursts = this.bursts.filter((b) => now - b.start < 2600);
+      const start = performance.now();
       for (const [r, layer] of this.layers) {
         try {
           this.draw(r, layer, now);
         } catch (e) {
-          console.warn("Folder Hub: graph effects failed, turning them off for this view", e);
+          console.warn("ObsOrg: graph effects failed, turning them off for this view", e);
           layer.canvas.remove();
           this.layers.delete(r);
         }
       }
+      this.adapt(performance.now() - start, now);
     };
   }
   get app() {
@@ -1494,7 +1521,7 @@ var GraphFx = class {
   get active() {
     const s = this.plugin.settings;
     const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-    const anything = s.fxRing || s.fxWave || s.fxGlow || s.linkFlow !== "off";
+    const anything = s.fxRing || s.fxWave || s.fxGlow || s.linkFlow !== "off" || s.fxShowFps;
     return s.fxEnabled && s.animations && !reduced && anything;
   }
   start() {
@@ -1524,12 +1551,12 @@ var GraphFx = class {
         if (!this.layers.has(r)) {
           if (getComputedStyle(host).position === "static") host.style.position = "relative";
           const canvas = host.createEl("canvas", { cls: "fh-graph-fx" });
-          const ctx = canvas.getContext("2d");
+          const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
           if (!ctx) {
             canvas.remove();
             continue;
           }
-          this.layers.set(r, { canvas, ctx });
+          this.layers.set(r, { canvas, ctx, lists: null, dirty: false });
         }
       }
     }
@@ -1538,6 +1565,8 @@ var GraphFx = class {
       l.canvas.remove();
       this.layers.delete(r);
     }
+    this.colorKey = "";
+    for (const l of this.layers.values()) l.lists = null;
     if (this.layers.size && this.raf === null) this.raf = window.requestAnimationFrame(this.loop);
     if (!this.layers.size && this.raf !== null) {
       window.cancelAnimationFrame(this.raf);
@@ -1548,137 +1577,278 @@ var GraphFx = class {
   burst(id) {
     this.bursts.push({ id, start: performance.now() });
   }
-  draw(r, { canvas, ctx }, now) {
+  /**
+   * Lowers detail when frames get expensive or the frame rate drops below
+   * ~50 fps (the GPU can be the bottleneck even when our code is fast),
+   * raises it again when there's clear headroom.
+   */
+  adapt(cost, now) {
+    this.costEma = this.costEma * 0.9 + cost * 0.1;
+    if (now - this.lastQualityChange < 1500) return;
+    if ((this.costEma > 6 || this.fpsEma < 50) && this.quality > 0) {
+      this.quality = this.quality - 1;
+      this.lastQualityChange = now;
+    } else if (this.costEma < 2 && this.fpsEma > 57 && this.quality < 2) {
+      this.quality = this.quality + 1;
+      this.lastQualityChange = now;
+    }
+  }
+  colors() {
+    const s = this.plugin.settings;
+    const key = `${s.fxColor}|${s.linkFlowColor}`;
+    if (key !== this.colorKey) {
+      this.colorKey = key;
+      const [r, g, b] = parseHex(s.fxColor);
+      this.colorFn = (a) => `rgba(${r},${g},${b},${a < 0 ? 0 : a > 1 ? 1 : a.toFixed(3)})`;
+      const [fr, fg, fb] = parseHex(s.linkFlowColor);
+      this.flowStyle = `rgba(${fr},${fg},${fb},0.7)`;
+      const sprite = document.createElement("canvas");
+      sprite.width = sprite.height = 64;
+      const sc = sprite.getContext("2d");
+      if (sc) {
+        const grad = sc.createRadialGradient(32, 32, 0, 32, 32, 32);
+        grad.addColorStop(0, `rgba(${r},${g},${b},1)`);
+        grad.addColorStop(0.4, `rgba(${r},${g},${b},0.45)`);
+        grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+        sc.fillStyle = grad;
+        sc.fillRect(0, 0, 64, 64);
+      }
+      this.glowSprite = sprite;
+    }
+    return this.colorFn;
+  }
+  lists(layer, r) {
+    const hubs = this.plugin.graphTree.hubDepths();
+    const nodes = r.nodes;
+    const links = r.links;
+    const l = layer.lists;
+    if (l && l.nodesRef === nodes && l.linksRef === links && l.nodeCount === (nodes?.length ?? 0) && l.linkCount === (links?.length ?? 0) && l.hubsRef === hubs) {
+      return l;
+    }
+    const byId = /* @__PURE__ */ new Map();
+    const hubNodes = [];
+    const hubDepth = [];
+    for (const n of nodes ?? []) {
+      byId.set(n.id, n);
+      const d = hubs.get(n.id);
+      if (d !== void 0) {
+        hubNodes.push(n);
+        hubDepth.push(d);
+      }
+    }
+    const hubLinks = [];
+    const hubLinkDepth = [];
+    for (const link of links ?? []) {
+      const d = hubs.get(link.source.id);
+      if (d !== void 0) {
+        hubLinks.push(link);
+        hubLinkDepth.push(d);
+      }
+    }
+    layer.lists = {
+      nodesRef: nodes,
+      linksRef: links,
+      nodeCount: nodes?.length ?? 0,
+      linkCount: links?.length ?? 0,
+      hubsRef: hubs,
+      hubNodes,
+      hubDepth,
+      hubLinks,
+      hubLinkDepth,
+      byId
+    };
+    return layer.lists;
+  }
+  /**
+   * World → screen mapping for this frame: screen = world · S + offset.
+   * Calibrated from the node sprites' world transforms (read-only, no PIXI
+   * calls), checked against a second node; falls back to pan/scale.
+   */
+  mapping(r, nodes, ratio) {
+    let S = r.scale ?? 1;
+    let ox = r.panX ?? 0;
+    let oy = r.panY ?? 0;
+    const samples = [];
+    for (let i = 0; i < nodes.length && samples.length < 4; i++) {
+      const n = nodes[i];
+      const wt = n.circle?.worldTransform;
+      if (n.rendered !== false && wt && Number.isFinite(wt.tx) && Number.isFinite(wt.ty)) samples.push(n);
+    }
+    if (samples.length) {
+      const a = samples[0];
+      const wa = a.circle.worldTransform;
+      let cS = S;
+      const b = samples.find((n) => Math.abs(n.x - a.x) > 1);
+      if (b) {
+        const s2 = (b.circle.worldTransform.tx - wa.tx) / (b.x - a.x);
+        if (Number.isFinite(s2) && s2 > 0) cS = s2;
+      }
+      const cx = wa.tx - a.x * cS;
+      const cy = wa.ty - a.y * cS;
+      const ok = samples.every((n) => {
+        const wt = n.circle.worldTransform;
+        return Math.abs(n.x * cS + cx - wt.tx) < 2 && Math.abs(n.y * cS + cy - wt.ty) < 2;
+      });
+      if (ok) {
+        S = cS;
+        ox = cx;
+        oy = cy;
+      }
+    }
+    return { S: S * ratio, ox: ox * ratio, oy: oy * ratio };
+  }
+  draw(r, layer, now) {
+    const { canvas, ctx } = layer;
     const host = r.containerEl;
     const w = host.clientWidth;
     const h = host.clientHeight;
-    if (!w || !h) return;
-    const dpr = window.devicePixelRatio || 1;
-    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
-      canvas.width = Math.round(w * dpr);
-      canvas.height = Math.round(h * dpr);
-    }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
+    if (!w || !h || host.offsetParent === null) return;
     const s = this.plugin.settings;
-    const nodes = r.nodes ?? [];
-    if (!nodes.length) return;
-    const ratio = w / (r.px?.screen?.width || w);
-    const scale = r.scale ?? 1;
-    const cache = /* @__PURE__ */ new Map();
-    const pos = (n) => {
-      let p = cache.get(n);
-      if (!p) {
-        const g = n.circle?.getGlobalPosition?.();
-        p = g ? { x: g.x * ratio, y: g.y * ratio } : { x: (n.x * scale + (r.panX ?? 0)) * ratio, y: (n.y * scale + (r.panY ?? 0)) * ratio };
-        cache.set(n, p);
-      }
-      return p;
-    };
-    const radius = (n) => {
-      try {
-        const b = n.circle?.getBounds?.();
-        if (b && b.width > 0) return b.width / 2 * ratio;
-      } catch {
-      }
-      return (n.getSize?.() ?? 6) * scale * ratio;
-    };
-    const onScreen = (p, pad2 = 120) => p.x > -pad2 && p.y > -pad2 && p.x < w + pad2 && p.y < h + pad2;
-    const hubs = this.plugin.graphTree.hubDepths();
     const t = (now - this.t0) / 1e3;
     const interval = Math.max(1, s.fxInterval);
     const phase = t % interval;
-    const links = r.links ?? [];
-    if (s.linkFlow !== "off" && links.length) {
-      ctx.save();
+    const nodes = r.nodes ?? [];
+    const lists = this.lists(layer, r);
+    const q = this.quality;
+    const maxDepth = lists.hubDepth.length ? Math.max(...lists.hubDepth) : 1;
+    const pulseWindow = (maxDepth - 1) * (s.fxWave ? TRAVEL : 0) + Math.max(RING, TRAVEL + LINGER);
+    const busy = s.fxGlow || s.fxShowFps || s.linkFlow !== "off" || s.fxWave && s.rayMode === "constant" || this.bursts.length > 0 || (s.fxRing || s.fxWave) && phase < pulseWindow;
+    if (!busy) {
+      if (layer.dirty) {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        layer.dirty = false;
+      }
+      return;
+    }
+    const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP[q]);
+    const cw = Math.round(w * dpr);
+    const ch = Math.round(h * dpr);
+    if (canvas.width !== cw || canvas.height !== ch) {
+      canvas.width = cw;
+      canvas.height = ch;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    layer.dirty = true;
+    if (!nodes.length) return;
+    const color = this.colors();
+    const ratio = w / (r.px?.screen?.width || w);
+    const { S, ox, oy } = this.mapping(r, nodes, ratio);
+    const X = (n) => n.x * S + ox;
+    const Y = (n) => n.y * S + oy;
+    const radius = (n) => Math.max(3, (n.getSize?.() ?? 6) * S);
+    const PAD = 120;
+    const visible = (x, y) => x > -PAD && y > -PAD && x < w + PAD && y < h + PAD;
+    const segVisible = (ax, ay, bx, by) => !(ax < -PAD && bx < -PAD || ay < -PAD && by < -PAD || ax > w + PAD && bx > w + PAD || ay > h + PAD && by > h + PAD);
+    const emitAt = (depth) => (depth - 1) * (s.fxWave ? TRAVEL : 0);
+    if (s.linkFlow !== "off") {
+      const source = s.linkFlow === "hubs" ? lists.hubLinks : r.links ?? [];
+      const limit = MAX_FLOW[q];
       ctx.beginPath();
       let count = 0;
-      for (const l of links) {
-        if (count >= MAX_LINKS) break;
-        if (s.linkFlow === "hubs" && !hubs.has(l.source.id)) continue;
-        const a = pos(l.source);
-        const b = pos(l.target);
-        if (!onScreen(a, 0) && !onScreen(b, 0)) continue;
-        ctx.moveTo(a.x, a.y);
-        ctx.lineTo(b.x, b.y);
+      for (let i = 0; i < source.length && count < limit; i++) {
+        const l = source[i];
+        const ax = X(l.source);
+        const ay = Y(l.source);
+        const bx = X(l.target);
+        const by = Y(l.target);
+        if (!segVisible(ax, ay, bx, by)) continue;
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
         count++;
       }
-      ctx.setLineDash([3, 9]);
-      ctx.lineDashOffset = -(t * s.linkFlowSpeed % 12);
-      ctx.strokeStyle = rgba(s.linkFlowColor, 0.7);
-      ctx.lineWidth = 1.4;
-      ctx.lineCap = "round";
-      ctx.stroke();
-      ctx.restore();
-    }
-    const hubNodes = nodes.filter((n) => hubs.has(n.id));
-    if (s.fxGlow) {
-      const a = 0.18 + 0.14 * Math.sin(t * Math.PI * 2 / 2.6);
-      for (const n of hubNodes) {
-        const p = pos(n);
-        if (!onScreen(p)) continue;
-        const rr = radius(n) * 2.8 + 6;
-        const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, rr);
-        g.addColorStop(0, rgba(s.fxColor, a));
-        g.addColorStop(1, rgba(s.fxColor, 0));
-        ctx.fillStyle = g;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, rr, 0, Math.PI * 2);
-        ctx.fill();
+      if (count) {
+        ctx.setLineDash([3, 9]);
+        ctx.lineDashOffset = -(t * s.linkFlowSpeed % 12);
+        ctx.strokeStyle = this.flowStyle;
+        ctx.lineWidth = 1.4;
+        ctx.lineCap = "round";
+        ctx.stroke();
+        ctx.setLineDash([]);
       }
     }
-    const emitAt = (id) => ((hubs.get(id) ?? 1) - 1) * (s.fxWave ? TRAVEL : 0);
+    ctx.globalCompositeOperation = "lighter";
+    if (s.fxGlow && this.glowSprite) {
+      ctx.globalAlpha = 0.3 + 0.2 * Math.sin(t * Math.PI * 2 / 2.6);
+      for (const n of lists.hubNodes) {
+        const x = X(n);
+        const y = Y(n);
+        if (!visible(x, y)) continue;
+        const rr = radius(n) * 3 + 8;
+        ctx.drawImage(this.glowSprite, x - rr, y - rr, rr * 2, rr * 2);
+      }
+      ctx.globalAlpha = 1;
+    }
     if (s.fxRing) {
-      for (const n of hubNodes) {
-        const age = phase - emitAt(n.id);
+      for (let i = 0; i < lists.hubNodes.length; i++) {
+        const age = phase - emitAt(lists.hubDepth[i]);
         if (age < 0 || age > RING) continue;
-        const p = pos(n);
-        if (!onScreen(p)) continue;
+        const n = lists.hubNodes[i];
+        const x = X(n);
+        const y = Y(n);
+        if (!visible(x, y)) continue;
         const k = age / RING;
         const base = radius(n);
         ctx.beginPath();
-        ctx.arc(p.x, p.y, base + 4 + k * (28 + base * 1.5), 0, Math.PI * 2);
-        ctx.strokeStyle = rgba(s.fxColor, (1 - k) * 0.85);
+        ctx.arc(x, y, base + 4 + k * (28 + base * 1.5), 0, Math.PI * 2);
+        ctx.strokeStyle = color((1 - k) * 0.85);
         ctx.lineWidth = 2.5 * (1 - k) + 0.6;
         ctx.stroke();
       }
     }
-    if (s.fxWave && links.length) {
-      const color = (a) => rgba(s.fxColor, a);
+    if (s.fxWave) {
       const constant = s.rayMode === "constant";
+      const limit = MAX_RAYS[q];
       let count = 0;
-      links.forEach((l, i) => {
-        if (count >= MAX_RAYS || !hubs.has(l.source.id)) return;
+      const a = { x: 0, y: 0 };
+      const b = { x: 0, y: 0 };
+      for (let i = 0; i < lists.hubLinks.length && count < limit; i++) {
         let head = 1;
         let alpha = 1;
         if (!constant) {
-          const age = phase - emitAt(l.source.id);
-          if (age < 0 || age > TRAVEL + LINGER) return;
+          const age = phase - emitAt(lists.hubLinkDepth[i]);
+          if (age < 0 || age > TRAVEL + LINGER) continue;
           head = easeInOut(Math.min(1, age / TRAVEL));
           alpha = age <= TRAVEL ? 1 : 1 - (age - TRAVEL) / LINGER;
         }
-        const a = pos(l.source);
-        const b = pos(l.target);
-        if (!onScreen(a) && !onScreen(b)) return;
+        const l = lists.hubLinks[i];
+        a.x = X(l.source);
+        a.y = Y(l.source);
+        b.x = X(l.target);
+        b.y = Y(l.target);
+        if (!segVisible(a.x, a.y, b.x, b.y)) continue;
         count++;
-        drawRay(ctx, a, b, { style: s.rayStyle, head, alpha, t, seed: i, color, width: s.rayWidth, constant });
-      });
+        drawRay(ctx, a, b, { style: s.rayStyle, head, alpha, t, seed: i, color, width: s.rayWidth, constant, quality: q });
+      }
     }
-    for (const b of this.bursts) {
-      const n = nodes.find((x) => x.id === b.id);
+    for (const burst of this.bursts) {
+      const n = lists.byId.get(burst.id);
       if (!n) continue;
-      const p = pos(n);
+      const x = X(n);
+      const y = Y(n);
       const base = radius(n);
       for (let i = 0; i < 3; i++) {
-        const age = (now - b.start) / 1e3 - i * 0.35;
+        const age = (now - burst.start) / 1e3 - i * 0.35;
         if (age < 0 || age > 1.6) continue;
         const k = age / 1.6;
         ctx.beginPath();
-        ctx.arc(p.x, p.y, base + 6 + k * 110, 0, Math.PI * 2);
-        ctx.strokeStyle = rgba(s.fxColor, (1 - k) * 0.95);
+        ctx.arc(x, y, base + 6 + k * 110, 0, Math.PI * 2);
+        ctx.strokeStyle = color((1 - k) * 0.95);
         ctx.lineWidth = 4 * (1 - k) + 1;
         ctx.stroke();
       }
+    }
+    ctx.globalCompositeOperation = "source-over";
+    if (s.fxShowFps) {
+      const fps = Math.round(this.fpsEma);
+      const label = `${fps} FPS \xB7 ${["\u043D\u0438\u0437\u043A\u043E\u0435", "\u0441\u0440\u0435\u0434\u043D\u0435\u0435", "\u0432\u044B\u0441\u043E\u043A\u043E\u0435"][q]}`;
+      ctx.font = "600 12px var(--font-interface, sans-serif)";
+      const tw = ctx.measureText(label).width;
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(w - tw - 22, 8, tw + 14, 22);
+      ctx.fillStyle = fps >= 55 ? "#44cf6e" : fps >= 40 ? "#e0de71" : "#fb464c";
+      ctx.fillText(label, w - tw - 15, 23);
     }
   }
 };
@@ -1780,9 +1950,9 @@ function applyBlock(content, body) {
   return (trimmed ? trimmed + "\n\n" : "") + block + "\n";
 }
 var LINK_RE = /\[\[([^\]|#^]+)(?:[#^][^\]|]*)?(?:\|[^\]]*)?\]\]/g;
-function extractLinkpaths(line) {
+function extractLinkpaths(line2) {
   const out = [];
-  for (const m of line.matchAll(LINK_RE)) out.push(m[1].trim());
+  for (const m of line2.matchAll(LINK_RE)) out.push(m[1].trim());
   return out;
 }
 function mergePreserving(existing, items, resolve, opts) {
@@ -1790,16 +1960,16 @@ function mergePreserving(existing, items, resolve, opts) {
   const linked = /* @__PURE__ */ new Set();
   const kept = [];
   let linkLines = 0;
-  for (const line of existing) {
-    const linkpaths = extractLinkpaths(line);
+  for (const line2 of existing) {
+    const linkpaths = extractLinkpaths(line2);
     if (linkpaths.length === 0) {
-      kept.push(line);
+      kept.push(line2);
       continue;
     }
     const targets = linkpaths.map(resolve).filter((p) => !!p && wanted.has(p));
     if (targets.length === 0) continue;
     targets.forEach((t) => linked.add(t));
-    kept.push(line);
+    kept.push(line2);
     linkLines++;
   }
   while (kept.length && kept[kept.length - 1].trim() === "") kept.pop();
@@ -1892,7 +2062,8 @@ var DEFAULT_SETTINGS = {
   linkFlowColor: "#9a9a9a",
   linkFlowSpeed: 30,
   graphGrow: true,
-  graphFreeze: false
+  graphFreeze: false,
+  fxShowFps: false
 };
 var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
   constructor(app, plugin) {
@@ -2281,6 +2452,14 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
     new import_obsidian7.Setting(containerEl).setName("\u0420\u043E\u0441\u0442 \u0434\u0435\u0440\u0435\u0432\u0430 \u043F\u0440\u0438 \u043E\u0442\u043A\u0440\u044B\u0442\u0438\u0438").setDesc("\u0423\u0437\u043B\u044B \u0432\u044B\u0440\u0430\u0441\u0442\u0430\u044E\u0442 \u0438\u0437 \u0446\u0435\u043D\u0442\u0440\u0430 \u0432\u0435\u0442\u043A\u0430 \u0437\u0430 \u0432\u0435\u0442\u043A\u043E\u0439, \u0443\u0440\u043E\u0432\u0435\u043D\u044C \u0437\u0430 \u0443\u0440\u043E\u0432\u043D\u0435\u043C (\u043D\u0443\u0436\u043D\u0430 \u0440\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0430 \u0432\u0435\u0442\u043A\u0430\u043C\u0438).").addToggle(
       (t) => t.setValue(s.graphGrow).onChange(async (v) => {
         s.graphGrow = v;
+        await save();
+      })
+    );
+    new import_obsidian7.Setting(containerEl).setName("\u041F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C FPS").setDesc(
+      "\u0421\u0447\u0451\u0442\u0447\u0438\u043A \u043A\u0430\u0434\u0440\u043E\u0432 \u0432 \u0443\u0433\u043B\u0443 \u0433\u0440\u0430\u0444\u0430 \u0438 \u0442\u0435\u043A\u0443\u0449\u0435\u0435 \u043A\u0430\u0447\u0435\u0441\u0442\u0432\u043E \u044D\u0444\u0444\u0435\u043A\u0442\u043E\u0432. \u041A\u0430\u0447\u0435\u0441\u0442\u0432\u043E \u043F\u043E\u0434\u0441\u0442\u0440\u0430\u0438\u0432\u0430\u0435\u0442\u0441\u044F \u0441\u0430\u043C\u043E: \u0435\u0441\u043B\u0438 \u043A\u0430\u0434\u0440 \u0440\u0438\u0441\u0443\u0435\u0442\u0441\u044F \u0441\u043B\u0438\u0448\u043A\u043E\u043C \u0434\u043E\u043B\u0433\u043E, \u044D\u0444\u0444\u0435\u043A\u0442\u044B \u0443\u043F\u0440\u043E\u0449\u0430\u044E\u0442\u0441\u044F, \u0447\u0442\u043E\u0431\u044B \u0434\u0435\u0440\u0436\u0430\u0442\u044C 60 FPS."
+    ).addToggle(
+      (t) => t.setValue(s.fxShowFps).onChange(async (v) => {
+        s.fxShowFps = v;
         await save();
       })
     );

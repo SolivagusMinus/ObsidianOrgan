@@ -91,6 +91,7 @@ export interface FolderHubSettings {
 	moduleFill: boolean;
 	moduleLabels: boolean;
 	moduleAnimate: boolean;
+	moduleIntro: "bubble" | "draw" | "none";
 }
 
 export const DEFAULT_NOTE_TEMPLATE = `---
@@ -177,6 +178,7 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	moduleFill: true,
 	moduleLabels: true,
 	moduleAnimate: true,
+	moduleIntro: "bubble",
 };
 
 export class FolderHubSettingTab extends PluginSettingTab {
@@ -944,6 +946,19 @@ export class FolderHubSettingTab extends PluginSettingTab {
 					.setDynamicTooltip()
 					.onChange(async (v) => {
 						s.moduleLineWidth = v;
+						await changed();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Появление модуля")
+			.setDesc("Как барьер возникает при открытии графа или создании модуля.")
+			.addDropdown((d) =>
+				d
+					.addOptions({ bubble: "Пузырь — надувается и колышется", draw: "Закрывается по кругу", none: "Без анимации" })
+					.setValue(s.moduleIntro)
+					.onChange(async (v) => {
+						s.moduleIntro = v as FolderHubSettings["moduleIntro"];
 						await changed();
 					}),
 			);

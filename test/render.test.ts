@@ -277,3 +277,15 @@ test("removeBlock strips the managed list and keeps the user's text", () => {
 	assert.equal(removeBlock(`${BLOCK_START}\n- [[A]]\n${BLOCK_END}\n`), "");
 	assert.equal(removeBlock("без блока"), "без блока");
 });
+
+import { polarRadii, elasticOut } from "../src/module-shapes";
+
+test("polar radii of a square and a circle", () => {
+	const sq = [{ x: -10, y: -10 }, { x: 10, y: -10 }, { x: 10, y: 10 }, { x: -10, y: 10 }];
+	const r = polarRadii(sq, { x: 0, y: 0 }, 8);
+	assert.ok(Math.abs(r[0] - 10) < 1e-6, "straight up hits the top edge");
+	assert.ok(Math.abs(r[1] - Math.SQRT2 * 10) < 1e-6, "diagonal hits the corner");
+	assert.equal(elasticOut(0), 0);
+	assert.equal(elasticOut(1), 1);
+	assert.ok(Math.max(...[0.2, 0.3, 0.4].map(elasticOut)) > 1, "overshoots like a bubble");
+});

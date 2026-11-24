@@ -291,3 +291,41 @@ export function fillOutline(ctx: CanvasRenderingContext2D, outline: Pt[], style:
 	tracePath(ctx, outline);
 	ctx.fill();
 }
+
+/**
+ * Distance from `c` to a convex polygon along N evenly spaced directions
+ * (starting straight up, clockwise on screen). Lets an outline be stored as
+ * N radii, so consecutive frames can be blended smoothly.
+ */
+export function polarRadii(poly: Pt[], c: Pt, n: number): Float32Array {
+	const out = new Float32Array(n);
+	const m = poly.length;
+	for (let i = 0; i < n; i++) {
+		const a = -Math.PI / 2 + (i / n) * Math.PI * 2;
+		const dx = Math.cos(a);
+		const dy = Math.sin(a);
+		let best = 0;
+		for (let j = 0; j < m; j++) {
+			const p = poly[j];
+			const q = poly[(j + 1) % m];
+			const ex = q.x - p.x;
+			const ey = q.y - p.y;
+			const den = dx * ey - dy * ex;
+			if (Math.abs(den) < 1e-9) continue;
+			const wx = p.x - c.x;
+			const wy = p.y - c.y;
+			const t = (wx * ey - wy * ex) / den;
+			const u = (wx * dy - wy * dx) / den;
+			if (t > best && u >= -1e-6 && u <= 1 + 1e-6) best = t;
+		}
+		out[i] = best;
+	}
+	return out;
+}
+
+/** Springy overshoot easing for the "bubble" entrance (0 → 1). */
+export function elasticOut(x: number): number {
+	if (x <= 0) return 0;
+	if (x >= 1) return 1;
+	return Math.pow(2, -10 * x) * Math.sin((x * 10 - 0.75) * ((2 * Math.PI) / 3)) + 1;
+}

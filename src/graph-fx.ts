@@ -1,7 +1,7 @@
 import { Platform, View } from "obsidian";
 import type FolderHubPlugin from "./main";
 import { Quality, drawRay } from "./rays";
-import { Pt, drawBoundary, fillOutline, moduleOutline, smoothClosed } from "./module-shapes";
+import { centroid, drawBoundary, elasticOut, fillOutline, moduleOutline, polarRadii } from "./module-shapes";
 import type { ModuleDef } from "./modules";
 
 // ---------------------------------------------------------------------------
@@ -62,13 +62,11 @@ interface Lists {
 	byId: Map<string, FxNode>;
 }
 
-/** A module's member nodes in one graph, with its outline in graph (world) units. */
+/** A module's member nodes in one graph. */
 interface ModEntry {
 	def: ModuleDef;
 	nodes: FxNode[];
-	outline: Pt[];
 	colorFn: (a: number) => string;
-	fill: string;
 }
 
 interface ModCache {
@@ -77,15 +75,31 @@ interface ModCache {
 	defsKey: string;
 	listsRef: Lists;
 	entries: ModEntry[];
-	/** Frames since outlines were recomputed. */
-	age: number;
 }
+
+/**
+ * Animated state of one module's barrier, kept across cache rebuilds: the
+ * outline is stored as N radii around a centre (graph units) and blended
+ * towards the target every frame, so it never jumps.
+ */
+interface ModState {
+	cx: number;
+	cy: number;
+	radii: Float32Array;
+	born: number;
+	last: number;
+}
+
+/** Number of directions the barrier outline is sampled in. */
+const MOD_RAYS = 120;
 
 interface Layer {
 	canvas: HTMLCanvasElement;
 	ctx: CanvasRenderingContext2D;
 	lists: Lists | null;
 	mods: ModCache | null;
+	modState: Map<string, ModState>;
+	frame: number;
 	/** Whether the canvas currently has something drawn on it. */
 	dirty: boolean;
 }
@@ -195,7 +209,7 @@ export class GraphFx {
 						canvas.remove();
 						continue;
 					}
-					this.layers.set(r, { canvas, ctx, lists: null, mods: null, dirty: false });
+					this.layers.set(r, { canvas, ctx, lists: null, mods: null, modState: new Map(), frame: 0, dirty: false });
 				}
 			}
 		}
@@ -362,24 +376,42 @@ export class GraphFx {
 			const nodes: FxNode[] = [];
 			for (const [id, n] of lists.byId) if (set.has(id)) nodes.push(n);
 			if (!nodes.length) continue;
-			const colorFn = this.rgbaFn(def.color);
-			entries.push({ def, nodes, outline: [], colorFn, fill: colorFn(0.07) });
+			entries.push({ def, nodes, colorFn: this.rgbaFn(def.color) });
 		}
-		layer.mods = { version: modules.version, defsRef: defs, defsKey: key, listsRef: lists, entries, age: 1e9 };
+		// Forget barriers of modules that are gone, so they animate in again if re-added.
+		const alive = new Set(entries.map((e) => e.def.id));
+		for (const id of [...layer.modState.keys()]) if (!alive.has(id)) layer.modState.delete(id);
+		layer.mods = { version: modules.version, defsRef: defs, defsKey: key, listsRef: lists, entries };
 		return layer.mods;
 	}
 
-	/** Outlines in graph units; nodes move slowly, so every few frames is enough. */
-	private updateOutlines(mods: ModCache) {
-		if (mods.age++ < 5) return;
-		mods.age = 0;
+	/** Moves the barrier's radii towards the current outline of its notes. */
+	private stepModule(layer: Layer, e: ModEntry, now: number): ModState {
 		const s = this.plugin.settings;
-		for (const e of mods.entries) {
+		let st = layer.modState.get(e.def.id);
+		// Big modules: recompute the target every few frames (blending hides it).
+		const recompute = !st || e.nodes.length <= 400 || layer.frame % 3 === 0;
+		if (recompute) {
 			const pts = e.nodes.map((n) => ({ x: n.x, y: n.y }));
 			const R = this.plugin.modules.radius(e.def.id, pts.length);
-			const pad = 38 * s.moduleSize;
-			e.outline = moduleOutline(pts, s.moduleShape, pad, s.moduleShape === "circle" ? R : R * 0.55);
+			const outline = moduleOutline(pts, s.moduleShape, 38 * s.moduleSize, s.moduleShape === "circle" ? R : R * 0.55);
+			if (outline.length >= 3) {
+				const c = centroid(outline);
+				const target = polarRadii(outline, c, MOD_RAYS);
+				if (!st) {
+					st = { cx: c.x, cy: c.y, radii: target, born: now, last: now };
+					layer.modState.set(e.def.id, st);
+				} else {
+					// Frame-rate independent smoothing (~150 ms to settle).
+					const k = 1 - Math.pow(0.8, Math.min(4, (now - st.last) / 16.7));
+					st.cx += (c.x - st.cx) * k;
+					st.cy += (c.y - st.cy) * k;
+					for (let i = 0; i < MOD_RAYS; i++) st.radii[i] += (target[i] - st.radii[i]) * k;
+				}
+			}
 		}
+		if (st) st.last = now;
+		return st!;
 	}
 
 	/**
@@ -486,25 +518,48 @@ export class GraphFx {
 
 		// ---- modules: barriers around groups of notes (drawn underneath everything)
 		if (modsOn) {
+			layer.frame++;
 			const mods = this.modEntries(layer, lists);
-			this.updateOutlines(mods);
 			const animate = s.moduleAnimate && s.animations;
+			const intro = s.animations ? s.moduleIntro : "none";
 			mods.entries.forEach((e, idx) => {
-				if (e.outline.length < 3) return;
-				let screen = e.outline.map((p) => ({ x: p.x * S + ox, y: p.y * S + oy }));
-				let minX = Infinity;
-				let minY = Infinity;
-				let maxX = -Infinity;
-				let maxY = -Infinity;
-				for (const p of screen) {
-					if (p.x < minX) minX = p.x;
-					if (p.y < minY) minY = p.y;
-					if (p.x > maxX) maxX = p.x;
-					if (p.y > maxY) maxY = p.y;
+				const st = this.stepModule(layer, e, now);
+				if (!st) return;
+				const age = (now - st.born) / 1000;
+
+				// Entrance: "bubble" inflates with a springy overshoot and a wobble that
+				// calms down; "draw" closes the barrier clockwise.
+				const scale = intro === "bubble" ? elasticOut(Math.min(1, age / 1.1)) : 1;
+				let wobble = animate ? 0.012 : 0;
+				if (intro === "bubble") wobble += 0.07 * Math.max(0, 1 - age / 1.4);
+				const reveal = intro === "draw" ? Math.min(1, age / 1.2) : 1;
+				const fade = intro === "none" ? 1 : Math.min(1, age / 0.6);
+
+				const cxs = st.cx * S + ox;
+				const cys = st.cy * S + oy;
+				const screen: { x: number; y: number }[] = new Array(MOD_RAYS);
+				let maxR = 0;
+				for (let i = 0; i < MOD_RAYS; i++) {
+					const a = -Math.PI / 2 + (i / MOD_RAYS) * Math.PI * 2;
+					const wob = wobble ? 1 + wobble * (Math.sin(3 * a + t * 1.4 + idx) + 0.6 * Math.sin(5 * a - t * 1.1)) : 1;
+					const rr = st.radii[i] * scale * wob * S;
+					if (rr > maxR) maxR = rr;
+					screen[i] = { x: cxs + Math.cos(a) * rr, y: cys + Math.sin(a) * rr };
 				}
-				if (maxX < -20 || maxY < -20 || minX > w + 20 || minY > h + 20) return;
-				if (s.moduleShape === "cloud") screen = smoothClosed(screen, q === 0 ? 3 : 6);
-				if (s.moduleFill) fillOutline(ctx, screen, e.fill);
+				if (cxs + maxR < -20 || cys + maxR < -20 || cxs - maxR > w + 20 || cys - maxR > h + 20) return;
+
+				ctx.save();
+				if (reveal < 1) {
+					// Only the part of the barrier that has "closed" so far.
+					const start = -Math.PI / 2;
+					ctx.beginPath();
+					ctx.moveTo(cxs, cys);
+					ctx.arc(cxs, cys, maxR * 1.3 + 20, start, start + reveal * Math.PI * 2);
+					ctx.closePath();
+					ctx.clip();
+				}
+				ctx.globalAlpha = fade;
+				if (s.moduleFill) fillOutline(ctx, screen, e.colorFn(0.07));
 				drawBoundary(ctx, screen, {
 					style: e.def.line === "default" ? s.moduleLine : e.def.line,
 					color: e.colorFn,
@@ -513,10 +568,26 @@ export class GraphFx {
 					width: s.moduleLineWidth,
 					seed: idx + 1,
 				});
-				if (s.moduleLabels) {
-					let top = screen[0];
-					for (const p of screen) if (p.y < top.y) top = p;
+				ctx.restore();
+
+				if (reveal < 1) {
+					// Glowing head of the closing line.
+					const k = Math.floor(reveal * MOD_RAYS) % MOD_RAYS;
+					const head = screen[k];
+					ctx.fillStyle = e.colorFn(0.3);
+					ctx.beginPath();
+					ctx.arc(head.x, head.y, 7, 0, Math.PI * 2);
+					ctx.fill();
+					ctx.fillStyle = "rgba(255,255,255,0.95)";
+					ctx.beginPath();
+					ctx.arc(head.x, head.y, 2.5, 0, Math.PI * 2);
+					ctx.fill();
+				}
+
+				if (s.moduleLabels && fade > 0.05) {
+					const top = screen[0]; // index 0 points straight up
 					const label = `${e.def.name} · ${e.nodes.length}`;
+					ctx.globalAlpha = fade;
 					ctx.font = "600 12px var(--font-interface, sans-serif)";
 					const tw = ctx.measureText(label).width;
 					const lx = Math.min(Math.max(top.x - tw / 2, 4), w - tw - 4);
@@ -525,6 +596,7 @@ export class GraphFx {
 					ctx.fillRect(lx - 6, ly - 13, tw + 12, 18);
 					ctx.fillStyle = e.colorFn(1);
 					ctx.fillText(label, lx, ly);
+					ctx.globalAlpha = 1;
 				}
 			});
 		}

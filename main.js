@@ -1601,27 +1601,6 @@ function circlePoints(c, r, n) {
   }
   return out;
 }
-function smoothClosed(pts, perSegment = 6) {
-  const n = pts.length;
-  if (n < 3) return pts;
-  const out = [];
-  for (let i = 0; i < n; i++) {
-    const p0 = pts[(i - 1 + n) % n];
-    const p1 = pts[i];
-    const p2 = pts[(i + 1) % n];
-    const p3 = pts[(i + 2) % n];
-    for (let s = 0; s < perSegment; s++) {
-      const t = s / perSegment;
-      const t2 = t * t;
-      const t3 = t2 * t;
-      out.push({
-        x: 0.5 * (2 * p1.x + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
-        y: 0.5 * (2 * p1.y + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
-      });
-    }
-  }
-  return out;
-}
 function resampleClosed(pts, spacing, offset = 0, maxPoints = 1200) {
   const n = pts.length;
   if (n < 2) return pts;
@@ -1778,8 +1757,39 @@ function fillOutline(ctx, outline, style) {
   tracePath(ctx, outline);
   ctx.fill();
 }
+function polarRadii(poly, c, n) {
+  const out = new Float32Array(n);
+  const m = poly.length;
+  for (let i = 0; i < n; i++) {
+    const a = -Math.PI / 2 + i / n * Math.PI * 2;
+    const dx = Math.cos(a);
+    const dy = Math.sin(a);
+    let best = 0;
+    for (let j = 0; j < m; j++) {
+      const p = poly[j];
+      const q = poly[(j + 1) % m];
+      const ex = q.x - p.x;
+      const ey = q.y - p.y;
+      const den = dx * ey - dy * ex;
+      if (Math.abs(den) < 1e-9) continue;
+      const wx = p.x - c.x;
+      const wy = p.y - c.y;
+      const t = (wx * ey - wy * ex) / den;
+      const u = (wx * dy - wy * dx) / den;
+      if (t > best && u >= -1e-6 && u <= 1 + 1e-6) best = t;
+    }
+    out[i] = best;
+  }
+  return out;
+}
+function elasticOut(x) {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  return Math.pow(2, -10 * x) * Math.sin((x * 10 - 0.75) * (2 * Math.PI / 3)) + 1;
+}
 
 // src/graph-fx.ts
+var MOD_RAYS = 120;
 var TRAVEL = 0.9;
 var LINGER = 0.35;
 var RING = 1.4;
@@ -1886,7 +1896,7 @@ var GraphFx = class {
             canvas.remove();
             continue;
           }
-          this.layers.set(r, { canvas, ctx, lists: null, mods: null, dirty: false });
+          this.layers.set(r, { canvas, ctx, lists: null, mods: null, modState: /* @__PURE__ */ new Map(), frame: 0, dirty: false });
         }
       }
     }
@@ -2014,23 +2024,38 @@ var GraphFx = class {
       const nodes = [];
       for (const [id, n] of lists.byId) if (set.has(id)) nodes.push(n);
       if (!nodes.length) continue;
-      const colorFn = this.rgbaFn(def.color);
-      entries.push({ def, nodes, outline: [], colorFn, fill: colorFn(0.07) });
+      entries.push({ def, nodes, colorFn: this.rgbaFn(def.color) });
     }
-    layer.mods = { version: modules.version, defsRef: defs, defsKey: key, listsRef: lists, entries, age: 1e9 };
+    const alive = new Set(entries.map((e) => e.def.id));
+    for (const id of [...layer.modState.keys()]) if (!alive.has(id)) layer.modState.delete(id);
+    layer.mods = { version: modules.version, defsRef: defs, defsKey: key, listsRef: lists, entries };
     return layer.mods;
   }
-  /** Outlines in graph units; nodes move slowly, so every few frames is enough. */
-  updateOutlines(mods) {
-    if (mods.age++ < 5) return;
-    mods.age = 0;
+  /** Moves the barrier's radii towards the current outline of its notes. */
+  stepModule(layer, e, now) {
     const s = this.plugin.settings;
-    for (const e of mods.entries) {
+    let st = layer.modState.get(e.def.id);
+    const recompute = !st || e.nodes.length <= 400 || layer.frame % 3 === 0;
+    if (recompute) {
       const pts = e.nodes.map((n) => ({ x: n.x, y: n.y }));
       const R = this.plugin.modules.radius(e.def.id, pts.length);
-      const pad2 = 38 * s.moduleSize;
-      e.outline = moduleOutline(pts, s.moduleShape, pad2, s.moduleShape === "circle" ? R : R * 0.55);
+      const outline = moduleOutline(pts, s.moduleShape, 38 * s.moduleSize, s.moduleShape === "circle" ? R : R * 0.55);
+      if (outline.length >= 3) {
+        const c = centroid(outline);
+        const target = polarRadii(outline, c, MOD_RAYS);
+        if (!st) {
+          st = { cx: c.x, cy: c.y, radii: target, born: now, last: now };
+          layer.modState.set(e.def.id, st);
+        } else {
+          const k = 1 - Math.pow(0.8, Math.min(4, (now - st.last) / 16.7));
+          st.cx += (c.x - st.cx) * k;
+          st.cy += (c.y - st.cy) * k;
+          for (let i = 0; i < MOD_RAYS; i++) st.radii[i] += (target[i] - st.radii[i]) * k;
+        }
+      }
     }
+    if (st) st.last = now;
+    return st;
   }
   /**
    * World → screen mapping for this frame: screen = world · S + offset.
@@ -2118,25 +2143,42 @@ var GraphFx = class {
     const segVisible = (ax, ay, bx, by) => !(ax < -PAD && bx < -PAD || ay < -PAD && by < -PAD || ax > w + PAD && bx > w + PAD || ay > h + PAD && by > h + PAD);
     const emitAt = (depth) => (depth - 1) * (s.fxWave ? TRAVEL : 0);
     if (modsOn) {
+      layer.frame++;
       const mods = this.modEntries(layer, lists);
-      this.updateOutlines(mods);
       const animate = s.moduleAnimate && s.animations;
+      const intro = s.animations ? s.moduleIntro : "none";
       mods.entries.forEach((e, idx) => {
-        if (e.outline.length < 3) return;
-        let screen = e.outline.map((p) => ({ x: p.x * S + ox, y: p.y * S + oy }));
-        let minX = Infinity;
-        let minY = Infinity;
-        let maxX = -Infinity;
-        let maxY = -Infinity;
-        for (const p of screen) {
-          if (p.x < minX) minX = p.x;
-          if (p.y < minY) minY = p.y;
-          if (p.x > maxX) maxX = p.x;
-          if (p.y > maxY) maxY = p.y;
+        const st = this.stepModule(layer, e, now);
+        if (!st) return;
+        const age = (now - st.born) / 1e3;
+        const scale = intro === "bubble" ? elasticOut(Math.min(1, age / 1.1)) : 1;
+        let wobble = animate ? 0.012 : 0;
+        if (intro === "bubble") wobble += 0.07 * Math.max(0, 1 - age / 1.4);
+        const reveal = intro === "draw" ? Math.min(1, age / 1.2) : 1;
+        const fade = intro === "none" ? 1 : Math.min(1, age / 0.6);
+        const cxs = st.cx * S + ox;
+        const cys = st.cy * S + oy;
+        const screen = new Array(MOD_RAYS);
+        let maxR = 0;
+        for (let i = 0; i < MOD_RAYS; i++) {
+          const a = -Math.PI / 2 + i / MOD_RAYS * Math.PI * 2;
+          const wob = wobble ? 1 + wobble * (Math.sin(3 * a + t * 1.4 + idx) + 0.6 * Math.sin(5 * a - t * 1.1)) : 1;
+          const rr = st.radii[i] * scale * wob * S;
+          if (rr > maxR) maxR = rr;
+          screen[i] = { x: cxs + Math.cos(a) * rr, y: cys + Math.sin(a) * rr };
         }
-        if (maxX < -20 || maxY < -20 || minX > w + 20 || minY > h + 20) return;
-        if (s.moduleShape === "cloud") screen = smoothClosed(screen, q === 0 ? 3 : 6);
-        if (s.moduleFill) fillOutline(ctx, screen, e.fill);
+        if (cxs + maxR < -20 || cys + maxR < -20 || cxs - maxR > w + 20 || cys - maxR > h + 20) return;
+        ctx.save();
+        if (reveal < 1) {
+          const start = -Math.PI / 2;
+          ctx.beginPath();
+          ctx.moveTo(cxs, cys);
+          ctx.arc(cxs, cys, maxR * 1.3 + 20, start, start + reveal * Math.PI * 2);
+          ctx.closePath();
+          ctx.clip();
+        }
+        ctx.globalAlpha = fade;
+        if (s.moduleFill) fillOutline(ctx, screen, e.colorFn(0.07));
         drawBoundary(ctx, screen, {
           style: e.def.line === "default" ? s.moduleLine : e.def.line,
           color: e.colorFn,
@@ -2145,10 +2187,23 @@ var GraphFx = class {
           width: s.moduleLineWidth,
           seed: idx + 1
         });
-        if (s.moduleLabels) {
-          let top = screen[0];
-          for (const p of screen) if (p.y < top.y) top = p;
+        ctx.restore();
+        if (reveal < 1) {
+          const k = Math.floor(reveal * MOD_RAYS) % MOD_RAYS;
+          const head = screen[k];
+          ctx.fillStyle = e.colorFn(0.3);
+          ctx.beginPath();
+          ctx.arc(head.x, head.y, 7, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = "rgba(255,255,255,0.95)";
+          ctx.beginPath();
+          ctx.arc(head.x, head.y, 2.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        if (s.moduleLabels && fade > 0.05) {
+          const top = screen[0];
           const label = `${e.def.name} \xB7 ${e.nodes.length}`;
+          ctx.globalAlpha = fade;
           ctx.font = "600 12px var(--font-interface, sans-serif)";
           const tw = ctx.measureText(label).width;
           const lx = Math.min(Math.max(top.x - tw / 2, 4), w - tw - 4);
@@ -2157,6 +2212,7 @@ var GraphFx = class {
           ctx.fillRect(lx - 6, ly - 13, tw + 12, 18);
           ctx.fillStyle = e.colorFn(1);
           ctx.fillText(label, lx, ly);
+          ctx.globalAlpha = 1;
         }
       });
     }
@@ -2331,6 +2387,15 @@ var GraphModules = class {
             const tags = cache ? (0, import_obsidian7.getAllTags)(cache) ?? [] : [];
             if (tags.some((t) => t.toLowerCase() === tag || t.toLowerCase().startsWith(tag + "/"))) set.add(f.path);
           }
+        }
+      }
+      const unresolved = this.plugin.app.metadataCache.unresolvedLinks ?? {};
+      for (const path of [...set]) {
+        const links = unresolved[path];
+        if (!links) continue;
+        for (const link of Object.keys(links)) {
+          set.add(link);
+          if (!link.endsWith(".md")) set.add(`${link}.md`);
         }
       }
       out.set(m.id, set);
@@ -2627,7 +2692,8 @@ var DEFAULT_SETTINGS = {
   moduleSize: 1,
   moduleFill: true,
   moduleLabels: true,
-  moduleAnimate: true
+  moduleAnimate: true,
+  moduleIntro: "bubble"
 };
 var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
   constructor(app, plugin) {
@@ -3081,6 +3147,12 @@ var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
     ).addSlider(
       (sl) => sl.setLimits(0.5, 3, 0.25).setValue(s.moduleLineWidth).setDynamicTooltip().onChange(async (v) => {
         s.moduleLineWidth = v;
+        await changed();
+      })
+    );
+    new import_obsidian8.Setting(containerEl).setName("\u041F\u043E\u044F\u0432\u043B\u0435\u043D\u0438\u0435 \u043C\u043E\u0434\u0443\u043B\u044F").setDesc("\u041A\u0430\u043A \u0431\u0430\u0440\u044C\u0435\u0440 \u0432\u043E\u0437\u043D\u0438\u043A\u0430\u0435\u0442 \u043F\u0440\u0438 \u043E\u0442\u043A\u0440\u044B\u0442\u0438\u0438 \u0433\u0440\u0430\u0444\u0430 \u0438\u043B\u0438 \u0441\u043E\u0437\u0434\u0430\u043D\u0438\u0438 \u043C\u043E\u0434\u0443\u043B\u044F.").addDropdown(
+      (d) => d.addOptions({ bubble: "\u041F\u0443\u0437\u044B\u0440\u044C \u2014 \u043D\u0430\u0434\u0443\u0432\u0430\u0435\u0442\u0441\u044F \u0438 \u043A\u043E\u043B\u044B\u0448\u0435\u0442\u0441\u044F", draw: "\u0417\u0430\u043A\u0440\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u043F\u043E \u043A\u0440\u0443\u0433\u0443", none: "\u0411\u0435\u0437 \u0430\u043D\u0438\u043C\u0430\u0446\u0438\u0438" }).setValue(s.moduleIntro).onChange(async (v) => {
+        s.moduleIntro = v;
         await changed();
       })
     );

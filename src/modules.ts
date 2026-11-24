@@ -87,6 +87,17 @@ export class GraphModules {
 					}
 				}
 			}
+			// Notes that don't exist yet but are linked from the module ([[…]]) are
+			// shown as nodes in the graph too — they belong inside the barrier.
+			const unresolved = this.plugin.app.metadataCache.unresolvedLinks ?? {};
+			for (const path of [...set]) {
+				const links = unresolved[path];
+				if (!links) continue;
+				for (const link of Object.keys(links)) {
+					set.add(link);
+					if (!link.endsWith(".md")) set.add(`${link}.md`);
+				}
+			}
 			out.set(m.id, set);
 		}
 		this.cache = out;

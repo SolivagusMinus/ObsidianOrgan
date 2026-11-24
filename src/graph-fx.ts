@@ -522,6 +522,7 @@ export class GraphFx {
 			const mods = this.modEntries(layer, lists);
 			const animate = s.moduleAnimate && s.animations;
 			const intro = s.animations ? s.moduleIntro : "none";
+			const labelBoxes: { x: number; y: number; w: number; h: number }[] = [];
 			mods.entries.forEach((e, idx) => {
 				const st = this.stepModule(layer, e, now);
 				if (!st) return;
@@ -591,7 +592,11 @@ export class GraphFx {
 					ctx.font = "600 12px var(--font-interface, sans-serif)";
 					const tw = ctx.measureText(label).width;
 					const lx = Math.min(Math.max(top.x - tw / 2, 4), w - tw - 4);
-					const ly = Math.max(top.y - 10, 16);
+					let ly = Math.max(top.y - 10, 16);
+					// Don't cover another module's label: step down until there's room.
+					const hit = (y: number) => labelBoxes.some((b) => lx - 6 < b.x + b.w && lx + tw + 6 > b.x && y - 13 < b.y + b.h && y + 5 > b.y);
+					for (let k = 0; k < 8 && hit(ly); k++) ly += 20;
+					labelBoxes.push({ x: lx - 6, y: ly - 13, w: tw + 12, h: 18 });
 					ctx.fillStyle = "rgba(0,0,0,0.5)";
 					ctx.fillRect(lx - 6, ly - 13, tw + 12, 18);
 					ctx.fillStyle = e.colorFn(1);

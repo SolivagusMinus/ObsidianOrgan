@@ -42,6 +42,16 @@ const hexToRgb = (hex: string): number => {
 };
 
 
+/** A note kept in place by a module: inside it (member) or outside it (outsider). */
+interface Held {
+	mod: string;
+	inside: boolean;
+	dx: number;
+	dy: number;
+	x: number;
+	y: number;
+}
+
 export class GraphTree {
 	private originals = new Map<GraphRenderer, (data: unknown) => void>();
 	private views = new Map<GraphRenderer, GraphLeafView>();
@@ -63,6 +73,8 @@ export class GraphTree {
 	/** How often each note had to be pulled back; repeat offenders widen the barrier instead. */
 	private holdStrikes = new Map<string, number>();
 	private holdStrikesReset = 0;
+	/** Notes kept in place by their module (offset from the module centre), per graph. */
+	private held = new Map<GraphRenderer, Map<string, Held>>();
 	/** Target positions last sent to each graph, to skip no-op updates. */
 	private sent = new Map<GraphRenderer, Map<string, Point>>();
 
@@ -98,6 +110,7 @@ export class GraphTree {
 		if (this.holdTimer !== null) window.clearInterval(this.holdTimer);
 		for (const [r, ids] of this.holdRelease) for (const id of ids) this.post(r, { forceNode: { id, x: null, y: null } });
 		this.holdRelease.clear();
+		for (const r of this.held.keys()) this.releaseHeld(r);
 		this.growing.forEach((id) => window.cancelAnimationFrame(id));
 		this.freezeTimers.forEach((t) => window.clearTimeout(t));
 		for (const r of [...this.originals.keys()]) {
@@ -412,10 +425,13 @@ export class GraphTree {
 			if (!ids.length) continue;
 			const pinnedIds = ids.filter((id) => base.has(id));
 			const baseC = pinnedIds.length ? centroid(pinnedIds.map((id) => base.get(id)!)) : null;
+			// A skill-tree branch can be wider than "its share" by note count: reserve its real size.
+			let extent = modules.radius(m.id, ids.length);
+			if (baseC) for (const id of pinnedIds) extent = Math.max(extent, Math.hypot(base.get(id)!.x - baseC.x, base.get(id)!.y - baseC.y) + 30);
 			const start =
 				modules.centers.get(m.id) ??
 				baseC ?? { x: median(ids.map((id) => nodeById.get(id)!.x)), y: median(ids.map((id) => nodeById.get(id)!.y)) };
-			circles.push({ x: start.x, y: start.y, r: modules.radius(m.id, ids.length) + pad, id: m.id, ids, baseC });
+			circles.push({ x: start.x, y: start.y, r: extent + pad, id: m.id, ids, baseC });
 		}
 		separateCircles(circles, s.moduleGap);
 
@@ -423,7 +439,7 @@ export class GraphTree {
 		const alive = new Set<string>();
 		for (const c of circles) {
 			alive.add(c.id);
-			modules.centers.set(c.id, { x: c.x, y: c.y });
+			modules.centers.set(c.id, { x: c.x, y: c.y, hold: c.r - pad });
 			if (c.baseC) {
 				const dx = c.x - c.baseC.x;
 				const dy = c.y - c.baseC.y;
@@ -459,75 +475,106 @@ export class GraphTree {
 			this.holdStrikes.clear();
 			this.holdStrikesReset = now;
 		}
+		const median = (v: number[]) => {
+			v.sort((p, q) => p - q);
+			const mid = v.length >> 1;
+			return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+		};
 		for (const r of this.originals.keys()) {
 			const release = this.holdRelease.get(r) ?? new Set<string>();
 			for (const id of release) this.post(r, { forceNode: { id, x: null, y: null } });
 			release.clear();
 			this.holdRelease.set(r, release);
-			if (!s.moduleHold || !modules.list.length || !r.nodes?.length || this.growing.has(r)) continue;
+			const held = this.held.get(r) ?? new Map<string, Held>();
+			this.held.set(r, held);
+			if (!s.moduleHold || !s.modulesEnabled || !modules.list.length || !r.nodes?.length || this.growing.has(r)) {
+				this.releaseHeld(r);
+				continue;
+			}
 
 			const pinned = this.pinned.get(r);
 			const frozen = this.frozen.get(r);
 			const members = modules.members();
+			const live = new Set(modules.list.map((m) => m.id));
 			let clamped = 0;
-			const widened = new Set<string>();
+
+			// Drop held pins whose module is gone or whose note changed module.
+			for (const [id, h] of [...held]) {
+				const isMember = members.get(h.mod)?.has(id) ?? false;
+				if (!live.has(h.mod) || isMember !== h.inside || pinned?.has(id)) {
+					this.post(r, { forceNode: { id, x: null, y: null } });
+					held.delete(id);
+				}
+			}
+
 			for (const m of modules.list) {
+				modules.relax(m.id); // give back room from older versions' widening
 				const set = members.get(m.id);
 				if (!set?.size) continue;
 				const nodes = r.nodes.filter((n) => set.has(n.id));
 				if (!nodes.length) continue;
-				// Median centre: a single runaway note can't drag the barrier along.
-				const median = (v: number[]) => {
-					v.sort((p, q) => p - q);
-					const mid = v.length >> 1;
-					return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
-				};
 				const placed = s.moduleSeparate ? modules.centers.get(m.id) : undefined;
 				const cx = placed?.x ?? median(nodes.map((n) => n.x));
 				const cy = placed?.y ?? median(nodes.map((n) => n.y));
-				const R = modules.radius(m.id, nodes.length);
+				const R = placed?.hold ?? modules.radius(m.id, nodes.length);
 
-				// Separate places: notes that aren't part of this module are kept outside it.
-				if (s.moduleSeparate) {
-					for (const n of r.nodes) {
-						if (set.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
-						const dx = n.x - cx;
-						const dy = n.y - cy;
-						const d = Math.hypot(dx, dy) || 1;
-						if (d >= R * 0.95) continue;
-						const key = `${n.id}|out`;
-						const strikes = (this.holdStrikes.get(key) ?? 0) + 1;
-						this.holdStrikes.set(key, strikes);
-						if (strikes > 6) continue; // the layout insists — let it be
-						const k = (R * 1.1) / d;
-						this.post(r, { forceNode: { id: n.id, x: cx + dx * k, y: cy + dy * k } });
-						release.add(n.id);
+				// Held notes ride along when the module moves.
+				for (const [id, h] of held) {
+					if (h.mod !== m.id) continue;
+					const x = cx + h.dx;
+					const y = cy + h.dy;
+					if (Math.abs(x - h.x) > 0.5 || Math.abs(y - h.y) > 0.5) {
+						this.post(r, { forceNode: { id, x, y } });
+						h.x = x;
+						h.y = y;
 						clamped++;
 					}
 				}
+
+				/** Soft pull for the first escapes; after that the note is kept in place. */
+				const correct = (id: string, dx: number, dy: number, d: number, radius: number, inside: boolean) => {
+					const key = inside ? id : `${id}|out`;
+					const strikes = (this.holdStrikes.get(key) ?? 0) + 1;
+					this.holdStrikes.set(key, strikes);
+					const k = radius / (d || 1);
+					const rx = (d ? dx : 1) * k;
+					const ry = (d ? dy : 0) * k;
+					this.post(r, { forceNode: { id, x: cx + rx, y: cy + ry } });
+					if (strikes > 2) held.set(id, { mod: m.id, inside, dx: rx, dy: ry, x: cx + rx, y: cy + ry });
+					else release.add(id);
+					clamped++;
+				};
+
+				// Members outside the barrier come back in.
 				for (const n of nodes) {
-					if (pinned?.has(n.id) || frozen?.has(n.id)) continue;
+					if (held.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
 					const dx = n.x - cx;
 					const dy = n.y - cy;
 					const d = Math.hypot(dx, dy);
-					if (d <= R || d === 0) continue;
-					const strikes = (this.holdStrikes.get(n.id) ?? 0) + 1;
-					this.holdStrikes.set(n.id, strikes);
-					if (strikes > 6) {
-						modules.widen(m.id, d - R + 20);
-						widened.add(m.id);
-						continue;
+					if (d > R) correct(n.id, dx, dy, d, R * 0.85, true);
+				}
+
+				// Separate places: notes that aren't part of this module stay outside it.
+				if (s.moduleSeparate) {
+					for (const n of r.nodes) {
+						if (set.has(n.id) || held.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
+						const dx = n.x - cx;
+						const dy = n.y - cy;
+						const d = Math.hypot(dx, dy);
+						if (d < R * 0.98) correct(n.id, dx, dy, d, R * 1.1, false);
 					}
-					const k = (R * 0.85) / d;
-					this.post(r, { forceNode: { id: n.id, x: cx + dx * k, y: cy + dy * k } });
-					release.add(n.id);
-					clamped++;
 				}
 			}
-			for (const m of modules.list) if (!widened.has(m.id)) modules.relax(m.id);
 			// A gentle nudge so the pins take effect even if the graph had come to rest.
 			if (clamped) this.post(r, { alpha: 0.05, run: true });
 		}
+	}
+
+	private releaseHeld(r: GraphRenderer) {
+		const held = this.held.get(r);
+		if (!held?.size) return;
+		for (const id of held.keys()) this.post(r, { forceNode: { id, x: null, y: null } });
+		held.clear();
 	}
 
 	// ------------------------------------------------------------- colours

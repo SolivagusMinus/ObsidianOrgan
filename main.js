@@ -1279,6 +1279,8 @@ var GraphTree = class {
     /** How often each note had to be pulled back; repeat offenders widen the barrier instead. */
     this.holdStrikes = /* @__PURE__ */ new Map();
     this.holdStrikesReset = 0;
+    /** Notes kept in place by their module (offset from the module centre), per graph. */
+    this.held = /* @__PURE__ */ new Map();
     /** Target positions last sent to each graph, to skip no-op updates. */
     this.sent = /* @__PURE__ */ new Map();
   }
@@ -1307,6 +1309,7 @@ var GraphTree = class {
     if (this.holdTimer !== null) window.clearInterval(this.holdTimer);
     for (const [r, ids] of this.holdRelease) for (const id of ids) this.post(r, { forceNode: { id, x: null, y: null } });
     this.holdRelease.clear();
+    for (const r of this.held.keys()) this.releaseHeld(r);
     this.growing.forEach((id) => window.cancelAnimationFrame(id));
     this.freezeTimers.forEach((t) => window.clearTimeout(t));
     for (const r of [...this.originals.keys()]) {
@@ -1585,15 +1588,17 @@ var GraphTree = class {
       if (!ids.length) continue;
       const pinnedIds = ids.filter((id) => base.has(id));
       const baseC = pinnedIds.length ? centroid(pinnedIds.map((id) => base.get(id))) : null;
+      let extent = modules.radius(m.id, ids.length);
+      if (baseC) for (const id of pinnedIds) extent = Math.max(extent, Math.hypot(base.get(id).x - baseC.x, base.get(id).y - baseC.y) + 30);
       const start = modules.centers.get(m.id) ?? baseC ?? { x: median(ids.map((id) => nodeById.get(id).x)), y: median(ids.map((id) => nodeById.get(id).y)) };
-      circles.push({ x: start.x, y: start.y, r: modules.radius(m.id, ids.length) + pad2, id: m.id, ids, baseC });
+      circles.push({ x: start.x, y: start.y, r: extent + pad2, id: m.id, ids, baseC });
     }
     separateCircles(circles, s.moduleGap);
     const target = new Map(base);
     const alive = /* @__PURE__ */ new Set();
     for (const c of circles) {
       alive.add(c.id);
-      modules.centers.set(c.id, { x: c.x, y: c.y });
+      modules.centers.set(c.id, { x: c.x, y: c.y, hold: c.r - pad2 });
       if (c.baseC) {
         const dx = c.x - c.baseC.x;
         const dy = c.y - c.baseC.y;
@@ -1627,70 +1632,92 @@ var GraphTree = class {
       this.holdStrikes.clear();
       this.holdStrikesReset = now;
     }
+    const median = (v) => {
+      v.sort((p, q) => p - q);
+      const mid = v.length >> 1;
+      return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+    };
     for (const r of this.originals.keys()) {
       const release = this.holdRelease.get(r) ?? /* @__PURE__ */ new Set();
       for (const id of release) this.post(r, { forceNode: { id, x: null, y: null } });
       release.clear();
       this.holdRelease.set(r, release);
-      if (!s.moduleHold || !modules.list.length || !r.nodes?.length || this.growing.has(r)) continue;
+      const held = this.held.get(r) ?? /* @__PURE__ */ new Map();
+      this.held.set(r, held);
+      if (!s.moduleHold || !s.modulesEnabled || !modules.list.length || !r.nodes?.length || this.growing.has(r)) {
+        this.releaseHeld(r);
+        continue;
+      }
       const pinned = this.pinned.get(r);
       const frozen = this.frozen.get(r);
       const members = modules.members();
+      const live = new Set(modules.list.map((m) => m.id));
       let clamped = 0;
-      const widened = /* @__PURE__ */ new Set();
+      for (const [id, h] of [...held]) {
+        const isMember = members.get(h.mod)?.has(id) ?? false;
+        if (!live.has(h.mod) || isMember !== h.inside || pinned?.has(id)) {
+          this.post(r, { forceNode: { id, x: null, y: null } });
+          held.delete(id);
+        }
+      }
       for (const m of modules.list) {
+        modules.relax(m.id);
         const set = members.get(m.id);
         if (!set?.size) continue;
         const nodes = r.nodes.filter((n) => set.has(n.id));
         if (!nodes.length) continue;
-        const median = (v) => {
-          v.sort((p, q) => p - q);
-          const mid = v.length >> 1;
-          return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
-        };
         const placed = s.moduleSeparate ? modules.centers.get(m.id) : void 0;
         const cx = placed?.x ?? median(nodes.map((n) => n.x));
         const cy = placed?.y ?? median(nodes.map((n) => n.y));
-        const R = modules.radius(m.id, nodes.length);
-        if (s.moduleSeparate) {
-          for (const n of r.nodes) {
-            if (set.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
-            const dx = n.x - cx;
-            const dy = n.y - cy;
-            const d = Math.hypot(dx, dy) || 1;
-            if (d >= R * 0.95) continue;
-            const key = `${n.id}|out`;
-            const strikes = (this.holdStrikes.get(key) ?? 0) + 1;
-            this.holdStrikes.set(key, strikes);
-            if (strikes > 6) continue;
-            const k = R * 1.1 / d;
-            this.post(r, { forceNode: { id: n.id, x: cx + dx * k, y: cy + dy * k } });
-            release.add(n.id);
+        const R = placed?.hold ?? modules.radius(m.id, nodes.length);
+        for (const [id, h] of held) {
+          if (h.mod !== m.id) continue;
+          const x = cx + h.dx;
+          const y = cy + h.dy;
+          if (Math.abs(x - h.x) > 0.5 || Math.abs(y - h.y) > 0.5) {
+            this.post(r, { forceNode: { id, x, y } });
+            h.x = x;
+            h.y = y;
             clamped++;
           }
         }
+        const correct = (id, dx, dy, d, radius, inside) => {
+          const key = inside ? id : `${id}|out`;
+          const strikes = (this.holdStrikes.get(key) ?? 0) + 1;
+          this.holdStrikes.set(key, strikes);
+          const k = radius / (d || 1);
+          const rx = (d ? dx : 1) * k;
+          const ry = (d ? dy : 0) * k;
+          this.post(r, { forceNode: { id, x: cx + rx, y: cy + ry } });
+          if (strikes > 2) held.set(id, { mod: m.id, inside, dx: rx, dy: ry, x: cx + rx, y: cy + ry });
+          else release.add(id);
+          clamped++;
+        };
         for (const n of nodes) {
-          if (pinned?.has(n.id) || frozen?.has(n.id)) continue;
+          if (held.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
           const dx = n.x - cx;
           const dy = n.y - cy;
           const d = Math.hypot(dx, dy);
-          if (d <= R || d === 0) continue;
-          const strikes = (this.holdStrikes.get(n.id) ?? 0) + 1;
-          this.holdStrikes.set(n.id, strikes);
-          if (strikes > 6) {
-            modules.widen(m.id, d - R + 20);
-            widened.add(m.id);
-            continue;
+          if (d > R) correct(n.id, dx, dy, d, R * 0.85, true);
+        }
+        if (s.moduleSeparate) {
+          for (const n of r.nodes) {
+            if (set.has(n.id) || held.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
+            const dx = n.x - cx;
+            const dy = n.y - cy;
+            const d = Math.hypot(dx, dy);
+            if (d < R * 0.98) correct(n.id, dx, dy, d, R * 1.1, false);
           }
-          const k = R * 0.85 / d;
-          this.post(r, { forceNode: { id: n.id, x: cx + dx * k, y: cy + dy * k } });
-          release.add(n.id);
-          clamped++;
         }
       }
-      for (const m of modules.list) if (!widened.has(m.id)) modules.relax(m.id);
       if (clamped) this.post(r, { alpha: 0.05, run: true });
     }
+  }
+  releaseHeld(r) {
+    const held = this.held.get(r);
+    if (!held?.size) return;
+    for (const id of held.keys()) this.post(r, { forceNode: { id, x: null, y: null } });
+    held.clear();
   }
   // ------------------------------------------------------------- colours
   /**
@@ -2275,6 +2302,7 @@ var GraphFx = class {
       const mods = this.modEntries(layer, lists);
       const animate = s.moduleAnimate && s.animations;
       const intro = s.animations ? s.moduleIntro : "none";
+      const labelBoxes = [];
       mods.entries.forEach((e, idx) => {
         const st = this.stepModule(layer, e, now);
         if (!st) return;
@@ -2335,7 +2363,10 @@ var GraphFx = class {
           ctx.font = "600 12px var(--font-interface, sans-serif)";
           const tw = ctx.measureText(label).width;
           const lx = Math.min(Math.max(top.x - tw / 2, 4), w - tw - 4);
-          const ly = Math.max(top.y - 10, 16);
+          let ly = Math.max(top.y - 10, 16);
+          const hit = (y) => labelBoxes.some((b) => lx - 6 < b.x + b.w && lx + tw + 6 > b.x && y - 13 < b.y + b.h && y + 5 > b.y);
+          for (let k = 0; k < 8 && hit(ly); k++) ly += 20;
+          labelBoxes.push({ x: lx - 6, y: ly - 13, w: tw + 12, h: 18 });
           ctx.fillStyle = "rgba(0,0,0,0.5)";
           ctx.fillRect(lx - 6, ly - 13, tw + 12, 18);
           ctx.fillStyle = e.colorFn(1);

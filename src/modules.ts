@@ -36,7 +36,7 @@ export class GraphModules {
 	/** Extra radius a barrier gained because notes kept escaping it (world units). */
 	private extra = new Map<string, number>();
 	/** Where each module sits in the graph after separation (graph units). */
-	centers = new Map<string, { x: number; y: number }>();
+	centers = new Map<string, { x: number; y: number; hold?: number }>();
 
 	constructor(private plugin: FolderHubPlugin) {}
 

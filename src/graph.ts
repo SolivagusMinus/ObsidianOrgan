@@ -40,8 +40,6 @@ const hexToRgb = (hex: string): number => {
 	return parseInt(full, 16) || 0;
 };
 
-/** Branch colour groups written by v1.2.0 (removed since). */
-const isBranchQuery = (q: string) => q.startsWith("path:/^");
 
 export class GraphTree {
 	private originals = new Map<GraphRenderer, (data: unknown) => void>();
@@ -56,6 +54,12 @@ export class GraphTree {
 	private freezeTimers = new Map<GraphRenderer, number>();
 	private depthCache: { hubs: Map<string, number>; all: Map<string, number> } | null = null;
 	private posCache: Map<string, Point> | null = null;
+	private holdTimer: number | null = null;
+	/** Per graph: notes clamped on the last tick (released on the next one). */
+	private holdRelease = new Map<GraphRenderer, Set<string>>();
+	/** How often each note had to be pulled back; repeat offenders widen the barrier instead. */
+	private holdStrikes = new Map<string, number>();
+	private holdStrikesReset = 0;
 	/** Target positions last sent to each graph, to skip no-op updates. */
 	private sent = new Map<GraphRenderer, Map<string, Point>>();
 
@@ -79,11 +83,18 @@ export class GraphTree {
 		p.registerEvent(this.app.vault.on("delete", onTreeChange));
 		p.registerEvent(this.app.vault.on("rename", onTreeChange));
 		this.scan();
-		// Clean up branch colours left by v1.2.0.
-		if (this.plugin.settings.managedGraphQueries.some(isBranchQuery)) void this.syncColorGroups(false, false);
+		// Bring graph colour groups in line with the settings (module colours,
+		// leftovers from older versions).
+		void this.syncColorGroups(false, false);
+		// Modules: keep member notes inside their barrier.
+		this.holdTimer = window.setInterval(() => this.holdTick(), 400);
+		this.plugin.registerInterval(this.holdTimer);
 	}
 
 	stop() {
+		if (this.holdTimer !== null) window.clearInterval(this.holdTimer);
+		for (const [r, ids] of this.holdRelease) for (const id of ids) this.post(r, { forceNode: { id, x: null, y: null } });
+		this.holdRelease.clear();
 		this.growing.forEach((id) => window.cancelAnimationFrame(id));
 		this.freezeTimers.forEach((t) => window.clearTimeout(t));
 		for (const r of [...this.originals.keys()]) {
@@ -362,12 +373,77 @@ export class GraphTree {
 		return this.posCache;
 	}
 
+	// ------------------------------------------------------------- modules
+
+	/**
+	 * Keeps module members inside their barrier: a note that drifted outside
+	 * is pinned just inside for one tick and released on the next, so the
+	 * physics carries on from there. If a note keeps escaping (the layout
+	 * wants it outside), the barrier grows instead of fighting the physics.
+	 */
+	private holdTick() {
+		const s = this.plugin.settings;
+		const modules = this.plugin.modules;
+		const now = performance.now();
+		if (now - this.holdStrikesReset > 30000) {
+			this.holdStrikes.clear();
+			this.holdStrikesReset = now;
+		}
+		for (const r of this.originals.keys()) {
+			const release = this.holdRelease.get(r) ?? new Set<string>();
+			for (const id of release) this.post(r, { forceNode: { id, x: null, y: null } });
+			release.clear();
+			this.holdRelease.set(r, release);
+			if (!s.moduleHold || !modules.list.length || !r.nodes?.length || this.growing.has(r)) continue;
+
+			const pinned = this.pinned.get(r);
+			const frozen = this.frozen.get(r);
+			const members = modules.members();
+			let clamped = 0;
+			for (const m of modules.list) {
+				const set = members.get(m.id);
+				if (!set?.size) continue;
+				const nodes = r.nodes.filter((n) => set.has(n.id));
+				if (!nodes.length) continue;
+				// Median centre: a single runaway note can't drag the barrier along.
+				const median = (v: number[]) => {
+					v.sort((p, q) => p - q);
+					const mid = v.length >> 1;
+					return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+				};
+				const cx = median(nodes.map((n) => n.x));
+				const cy = median(nodes.map((n) => n.y));
+				const R = modules.radius(m.id, nodes.length);
+				for (const n of nodes) {
+					if (pinned?.has(n.id) || frozen?.has(n.id)) continue;
+					const dx = n.x - cx;
+					const dy = n.y - cy;
+					const d = Math.hypot(dx, dy);
+					if (d <= R || d === 0) continue;
+					const strikes = (this.holdStrikes.get(n.id) ?? 0) + 1;
+					this.holdStrikes.set(n.id, strikes);
+					if (strikes > 6) {
+						modules.widen(m.id, d - R + 20);
+						continue;
+					}
+					const k = (R * 0.85) / d;
+					this.post(r, { forceNode: { id: n.id, x: cx + dx * k, y: cy + dy * k } });
+					release.add(n.id);
+					clamped++;
+				}
+			}
+			// A gentle nudge so the pins take effect even if the graph had come to rest.
+			if (clamped) this.post(r, { alpha: 0.05, run: true });
+		}
+	}
+
 	// ------------------------------------------------------------- colours
 
 	/**
-	 * Keeps graph colour groups tidy: optionally puts the index-note tag group
-	 * first (highest priority), and removes branch groups written by v1.2.0.
-	 * Groups the user created are never touched.
+	 * Keeps graph colour groups in line with the settings: the index-note tag
+	 * group (only once the user asked for it) and one group per module that
+	 * paints its nodes. Groups the user created are never touched; groups this
+	 * plugin wrote earlier but no longer wants are removed.
 	 */
 	async syncColorGroups(addIndexGroup: boolean, notify: boolean) {
 		const s = this.plugin.settings;
@@ -388,13 +464,18 @@ export class GraphTree {
 		}
 
 		const managed = new Set(s.managedGraphQueries);
-		let groups = (cfg.colorGroups ?? []).filter((g) => !(managed.has(g.query) && isBranchQuery(g.query)));
-		const nextManaged = s.managedGraphQueries.filter((q) => !isBranchQuery(q));
-		if (addIndexGroup) {
-			const query = `tag:#${tag}`;
-			groups = [{ query, color: { a: 1, rgb: hexToRgb(s.highlightColor) } }, ...groups.filter((g) => g.query !== query)];
-			if (!nextManaged.includes(query)) nextManaged.push(query);
+		const tagQuery = tag ? `tag:#${tag}` : null;
+		const desired: ColorGroup[] = [];
+		if (tagQuery && (addIndexGroup || managed.has(tagQuery))) {
+			desired.push({ query: tagQuery, color: { a: 1, rgb: hexToRgb(s.highlightColor) } });
 		}
+		for (const g of this.plugin.modules.colorGroups()) {
+			if (!desired.some((d) => d.query === g.query)) desired.push({ query: g.query, color: { a: 1, rgb: hexToRgb(g.color) } });
+		}
+		const desiredQ = new Set(desired.map((g) => g.query));
+		const userGroups = (cfg.colorGroups ?? []).filter((g) => !managed.has(g.query) && !desiredQ.has(g.query));
+		const groups = [...desired, ...userGroups];
+		const nextManaged = desired.map((g) => g.query);
 
 		if (JSON.stringify(groups) !== JSON.stringify(cfg.colorGroups ?? [])) {
 			cfg.colorGroups = groups;

@@ -1,6 +1,8 @@
 import { Platform, View } from "obsidian";
 import type FolderHubPlugin from "./main";
 import { Quality, drawRay } from "./rays";
+import { Pt, drawBoundary, fillOutline, moduleOutline, smoothClosed } from "./module-shapes";
+import type { ModuleDef } from "./modules";
 
 // ---------------------------------------------------------------------------
 // Visual effects drawn on a transparent canvas laid over the graph view:
@@ -60,10 +62,30 @@ interface Lists {
 	byId: Map<string, FxNode>;
 }
 
+/** A module's member nodes in one graph, with its outline in graph (world) units. */
+interface ModEntry {
+	def: ModuleDef;
+	nodes: FxNode[];
+	outline: Pt[];
+	colorFn: (a: number) => string;
+	fill: string;
+}
+
+interface ModCache {
+	version: number;
+	defsRef: ModuleDef[];
+	defsKey: string;
+	listsRef: Lists;
+	entries: ModEntry[];
+	/** Frames since outlines were recomputed. */
+	age: number;
+}
+
 interface Layer {
 	canvas: HTMLCanvasElement;
 	ctx: CanvasRenderingContext2D;
 	lists: Lists | null;
+	mods: ModCache | null;
 	/** Whether the canvas currently has something drawn on it. */
 	dirty: boolean;
 }
@@ -121,11 +143,22 @@ export class GraphFx {
 		return this.plugin.app;
 	}
 
-	get active(): boolean {
+	/** Pulses, rays, flow and glow (animations). */
+	private get effectsOn(): boolean {
 		const s = this.plugin.settings;
 		const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 		const anything = s.fxRing || s.fxWave || s.fxGlow || s.linkFlow !== "off" || s.fxShowFps;
 		return s.fxEnabled && s.animations && !reduced && anything;
+	}
+
+	/** Module barriers are structure, not decoration: shown even with animations off. */
+	private get modulesOn(): boolean {
+		const s = this.plugin.settings;
+		return s.modulesEnabled && s.modules.length > 0;
+	}
+
+	get active(): boolean {
+		return this.effectsOn || this.modulesOn;
 	}
 
 	start() {
@@ -157,12 +190,12 @@ export class GraphFx {
 				if (!this.layers.has(r)) {
 					if (getComputedStyle(host).position === "static") host.style.position = "relative";
 					const canvas = host.createEl("canvas", { cls: "fh-graph-fx" });
-					const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true }) as CanvasRenderingContext2D | null;
+					const ctx = canvas.getContext("2d");
 					if (!ctx) {
 						canvas.remove();
 						continue;
 					}
-					this.layers.set(r, { canvas, ctx, lists: null, dirty: false });
+					this.layers.set(r, { canvas, ctx, lists: null, mods: null, dirty: false });
 				}
 			}
 		}
@@ -173,7 +206,10 @@ export class GraphFx {
 		}
 		// Settings may have changed: drop caches.
 		this.colorKey = "";
-		for (const l of this.layers.values()) l.lists = null;
+		for (const l of this.layers.values()) {
+			l.lists = null;
+			l.mods = null;
+		}
 
 		if (this.layers.size && this.raf === null) this.raf = window.requestAnimationFrame(this.loop);
 		if (!this.layers.size && this.raf !== null) {
@@ -303,6 +339,49 @@ export class GraphFx {
 		return layer.lists;
 	}
 
+	private rgbaFn(hex: string): (a: number) => string {
+		const h = hex.replace("#", "");
+		const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h.slice(0, 6);
+		const n = parseInt(full, 16);
+		const [r, g, b] = Number.isNaN(n) ? [57, 135, 229] : [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+		return (a: number) => `rgba(${r},${g},${b},${a < 0 ? 0 : a > 1 ? 1 : a.toFixed(3)})`;
+	}
+
+	/** Module members present in this graph (rebuilt when graph data or modules change). */
+	private modEntries(layer: Layer, lists: Lists): ModCache {
+		const modules = this.plugin.modules;
+		const defs = this.plugin.settings.modules;
+		const key = defs.map((d) => `${d.id}|${d.color}|${d.line}|${d.kind}|${d.value}`).join(";");
+		const c = layer.mods;
+		if (c && c.version === modules.version && c.defsRef === defs && c.defsKey === key && c.listsRef === lists) return c;
+		const members = modules.members();
+		const entries: ModEntry[] = [];
+		for (const def of defs) {
+			const set = members.get(def.id);
+			if (!set?.size) continue;
+			const nodes: FxNode[] = [];
+			for (const [id, n] of lists.byId) if (set.has(id)) nodes.push(n);
+			if (!nodes.length) continue;
+			const colorFn = this.rgbaFn(def.color);
+			entries.push({ def, nodes, outline: [], colorFn, fill: colorFn(0.07) });
+		}
+		layer.mods = { version: modules.version, defsRef: defs, defsKey: key, listsRef: lists, entries, age: 1e9 };
+		return layer.mods;
+	}
+
+	/** Outlines in graph units; nodes move slowly, so every few frames is enough. */
+	private updateOutlines(mods: ModCache) {
+		if (mods.age++ < 5) return;
+		mods.age = 0;
+		const s = this.plugin.settings;
+		for (const e of mods.entries) {
+			const pts = e.nodes.map((n) => ({ x: n.x, y: n.y }));
+			const R = this.plugin.modules.radius(e.def.id, pts.length);
+			const pad = 38 * s.moduleSize;
+			e.outline = moduleOutline(pts, s.moduleShape, pad, s.moduleShape === "circle" ? R : R * 0.55);
+		}
+	}
+
 	/**
 	 * World → screen mapping for this frame: screen = world · S + offset.
 	 * Calibrated from the node sprites' world transforms (read-only, no PIXI
@@ -361,13 +440,17 @@ export class GraphFx {
 		// Is anything visible this frame? Pulse-only setups are idle most of the time.
 		const maxDepth = lists.hubDepth.length ? Math.max(...lists.hubDepth) : 1;
 		const pulseWindow = (maxDepth - 1) * (s.fxWave ? TRAVEL : 0) + Math.max(RING, TRAVEL + LINGER);
+		const fxOn = this.effectsOn;
+		const modsOn = this.modulesOn;
 		const busy =
-			s.fxGlow ||
+			modsOn ||
+			(fxOn &&
+				(s.fxGlow ||
 			s.fxShowFps ||
 			s.linkFlow !== "off" ||
 			(s.fxWave && s.rayMode === "constant") ||
 			this.bursts.length > 0 ||
-			((s.fxRing || s.fxWave) && phase < pulseWindow);
+			((s.fxRing || s.fxWave) && phase < pulseWindow)));
 		if (!busy) {
 			if (layer.dirty) {
 				ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -400,6 +483,52 @@ export class GraphFx {
 		const segVisible = (ax: number, ay: number, bx: number, by: number) =>
 			!((ax < -PAD && bx < -PAD) || (ay < -PAD && by < -PAD) || (ax > w + PAD && bx > w + PAD) || (ay > h + PAD && by > h + PAD));
 		const emitAt = (depth: number) => (depth - 1) * (s.fxWave ? TRAVEL : 0);
+
+		// ---- modules: barriers around groups of notes (drawn underneath everything)
+		if (modsOn) {
+			const mods = this.modEntries(layer, lists);
+			this.updateOutlines(mods);
+			const animate = s.moduleAnimate && s.animations;
+			mods.entries.forEach((e, idx) => {
+				if (e.outline.length < 3) return;
+				let screen = e.outline.map((p) => ({ x: p.x * S + ox, y: p.y * S + oy }));
+				let minX = Infinity;
+				let minY = Infinity;
+				let maxX = -Infinity;
+				let maxY = -Infinity;
+				for (const p of screen) {
+					if (p.x < minX) minX = p.x;
+					if (p.y < minY) minY = p.y;
+					if (p.x > maxX) maxX = p.x;
+					if (p.y > maxY) maxY = p.y;
+				}
+				if (maxX < -20 || maxY < -20 || minX > w + 20 || minY > h + 20) return;
+				if (s.moduleShape === "cloud") screen = smoothClosed(screen, q === 0 ? 3 : 6);
+				if (s.moduleFill) fillOutline(ctx, screen, e.fill);
+				drawBoundary(ctx, screen, {
+					style: e.def.line === "default" ? s.moduleLine : e.def.line,
+					color: e.colorFn,
+					t,
+					animate,
+					width: s.moduleLineWidth,
+					seed: idx + 1,
+				});
+				if (s.moduleLabels) {
+					let top = screen[0];
+					for (const p of screen) if (p.y < top.y) top = p;
+					const label = `${e.def.name} · ${e.nodes.length}`;
+					ctx.font = "600 12px var(--font-interface, sans-serif)";
+					const tw = ctx.measureText(label).width;
+					const lx = Math.min(Math.max(top.x - tw / 2, 4), w - tw - 4);
+					const ly = Math.max(top.y - 10, 16);
+					ctx.fillStyle = "rgba(0,0,0,0.5)";
+					ctx.fillRect(lx - 6, ly - 13, tw + 12, 18);
+					ctx.fillStyle = e.colorFn(1);
+					ctx.fillText(label, lx, ly);
+				}
+			});
+		}
+		if (!fxOn) return;
 
 		// ---- link flow: moving dashes (one batched path)
 		if (s.linkFlow !== "off") {

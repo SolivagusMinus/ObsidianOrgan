@@ -14,6 +14,7 @@ import { CalendarView, VIEW_TYPE_CALENDAR } from "./calendar-view";
 import { BranchLevels } from "./branch-levels";
 import { GraphTree } from "./graph";
 import { GraphFx } from "./graph-fx";
+import { GraphModules } from "./modules";
 import { LEVEL_FENCE, stripLevelFence } from "./levels";
 import { WordTracker } from "./tracker";
 import { StatsData, pluralRu } from "./words";
@@ -43,6 +44,8 @@ export default class FolderHubPlugin extends Plugin {
 	tracker = new WordTracker(this);
 	graphTree = new GraphTree(this);
 	graphFx = new GraphFx(this);
+	modules = new GraphModules(this);
+	private colorSyncTimer: number | null = null;
 	levels = new BranchLevels(this);
 
 	private statusEl: HTMLElement | null = null;
@@ -62,10 +65,30 @@ export default class FolderHubPlugin extends Plugin {
 		this.register(() => this.styleEl?.remove());
 
 		this.levels.start();
+		this.modules.start();
 
 		// ---- Calendar & daily word counter
 		this.registerView(VIEW_TYPE_CALENDAR, (leaf) => new CalendarView(leaf, this));
 		this.addRibbonIcon("calendar-days", "ObsOrg: календарь и счётчик слов", () => void this.activateCalendar());
+		this.addCommand({
+			id: "module-from-current-folder",
+			name: "Граф: сделать папку текущей заметки модулем",
+			checkCallback: (checking) => {
+				const folder = this.app.workspace.getActiveFile()?.parent;
+				if (!folder || folder.isRoot()) return false;
+				if (!checking) void this.toggleFolderModule(folder, true);
+				return true;
+			},
+		});
+		this.addCommand({
+			id: "toggle-modules",
+			name: "Граф: показать/скрыть модули",
+			callback: async () => {
+				this.settings.modulesEnabled = !this.settings.modulesEnabled;
+				await this.saveSettings();
+				new Notice(`Модули в графе ${this.settings.modulesEnabled ? "показаны" : "скрыты"}`);
+			},
+		});
 		this.addCommand({
 			id: "toggle-skill-tree",
 			name: "Граф: включить/выключить дерево прокачки",
@@ -152,6 +175,13 @@ export default class FolderHubPlugin extends Plugin {
 							.onClick(() => this.createIndex(file, true)),
 					);
 				}
+				const isModule = !!this.modules.findFolderModule(file);
+				menu.addItem((i) =>
+					i
+						.setTitle(isModule ? "Убрать модуль графа" : "Сделать модулем графа")
+						.setIcon(isModule ? "circle-off" : "circle-dashed")
+						.onClick(() => this.toggleFolderModule(file, !isModule)),
+				);
 			}),
 		);
 
@@ -189,6 +219,7 @@ export default class FolderHubPlugin extends Plugin {
 		// Copy nested objects so DEFAULT_SETTINGS is never mutated.
 		this.settings.branchDirections = { ...(settings.branchDirections ?? {}) };
 		this.settings.managedGraphQueries = [...(settings.managedGraphQueries ?? [])];
+		this.settings.modules = (settings.modules ?? []).map((m) => ({ ...m }));
 		this.lastCalendarSig = this.calendarSignature();
 		this.lastTreeSig = this.treeSignature();
 	}
@@ -228,6 +259,32 @@ export default class FolderHubPlugin extends Plugin {
 	private calendarSignature(): string {
 		const s = this.settings;
 		return JSON.stringify([s.dailyGoal, s.animations, s.dailyFolder, s.dailyFormat, s.tag, s.indexName]);
+	}
+
+	// ------------------------------------------------------------ modules
+
+	/** Call after editing modules: refreshes membership, colours and the graph overlay. */
+	async onModulesChanged() {
+		this.modules.invalidate();
+		await this.saveSettings();
+		this.graphFx.sync();
+		if (this.colorSyncTimer !== null) window.clearTimeout(this.colorSyncTimer);
+		this.colorSyncTimer = window.setTimeout(() => {
+			this.colorSyncTimer = null;
+			void this.graphTree.syncColorGroups(false, false);
+		}, 1000);
+	}
+
+	async toggleFolderModule(folder: TFolder, on: boolean) {
+		if (on) {
+			const m = this.modules.addFolderModule(folder);
+			new Notice(`Модуль «${m.name}» добавлен в граф`);
+		} else {
+			const m = this.modules.findFolderModule(folder);
+			if (m) this.modules.remove(m.id);
+			new Notice(`Модуль «${folder.name}» убран из графа`);
+		}
+		await this.onModulesChanged();
 	}
 
 	// ------------------------------------------------------ words & calendar

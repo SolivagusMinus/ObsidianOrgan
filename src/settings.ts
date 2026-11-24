@@ -3,6 +3,9 @@ import type FolderHubPlugin from "./main";
 import type { Layout, SortBy, SortOrder } from "./render";
 import { DIRECTIONS, TreeStyle } from "./skilltree";
 import { RAY_STYLES, RayStyle } from "./rays";
+import { LINE_STYLES, LineStyle, ModuleShape } from "./module-shapes";
+import { MODULE_COLORS, ModuleDef, newModuleId } from "./modules";
+import { TFolder } from "obsidian";
 
 export interface FolderHubSettings {
 	// Creation
@@ -76,6 +79,18 @@ export interface FolderHubSettings {
 	graphGrow: boolean;
 	graphFreeze: boolean;
 	fxShowFps: boolean;
+
+	// Graph modules
+	modulesEnabled: boolean;
+	modules: ModuleDef[];
+	moduleShape: ModuleShape;
+	moduleLine: LineStyle;
+	moduleLineWidth: number;
+	moduleHold: boolean;
+	moduleSize: number;
+	moduleFill: boolean;
+	moduleLabels: boolean;
+	moduleAnimate: boolean;
 }
 
 export const DEFAULT_NOTE_TEMPLATE = `---
@@ -151,6 +166,17 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	graphGrow: true,
 	graphFreeze: false,
 	fxShowFps: false,
+
+	modulesEnabled: true,
+	modules: [],
+	moduleShape: "cloud",
+	moduleLine: "zigzag",
+	moduleLineWidth: 1,
+	moduleHold: true,
+	moduleSize: 1,
+	moduleFill: true,
+	moduleLabels: true,
+	moduleAnimate: true,
 };
 
 export class FolderHubSettingTab extends PluginSettingTab {
@@ -829,6 +855,8 @@ export class FolderHubSettingTab extends PluginSettingTab {
 				}),
 			);
 
+		this.displayModules(containerEl);
+
 		// ------------------------------------------------------------------
 		new Setting(containerEl).setName("Уровни веток").setHeading();
 
@@ -864,5 +892,218 @@ export class FolderHubSettingTab extends PluginSettingTab {
 						await this.plugin.updateAll(true);
 					}),
 			);
+	}
+
+	/** "Graph: modules" section with a small editor for each module. */
+	private displayModules(containerEl: HTMLElement) {
+		const s = this.plugin.settings;
+		const changed = () => this.plugin.onModulesChanged();
+
+		new Setting(containerEl).setName("Граф: модули").setHeading();
+		containerEl.createEl("p", {
+			cls: "setting-item-description",
+			text:
+				"Модуль — барьер вокруг группы заметок (папки или тега): граница своего цвета, которая растёт " +
+				"вместе с числом заметок и удерживает их внутри. Быстро создать: правый клик по папке → «Сделать модулем графа».",
+		});
+
+		new Setting(containerEl).setName("Показывать модули").addToggle((t) =>
+			t.setValue(s.modulesEnabled).onChange(async (v) => {
+				s.modulesEnabled = v;
+				await changed();
+			}),
+		);
+
+		new Setting(containerEl)
+			.setName("Форма границы")
+			.addDropdown((d) =>
+				d
+					.addOptions({ cloud: "Облако — по форме группы", circle: "Круг" })
+					.setValue(s.moduleShape)
+					.onChange(async (v) => {
+						s.moduleShape = v as ModuleShape;
+						await changed();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Линия границы по умолчанию")
+			.addDropdown((d) =>
+				d
+					.addOptions(LINE_STYLES)
+					.setValue(s.moduleLine)
+					.onChange(async (v) => {
+						s.moduleLine = v as LineStyle;
+						await changed();
+					}),
+			)
+			.addSlider((sl) =>
+				sl
+					.setLimits(0.5, 3, 0.25)
+					.setValue(s.moduleLineWidth)
+					.setDynamicTooltip()
+					.onChange(async (v) => {
+						s.moduleLineWidth = v;
+						await changed();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Размер барьера")
+			.setDesc("Множитель: барьер растёт с количеством заметок (√n), это — общий масштаб.")
+			.addSlider((sl) =>
+				sl
+					.setLimits(0.5, 2.5, 0.1)
+					.setValue(s.moduleSize)
+					.setDynamicTooltip()
+					.onChange(async (v) => {
+						s.moduleSize = v;
+						await changed();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Удерживать заметки внутри")
+			.setDesc("Вылетевшую за барьер заметку мягко возвращает внутрь; если её постоянно выталкивает — барьер расширяется.")
+			.addToggle((t) =>
+				t.setValue(s.moduleHold).onChange(async (v) => {
+					s.moduleHold = v;
+					await changed();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Заливка, подписи, анимация границы")
+			.addToggle((t) =>
+				t.setTooltip("Полупрозрачная заливка").setValue(s.moduleFill).onChange(async (v) => {
+					s.moduleFill = v;
+					await changed();
+				}),
+			)
+			.addToggle((t) =>
+				t.setTooltip("Подпись с названием и числом заметок").setValue(s.moduleLabels).onChange(async (v) => {
+					s.moduleLabels = v;
+					await changed();
+				}),
+			)
+			.addToggle((t) =>
+				t.setTooltip("Зубцы/штрихи/волна ползут вдоль границы").setValue(s.moduleAnimate).onChange(async (v) => {
+					s.moduleAnimate = v;
+					await changed();
+				}),
+			);
+
+		const folders = this.app.vault
+			.getAllLoadedFiles()
+			.filter((f): f is TFolder => f instanceof TFolder && !f.isRoot())
+			.map((f) => f.path)
+			.sort((a, b) => a.localeCompare(b));
+		const lineOptions: Record<string, string> = { default: `По умолчанию (${LINE_STYLES[s.moduleLine]})` };
+		for (const [k, v] of Object.entries(LINE_STYLES)) lineOptions[k] = v;
+
+		s.modules.forEach((m, i) => {
+			const box = containerEl.createDiv({ cls: "fh-module-box" });
+			box.style.setProperty("--fh-module-color", m.color);
+
+			new Setting(box)
+				.setName(`Модуль ${i + 1}`)
+				.addText((t) =>
+					t.setPlaceholder("Название").setValue(m.name).onChange(async (v) => {
+						m.name = v;
+						await changed();
+					}),
+				)
+				.addColorPicker((c) =>
+					c.setValue(m.color).onChange(async (v) => {
+						m.color = v;
+						box.style.setProperty("--fh-module-color", v);
+						await changed();
+					}),
+				)
+				.addExtraButton((b) =>
+					b
+						.setIcon("trash-2")
+						.setTooltip("Удалить модуль")
+						.onClick(async () => {
+							s.modules.splice(i, 1);
+							await changed();
+							this.display();
+						}),
+				);
+
+			const member = new Setting(box).setName("Состав").addDropdown((d) =>
+				d
+					.addOptions({ folder: "Папка", tag: "Тег" })
+					.setValue(m.kind)
+					.onChange(async (v) => {
+						m.kind = v as ModuleDef["kind"];
+						m.value = "";
+						await changed();
+						this.display();
+					}),
+			);
+			if (m.kind === "folder" && folders.length <= 400) {
+				member.addDropdown((d) => {
+					d.addOption("", "— выберите папку —");
+					for (const f of folders) d.addOption(f, f);
+					d.setValue(m.value).onChange(async (v) => {
+						m.value = v;
+						if (!m.name || m.name === "Новый модуль") m.name = v.split("/").pop() ?? v;
+						await changed();
+						this.display();
+					});
+				});
+			} else {
+				member.addText((t) =>
+					t
+						.setPlaceholder(m.kind === "tag" ? "тег без #" : "Путь к папке")
+						.setValue(m.value)
+						.onChange(async (v) => {
+							m.value = v.trim();
+							await changed();
+						}),
+				);
+			}
+
+			new Setting(box)
+				.setName("Граница и точки")
+				.addDropdown((d) =>
+					d
+						.addOptions(lineOptions)
+						.setValue(m.line)
+						.onChange(async (v) => {
+							m.line = v as ModuleDef["line"];
+							await changed();
+						}),
+				)
+				.addToggle((t) =>
+					t
+						.setTooltip("Красить точки модуля в его цвет (появится после повторного открытия графа)")
+						.setValue(m.colorNodes)
+						.onChange(async (v) => {
+							m.colorNodes = v;
+							await changed();
+						}),
+				);
+		});
+
+		new Setting(containerEl).addButton((b) =>
+			b
+				.setButtonText("Добавить модуль")
+				.setCta()
+				.onClick(async () => {
+					s.modules.push({
+						id: newModuleId(),
+						name: "Новый модуль",
+						kind: "folder",
+						value: "",
+						color: MODULE_COLORS[s.modules.length % MODULE_COLORS.length],
+						colorNodes: true,
+						line: "default",
+					});
+					await changed();
+					this.display();
+				}),
+		);
 	}
 }

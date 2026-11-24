@@ -416,3 +416,13 @@
 	}
 }
 .fh-no-anim, .fh-no-anim * { animation: none !important; transition: none !important; }
+
+/* Settings: one box per graph module, with its colour as an accent stripe */
+.fh-module-box {
+	border: 1px solid var(--background-modifier-border);
+	border-left: 4px solid var(--fh-module-color, var(--interactive-accent));
+	border-radius: 8px;
+	padding: 0 12px;
+	margin: 8px 0;
+}
+.fh-module-box .setting-item { border-top: none; }

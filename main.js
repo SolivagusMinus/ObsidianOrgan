@@ -24,7 +24,7 @@ __export(main_exports, {
   default: () => FolderHubPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian8 = require("obsidian");
+var import_obsidian10 = require("obsidian");
 
 // src/calendar-view.ts
 var import_obsidian3 = require("obsidian");
@@ -957,7 +957,6 @@ var hexToRgb = (hex) => {
   const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h.slice(0, 6);
   return parseInt(full, 16) || 0;
 };
-var isBranchQuery = (q) => q.startsWith("path:/^");
 var GraphTree = class {
   constructor(plugin) {
     this.plugin = plugin;
@@ -973,6 +972,12 @@ var GraphTree = class {
     this.freezeTimers = /* @__PURE__ */ new Map();
     this.depthCache = null;
     this.posCache = null;
+    this.holdTimer = null;
+    /** Per graph: notes clamped on the last tick (released on the next one). */
+    this.holdRelease = /* @__PURE__ */ new Map();
+    /** How often each note had to be pulled back; repeat offenders widen the barrier instead. */
+    this.holdStrikes = /* @__PURE__ */ new Map();
+    this.holdStrikesReset = 0;
     /** Target positions last sent to each graph, to skip no-op updates. */
     this.sent = /* @__PURE__ */ new Map();
   }
@@ -993,9 +998,14 @@ var GraphTree = class {
     p.registerEvent(this.app.vault.on("delete", onTreeChange));
     p.registerEvent(this.app.vault.on("rename", onTreeChange));
     this.scan();
-    if (this.plugin.settings.managedGraphQueries.some(isBranchQuery)) void this.syncColorGroups(false, false);
+    void this.syncColorGroups(false, false);
+    this.holdTimer = window.setInterval(() => this.holdTick(), 400);
+    this.plugin.registerInterval(this.holdTimer);
   }
   stop() {
+    if (this.holdTimer !== null) window.clearInterval(this.holdTimer);
+    for (const [r, ids] of this.holdRelease) for (const id of ids) this.post(r, { forceNode: { id, x: null, y: null } });
+    this.holdRelease.clear();
     this.growing.forEach((id) => window.cancelAnimationFrame(id));
     this.freezeTimers.forEach((t) => window.clearTimeout(t));
     for (const r of [...this.originals.keys()]) {
@@ -1240,11 +1250,71 @@ var GraphTree = class {
     if (!this.posCache) this.posCache = layoutSkillTree(this.buildTree(), this.layoutOptions());
     return this.posCache;
   }
+  // ------------------------------------------------------------- modules
+  /**
+   * Keeps module members inside their barrier: a note that drifted outside
+   * is pinned just inside for one tick and released on the next, so the
+   * physics carries on from there. If a note keeps escaping (the layout
+   * wants it outside), the barrier grows instead of fighting the physics.
+   */
+  holdTick() {
+    const s = this.plugin.settings;
+    const modules = this.plugin.modules;
+    const now = performance.now();
+    if (now - this.holdStrikesReset > 3e4) {
+      this.holdStrikes.clear();
+      this.holdStrikesReset = now;
+    }
+    for (const r of this.originals.keys()) {
+      const release = this.holdRelease.get(r) ?? /* @__PURE__ */ new Set();
+      for (const id of release) this.post(r, { forceNode: { id, x: null, y: null } });
+      release.clear();
+      this.holdRelease.set(r, release);
+      if (!s.moduleHold || !modules.list.length || !r.nodes?.length || this.growing.has(r)) continue;
+      const pinned = this.pinned.get(r);
+      const frozen = this.frozen.get(r);
+      const members = modules.members();
+      let clamped = 0;
+      for (const m of modules.list) {
+        const set = members.get(m.id);
+        if (!set?.size) continue;
+        const nodes = r.nodes.filter((n) => set.has(n.id));
+        if (!nodes.length) continue;
+        const median = (v) => {
+          v.sort((p, q) => p - q);
+          const mid = v.length >> 1;
+          return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+        };
+        const cx = median(nodes.map((n) => n.x));
+        const cy = median(nodes.map((n) => n.y));
+        const R = modules.radius(m.id, nodes.length);
+        for (const n of nodes) {
+          if (pinned?.has(n.id) || frozen?.has(n.id)) continue;
+          const dx = n.x - cx;
+          const dy = n.y - cy;
+          const d = Math.hypot(dx, dy);
+          if (d <= R || d === 0) continue;
+          const strikes = (this.holdStrikes.get(n.id) ?? 0) + 1;
+          this.holdStrikes.set(n.id, strikes);
+          if (strikes > 6) {
+            modules.widen(m.id, d - R + 20);
+            continue;
+          }
+          const k = R * 0.85 / d;
+          this.post(r, { forceNode: { id: n.id, x: cx + dx * k, y: cy + dy * k } });
+          release.add(n.id);
+          clamped++;
+        }
+      }
+      if (clamped) this.post(r, { alpha: 0.05, run: true });
+    }
+  }
   // ------------------------------------------------------------- colours
   /**
-   * Keeps graph colour groups tidy: optionally puts the index-note tag group
-   * first (highest priority), and removes branch groups written by v1.2.0.
-   * Groups the user created are never touched.
+   * Keeps graph colour groups in line with the settings: the index-note tag
+   * group (only once the user asked for it) and one group per module that
+   * paints its nodes. Groups the user created are never touched; groups this
+   * plugin wrote earlier but no longer wants are removed.
    */
   async syncColorGroups(addIndexGroup, notify) {
     const s = this.plugin.settings;
@@ -1264,13 +1334,18 @@ var GraphTree = class {
       return;
     }
     const managed = new Set(s.managedGraphQueries);
-    let groups = (cfg.colorGroups ?? []).filter((g) => !(managed.has(g.query) && isBranchQuery(g.query)));
-    const nextManaged = s.managedGraphQueries.filter((q) => !isBranchQuery(q));
-    if (addIndexGroup) {
-      const query = `tag:#${tag}`;
-      groups = [{ query, color: { a: 1, rgb: hexToRgb(s.highlightColor) } }, ...groups.filter((g) => g.query !== query)];
-      if (!nextManaged.includes(query)) nextManaged.push(query);
+    const tagQuery = tag ? `tag:#${tag}` : null;
+    const desired = [];
+    if (tagQuery && (addIndexGroup || managed.has(tagQuery))) {
+      desired.push({ query: tagQuery, color: { a: 1, rgb: hexToRgb(s.highlightColor) } });
     }
+    for (const g of this.plugin.modules.colorGroups()) {
+      if (!desired.some((d) => d.query === g.query)) desired.push({ query: g.query, color: { a: 1, rgb: hexToRgb(g.color) } });
+    }
+    const desiredQ = new Set(desired.map((g) => g.query));
+    const userGroups = (cfg.colorGroups ?? []).filter((g) => !managed.has(g.query) && !desiredQ.has(g.query));
+    const groups = [...desired, ...userGroups];
+    const nextManaged = desired.map((g) => g.query);
     if (JSON.stringify(groups) !== JSON.stringify(cfg.colorGroups ?? [])) {
       cfg.colorGroups = groups;
       await adapter.write(path, JSON.stringify(cfg, null, 2));
@@ -1458,6 +1533,252 @@ function drawLightning(ctx, a, b, len, p) {
   }
 }
 
+// src/module-shapes.ts
+var LINE_STYLES = {
+  zigzag: "\u0417\u0438\u0433\u0437\u0430\u0433",
+  solid: "\u0421\u043F\u043B\u043E\u0448\u043D\u0430\u044F",
+  dashed: "\u041F\u0443\u043D\u043A\u0442\u0438\u0440",
+  dotted: "\u0422\u043E\u0447\u043A\u0438",
+  wave: "\u0412\u043E\u043B\u043D\u0430",
+  double: "\u0414\u0432\u043E\u0439\u043D\u0430\u044F",
+  electric: "\u042D\u043B\u0435\u043A\u0442\u0440\u0438\u0447\u0435\u0441\u043A\u0430\u044F"
+};
+function convexHull(input) {
+  const pts = [...input].sort((a, b) => a.x - b.x || a.y - b.y);
+  if (pts.length < 3) return pts;
+  const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const lower = [];
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper = [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  upper.pop();
+  lower.pop();
+  return lower.concat(upper);
+}
+function centroid(pts) {
+  let x = 0;
+  let y = 0;
+  for (const p of pts) {
+    x += p.x;
+    y += p.y;
+  }
+  return pts.length ? { x: x / pts.length, y: y / pts.length } : { x: 0, y: 0 };
+}
+function moduleRadius(n, size = 1) {
+  return (110 + 42 * Math.sqrt(Math.max(1, n))) * size;
+}
+function moduleOutline(points, shape, pad2, minRadius) {
+  if (!points.length) return [];
+  const c = centroid(points);
+  if (shape === "circle") {
+    let r = minRadius;
+    for (const p of points) r = Math.max(r, Math.hypot(p.x - c.x, p.y - c.y) + pad2);
+    return circlePoints(c, r, 48);
+  }
+  const cloud = [];
+  const K = 10;
+  for (const p of points) {
+    for (let k = 0; k < K; k++) {
+      const a = k / K * Math.PI * 2;
+      cloud.push({ x: p.x + Math.cos(a) * pad2, y: p.y + Math.sin(a) * pad2 });
+    }
+  }
+  for (const p of circlePoints(c, minRadius, 16)) cloud.push(p);
+  return convexHull(cloud);
+}
+function circlePoints(c, r, n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const a = i / n * Math.PI * 2;
+    out.push({ x: c.x + Math.cos(a) * r, y: c.y + Math.sin(a) * r });
+  }
+  return out;
+}
+function smoothClosed(pts, perSegment = 6) {
+  const n = pts.length;
+  if (n < 3) return pts;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const p0 = pts[(i - 1 + n) % n];
+    const p1 = pts[i];
+    const p2 = pts[(i + 1) % n];
+    const p3 = pts[(i + 2) % n];
+    for (let s = 0; s < perSegment; s++) {
+      const t = s / perSegment;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      out.push({
+        x: 0.5 * (2 * p1.x + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+        y: 0.5 * (2 * p1.y + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
+      });
+    }
+  }
+  return out;
+}
+function resampleClosed(pts, spacing, offset = 0, maxPoints = 1200) {
+  const n = pts.length;
+  if (n < 2) return pts;
+  let perimeter = 0;
+  for (let i = 0; i < n; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % n];
+    perimeter += Math.hypot(b.x - a.x, b.y - a.y);
+  }
+  if (perimeter <= 0) return pts;
+  const step = Math.max(spacing, perimeter / maxPoints);
+  const count = Math.max(3, Math.floor(perimeter / step));
+  const out = [];
+  let seg = 0;
+  let segStart = 0;
+  let segLen = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+  for (let k = 0; k < count; k++) {
+    const d = ((offset % perimeter + perimeter) % perimeter + k * (perimeter / count)) % perimeter;
+    if (d < segStart) {
+      seg = 0;
+      segStart = 0;
+      segLen = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+    }
+    while (d > segStart + segLen && seg < n - 1) {
+      segStart += segLen;
+      seg++;
+      const a2 = pts[seg];
+      const b2 = pts[(seg + 1) % n];
+      segLen = Math.hypot(b2.x - a2.x, b2.y - a2.y);
+    }
+    const a = pts[seg];
+    const b = pts[(seg + 1) % n];
+    const k2 = segLen > 0 ? (d - segStart) / segLen : 0;
+    out.push({ x: a.x + (b.x - a.x) * k2, y: a.y + (b.y - a.y) * k2 });
+  }
+  return out;
+}
+function normals(pts) {
+  const n = pts.length;
+  const c = centroid(pts);
+  return pts.map((p, i) => {
+    const a = pts[(i - 1 + n) % n];
+    const b = pts[(i + 1) % n];
+    let nx = -(b.y - a.y);
+    let ny = b.x - a.x;
+    const len = Math.hypot(nx, ny) || 1;
+    nx /= len;
+    ny /= len;
+    if (nx * (p.x - c.x) + ny * (p.y - c.y) < 0) {
+      nx = -nx;
+      ny = -ny;
+    }
+    return { x: nx, y: ny };
+  });
+}
+function tracePath(ctx, pts) {
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.closePath();
+}
+function drawBoundary(ctx, outline, b) {
+  if (outline.length < 3) return;
+  const t = b.animate ? b.t : 0;
+  const w = b.width;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  switch (b.style) {
+    case "zigzag": {
+      const half = 6 * w;
+      const pts = resampleClosed(outline, half, -t * 14);
+      const nrm = normals(pts);
+      const amp = 3.5 * w;
+      const zz = pts.map((p, i) => ({ x: p.x + nrm[i].x * (i % 2 ? amp : -amp), y: p.y + nrm[i].y * (i % 2 ? amp : -amp) }));
+      ctx.strokeStyle = b.color(0.85);
+      ctx.lineWidth = 1.6 * w;
+      tracePath(ctx, zz);
+      ctx.stroke();
+      break;
+    }
+    case "wave": {
+      const pts = resampleClosed(outline, 3);
+      const nrm = normals(pts);
+      const amp = 3.5 * w;
+      const lambda = 26 * w;
+      let dist = 0;
+      const wv = pts.map((p, i) => {
+        if (i) dist += Math.hypot(p.x - pts[i - 1].x, p.y - pts[i - 1].y);
+        const o = amp * Math.sin(dist / lambda * Math.PI * 2 - t * 3);
+        return { x: p.x + nrm[i].x * o, y: p.y + nrm[i].y * o };
+      });
+      ctx.strokeStyle = b.color(0.85);
+      ctx.lineWidth = 1.6 * w;
+      tracePath(ctx, wv);
+      ctx.stroke();
+      break;
+    }
+    case "double": {
+      const pts = resampleClosed(outline, 6);
+      const nrm = normals(pts);
+      ctx.strokeStyle = b.color(0.8);
+      ctx.lineWidth = 1.2 * w;
+      for (const o of [-2.6 * w, 2.6 * w]) {
+        tracePath(ctx, pts.map((p, i) => ({ x: p.x + nrm[i].x * o, y: p.y + nrm[i].y * o })));
+        ctx.stroke();
+      }
+      break;
+    }
+    case "electric": {
+      const pts = resampleClosed(outline, 9);
+      const nrm = normals(pts);
+      let s = Math.floor(t * 12) * 9973 + b.seed * 7919 >>> 0;
+      const rnd = () => {
+        s = s * 1664525 + 1013904223 >>> 0;
+        return s / 4294967296;
+      };
+      const el = pts.map((p, i) => {
+        const o = (rnd() * 2 - 1) * 3.2 * w;
+        return { x: p.x + nrm[i].x * o, y: p.y + nrm[i].y * o };
+      });
+      ctx.strokeStyle = b.color(0.22);
+      ctx.lineWidth = 5 * w;
+      tracePath(ctx, el);
+      ctx.stroke();
+      ctx.strokeStyle = b.color(0.95);
+      ctx.lineWidth = 1.3 * w;
+      tracePath(ctx, el);
+      ctx.stroke();
+      break;
+    }
+    case "dashed":
+    case "dotted": {
+      const dotted = b.style === "dotted";
+      ctx.setLineDash(dotted ? [0.1, 8 * w] : [11 * w, 7 * w]);
+      ctx.lineDashOffset = -t * 18;
+      ctx.strokeStyle = b.color(0.85);
+      ctx.lineWidth = (dotted ? 3.2 : 1.8) * w;
+      tracePath(ctx, outline);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      break;
+    }
+    default: {
+      ctx.strokeStyle = b.color(0.85);
+      ctx.lineWidth = 1.8 * w;
+      tracePath(ctx, outline);
+      ctx.stroke();
+    }
+  }
+}
+function fillOutline(ctx, outline, style) {
+  if (outline.length < 3) return;
+  ctx.fillStyle = style;
+  tracePath(ctx, outline);
+  ctx.fill();
+}
+
 // src/graph-fx.ts
 var TRAVEL = 0.9;
 var LINGER = 0.35;
@@ -1518,11 +1839,20 @@ var GraphFx = class {
   get app() {
     return this.plugin.app;
   }
-  get active() {
+  /** Pulses, rays, flow and glow (animations). */
+  get effectsOn() {
     const s = this.plugin.settings;
     const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     const anything = s.fxRing || s.fxWave || s.fxGlow || s.linkFlow !== "off" || s.fxShowFps;
     return s.fxEnabled && s.animations && !reduced && anything;
+  }
+  /** Module barriers are structure, not decoration: shown even with animations off. */
+  get modulesOn() {
+    const s = this.plugin.settings;
+    return s.modulesEnabled && s.modules.length > 0;
+  }
+  get active() {
+    return this.effectsOn || this.modulesOn;
   }
   start() {
     this.plugin.registerEvent(this.app.workspace.on("layout-change", () => this.sync()));
@@ -1551,12 +1881,12 @@ var GraphFx = class {
         if (!this.layers.has(r)) {
           if (getComputedStyle(host).position === "static") host.style.position = "relative";
           const canvas = host.createEl("canvas", { cls: "fh-graph-fx" });
-          const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
+          const ctx = canvas.getContext("2d");
           if (!ctx) {
             canvas.remove();
             continue;
           }
-          this.layers.set(r, { canvas, ctx, lists: null, dirty: false });
+          this.layers.set(r, { canvas, ctx, lists: null, mods: null, dirty: false });
         }
       }
     }
@@ -1566,7 +1896,10 @@ var GraphFx = class {
       this.layers.delete(r);
     }
     this.colorKey = "";
-    for (const l of this.layers.values()) l.lists = null;
+    for (const l of this.layers.values()) {
+      l.lists = null;
+      l.mods = null;
+    }
     if (this.layers.size && this.raf === null) this.raf = window.requestAnimationFrame(this.loop);
     if (!this.layers.size && this.raf !== null) {
       window.cancelAnimationFrame(this.raf);
@@ -1659,6 +1992,46 @@ var GraphFx = class {
     };
     return layer.lists;
   }
+  rgbaFn(hex) {
+    const h = hex.replace("#", "");
+    const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h.slice(0, 6);
+    const n = parseInt(full, 16);
+    const [r, g, b] = Number.isNaN(n) ? [57, 135, 229] : [n >> 16 & 255, n >> 8 & 255, n & 255];
+    return (a) => `rgba(${r},${g},${b},${a < 0 ? 0 : a > 1 ? 1 : a.toFixed(3)})`;
+  }
+  /** Module members present in this graph (rebuilt when graph data or modules change). */
+  modEntries(layer, lists) {
+    const modules = this.plugin.modules;
+    const defs = this.plugin.settings.modules;
+    const key = defs.map((d) => `${d.id}|${d.color}|${d.line}|${d.kind}|${d.value}`).join(";");
+    const c = layer.mods;
+    if (c && c.version === modules.version && c.defsRef === defs && c.defsKey === key && c.listsRef === lists) return c;
+    const members = modules.members();
+    const entries = [];
+    for (const def of defs) {
+      const set = members.get(def.id);
+      if (!set?.size) continue;
+      const nodes = [];
+      for (const [id, n] of lists.byId) if (set.has(id)) nodes.push(n);
+      if (!nodes.length) continue;
+      const colorFn = this.rgbaFn(def.color);
+      entries.push({ def, nodes, outline: [], colorFn, fill: colorFn(0.07) });
+    }
+    layer.mods = { version: modules.version, defsRef: defs, defsKey: key, listsRef: lists, entries, age: 1e9 };
+    return layer.mods;
+  }
+  /** Outlines in graph units; nodes move slowly, so every few frames is enough. */
+  updateOutlines(mods) {
+    if (mods.age++ < 5) return;
+    mods.age = 0;
+    const s = this.plugin.settings;
+    for (const e of mods.entries) {
+      const pts = e.nodes.map((n) => ({ x: n.x, y: n.y }));
+      const R = this.plugin.modules.radius(e.def.id, pts.length);
+      const pad2 = 38 * s.moduleSize;
+      e.outline = moduleOutline(pts, s.moduleShape, pad2, s.moduleShape === "circle" ? R : R * 0.55);
+    }
+  }
   /**
    * World → screen mapping for this frame: screen = world · S + offset.
    * Calibrated from the node sprites' world transforms (read-only, no PIXI
@@ -1712,7 +2085,9 @@ var GraphFx = class {
     const q = this.quality;
     const maxDepth = lists.hubDepth.length ? Math.max(...lists.hubDepth) : 1;
     const pulseWindow = (maxDepth - 1) * (s.fxWave ? TRAVEL : 0) + Math.max(RING, TRAVEL + LINGER);
-    const busy = s.fxGlow || s.fxShowFps || s.linkFlow !== "off" || s.fxWave && s.rayMode === "constant" || this.bursts.length > 0 || (s.fxRing || s.fxWave) && phase < pulseWindow;
+    const fxOn = this.effectsOn;
+    const modsOn = this.modulesOn;
+    const busy = modsOn || fxOn && (s.fxGlow || s.fxShowFps || s.linkFlow !== "off" || s.fxWave && s.rayMode === "constant" || this.bursts.length > 0 || (s.fxRing || s.fxWave) && phase < pulseWindow);
     if (!busy) {
       if (layer.dirty) {
         ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1742,6 +2117,50 @@ var GraphFx = class {
     const visible = (x, y) => x > -PAD && y > -PAD && x < w + PAD && y < h + PAD;
     const segVisible = (ax, ay, bx, by) => !(ax < -PAD && bx < -PAD || ay < -PAD && by < -PAD || ax > w + PAD && bx > w + PAD || ay > h + PAD && by > h + PAD);
     const emitAt = (depth) => (depth - 1) * (s.fxWave ? TRAVEL : 0);
+    if (modsOn) {
+      const mods = this.modEntries(layer, lists);
+      this.updateOutlines(mods);
+      const animate = s.moduleAnimate && s.animations;
+      mods.entries.forEach((e, idx) => {
+        if (e.outline.length < 3) return;
+        let screen = e.outline.map((p) => ({ x: p.x * S + ox, y: p.y * S + oy }));
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const p of screen) {
+          if (p.x < minX) minX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y > maxY) maxY = p.y;
+        }
+        if (maxX < -20 || maxY < -20 || minX > w + 20 || minY > h + 20) return;
+        if (s.moduleShape === "cloud") screen = smoothClosed(screen, q === 0 ? 3 : 6);
+        if (s.moduleFill) fillOutline(ctx, screen, e.fill);
+        drawBoundary(ctx, screen, {
+          style: e.def.line === "default" ? s.moduleLine : e.def.line,
+          color: e.colorFn,
+          t,
+          animate,
+          width: s.moduleLineWidth,
+          seed: idx + 1
+        });
+        if (s.moduleLabels) {
+          let top = screen[0];
+          for (const p of screen) if (p.y < top.y) top = p;
+          const label = `${e.def.name} \xB7 ${e.nodes.length}`;
+          ctx.font = "600 12px var(--font-interface, sans-serif)";
+          const tw = ctx.measureText(label).width;
+          const lx = Math.min(Math.max(top.x - tw / 2, 4), w - tw - 4);
+          const ly = Math.max(top.y - 10, 16);
+          ctx.fillStyle = "rgba(0,0,0,0.5)";
+          ctx.fillRect(lx - 6, ly - 13, tw + 12, 18);
+          ctx.fillStyle = e.colorFn(1);
+          ctx.fillText(label, lx, ly);
+        }
+      });
+    }
+    if (!fxOn) return;
     if (s.linkFlow !== "off") {
       const source = s.linkFlow === "hubs" ? lists.hubLinks : r.links ?? [];
       const limit = MAX_FLOW[q];
@@ -1850,6 +2269,128 @@ var GraphFx = class {
       ctx.fillStyle = fps >= 55 ? "#44cf6e" : fps >= 40 ? "#e0de71" : "#fb464c";
       ctx.fillText(label, w - tw - 15, 23);
     }
+  }
+};
+
+// src/modules.ts
+var import_obsidian7 = require("obsidian");
+var MODULE_COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#0ca30c", "#9085e9", "#e66767"];
+var escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+function newModuleId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+var GraphModules = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.version = 0;
+    this.cache = null;
+    this.timer = null;
+    /** Extra radius a barrier gained because notes kept escaping it (world units). */
+    this.extra = /* @__PURE__ */ new Map();
+  }
+  start() {
+    const p = this.plugin;
+    const dirty = () => this.invalidateSoon();
+    p.registerEvent(p.app.vault.on("create", dirty));
+    p.registerEvent(p.app.vault.on("delete", dirty));
+    p.registerEvent(p.app.vault.on("rename", dirty));
+    p.registerEvent(p.app.metadataCache.on("resolved", dirty));
+  }
+  get list() {
+    return this.plugin.settings.modules;
+  }
+  invalidate() {
+    this.cache = null;
+    this.version++;
+  }
+  invalidateSoon() {
+    if (!this.list.length) return;
+    if (this.timer !== null) window.clearTimeout(this.timer);
+    this.timer = window.setTimeout(() => {
+      this.timer = null;
+      this.invalidate();
+    }, 800);
+  }
+  /** Module id → set of member paths. */
+  members() {
+    if (this.cache) return this.cache;
+    const out = /* @__PURE__ */ new Map();
+    const files = this.plugin.app.vault.getFiles();
+    for (const m of this.list) {
+      const set = /* @__PURE__ */ new Set();
+      if (m.kind === "folder") {
+        const folder = (0, import_obsidian7.normalizePath)(m.value || "/");
+        const prefix = folder === "/" ? "" : folder + "/";
+        for (const f of files) if (f.path.startsWith(prefix)) set.add(f.path);
+      } else {
+        const tag = "#" + m.value.replace(/^#/, "").trim().toLowerCase();
+        if (tag.length > 1) {
+          for (const f of files) {
+            if (f.extension !== "md") continue;
+            const cache = this.plugin.app.metadataCache.getFileCache(f);
+            const tags = cache ? (0, import_obsidian7.getAllTags)(cache) ?? [] : [];
+            if (tags.some((t) => t.toLowerCase() === tag || t.toLowerCase().startsWith(tag + "/"))) set.add(f.path);
+          }
+        }
+      }
+      out.set(m.id, set);
+    }
+    this.cache = out;
+    return out;
+  }
+  /** Barrier radius in graph units: grows with the number of notes, plus any widening. */
+  radius(id, count) {
+    return moduleRadius(count, this.plugin.settings.moduleSize) + (this.extra.get(id) ?? 0);
+  }
+  /** Lets a barrier grow when the layout keeps pushing notes out of it. */
+  widen(id, by) {
+    const cur = this.extra.get(id) ?? 0;
+    this.extra.set(id, Math.min(cur + Math.max(0, by), 2e3));
+  }
+  /** Graph search query that matches the module's members (for colour groups). */
+  query(m) {
+    if (m.kind === "folder") {
+      const folder = (0, import_obsidian7.normalizePath)(m.value || "");
+      if (!folder || folder === "/") return null;
+      return `path:/^${escapeRegex(folder)}\\//`;
+    }
+    const tag = m.value.replace(/^#/, "").trim();
+    return tag ? `tag:#${tag}` : null;
+  }
+  /** Colour groups for modules that paint their nodes, most specific first. */
+  colorGroups() {
+    const depth = (m) => m.kind === "folder" ? m.value.split("/").length : 100;
+    return this.list.filter((m) => m.colorNodes).sort((a, b) => depth(b) - depth(a)).map((m) => ({ query: this.query(m), color: m.color })).filter((g) => !!g.query);
+  }
+  /** Creates a module for a folder (or returns the existing one). */
+  addFolderModule(folder) {
+    const existing = this.list.find((m2) => m2.kind === "folder" && m2.value === folder.path);
+    if (existing) return existing;
+    const m = {
+      id: newModuleId(),
+      name: folder.name,
+      kind: "folder",
+      value: folder.path,
+      color: MODULE_COLORS[this.list.length % MODULE_COLORS.length],
+      colorNodes: true,
+      line: "default"
+    };
+    this.list.push(m);
+    this.invalidate();
+    return m;
+  }
+  findFolderModule(folder) {
+    return this.list.find((m) => m.kind === "folder" && m.value === folder.path);
+  }
+  remove(id) {
+    const i = this.list.findIndex((m) => m.id === id);
+    if (i >= 0) this.list.splice(i, 1);
+    this.invalidate();
+  }
+  /** True if the file belongs to any module (used by tests / UI). */
+  isMember(file) {
+    for (const set of this.members().values()) if (set.has(file.path)) return true;
+    return false;
   }
 };
 
@@ -1998,7 +2539,8 @@ function cssString(value) {
 }
 
 // src/settings.ts
-var import_obsidian7 = require("obsidian");
+var import_obsidian8 = require("obsidian");
+var import_obsidian9 = require("obsidian");
 var DEFAULT_NOTE_TEMPLATE = `---
 tags:
   - {{tag}}
@@ -2063,9 +2605,19 @@ var DEFAULT_SETTINGS = {
   linkFlowSpeed: 30,
   graphGrow: true,
   graphFreeze: false,
-  fxShowFps: false
+  fxShowFps: false,
+  modulesEnabled: true,
+  modules: [],
+  moduleShape: "cloud",
+  moduleLine: "zigzag",
+  moduleLineWidth: 1,
+  moduleHold: true,
+  moduleSize: 1,
+  moduleFill: true,
+  moduleLabels: true,
+  moduleAnimate: true
 };
-var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
+var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -2075,32 +2627,32 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
     const s = this.plugin.settings;
     const save = () => this.plugin.saveSettings();
     containerEl.empty();
-    new import_obsidian7.Setting(containerEl).setName("\u0421\u043E\u0437\u0434\u0430\u043D\u0438\u0435 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430").setHeading();
-    new import_obsidian7.Setting(containerEl).setName("\u0421\u043E\u0437\u0434\u0430\u0432\u0430\u0442\u044C \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438").setDesc("\u041F\u0440\u0438 \u0441\u043E\u0437\u0434\u0430\u043D\u0438\u0438 \u043D\u043E\u0432\u043E\u0439 \u043F\u0430\u043F\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438 \u043D\u0435\u0451 \u0441\u0440\u0430\u0437\u0443 \u043F\u043E\u044F\u0432\u043B\u044F\u0435\u0442\u0441\u044F \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0421\u043E\u0437\u0434\u0430\u043D\u0438\u0435 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430").setHeading();
+    new import_obsidian8.Setting(containerEl).setName("\u0421\u043E\u0437\u0434\u0430\u0432\u0430\u0442\u044C \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438").setDesc("\u041F\u0440\u0438 \u0441\u043E\u0437\u0434\u0430\u043D\u0438\u0438 \u043D\u043E\u0432\u043E\u0439 \u043F\u0430\u043F\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438 \u043D\u0435\u0451 \u0441\u0440\u0430\u0437\u0443 \u043F\u043E\u044F\u0432\u043B\u044F\u0435\u0442\u0441\u044F \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B.").addToggle(
       (t) => t.setValue(s.autoCreate).onChange(async (v) => {
         s.autoCreate = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0418\u043C\u044F \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430").setDesc("{{folder}} \u2014 \u0438\u043C\u044F \u043F\u0430\u043F\u043A\u0438. \u041D\u0430\u043F\u0440\u0438\u043C\u0435\u0440 \xAB{{folder}}\xBB \u0438\u043B\u0438 \xAB_{{folder}}\xBB \u0438\u043B\u0438 \xAB{{folder}} (\u043E\u0433\u043B\u0430\u0432\u043B\u0435\u043D\u0438\u0435)\xBB.").addText(
+    new import_obsidian8.Setting(containerEl).setName("\u0418\u043C\u044F \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430").setDesc("{{folder}} \u2014 \u0438\u043C\u044F \u043F\u0430\u043F\u043A\u0438. \u041D\u0430\u043F\u0440\u0438\u043C\u0435\u0440 \xAB{{folder}}\xBB \u0438\u043B\u0438 \xAB_{{folder}}\xBB \u0438\u043B\u0438 \xAB{{folder}} (\u043E\u0433\u043B\u0430\u0432\u043B\u0435\u043D\u0438\u0435)\xBB.").addText(
       (t) => t.setPlaceholder("{{folder}}").setValue(s.indexName).onChange(async (v) => {
         s.indexName = v || "{{folder}}";
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u041F\u0435\u0440\u0435\u0438\u043C\u0435\u043D\u043E\u0432\u044B\u0432\u0430\u0442\u044C \u0432\u043C\u0435\u0441\u0442\u0435 \u0441 \u043F\u0430\u043F\u043A\u043E\u0439").setDesc("\u041F\u0435\u0440\u0435\u0438\u043C\u0435\u043D\u043E\u0432\u0430\u043B\u0438 \u043F\u0430\u043F\u043A\u0443 \u2014 \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043F\u0435\u0440\u0435\u0438\u043C\u0435\u043D\u0443\u0435\u0442\u0441\u044F \u0441\u043B\u0435\u0434\u043E\u043C (\u0441\u0441\u044B\u043B\u043A\u0438 \u043D\u0430 \u043D\u0435\u0433\u043E \u043E\u0431\u043D\u043E\u0432\u044F\u0442\u0441\u044F).").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u041F\u0435\u0440\u0435\u0438\u043C\u0435\u043D\u043E\u0432\u044B\u0432\u0430\u0442\u044C \u0432\u043C\u0435\u0441\u0442\u0435 \u0441 \u043F\u0430\u043F\u043A\u043E\u0439").setDesc("\u041F\u0435\u0440\u0435\u0438\u043C\u0435\u043D\u043E\u0432\u0430\u043B\u0438 \u043F\u0430\u043F\u043A\u0443 \u2014 \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043F\u0435\u0440\u0435\u0438\u043C\u0435\u043D\u0443\u0435\u0442\u0441\u044F \u0441\u043B\u0435\u0434\u043E\u043C (\u0441\u0441\u044B\u043B\u043A\u0438 \u043D\u0430 \u043D\u0435\u0433\u043E \u043E\u0431\u043D\u043E\u0432\u044F\u0442\u0441\u044F).").addToggle(
       (t) => t.setValue(s.renameWithFolder).onChange(async (v) => {
         s.renameWithFolder = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0422\u0435\u0433 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432").setDesc("\u0414\u043E\u0431\u0430\u0432\u043B\u044F\u0435\u0442\u0441\u044F \u0432 \u0441\u0432\u043E\u0439\u0441\u0442\u0432\u0430 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430. \u041D\u0443\u0436\u0435\u043D \u0434\u043B\u044F \u0440\u0430\u0441\u043A\u0440\u0430\u0441\u043A\u0438 \u0432 \u0433\u0440\u0430\u0444\u0435 (\u0437\u0430\u043F\u0440\u043E\u0441 tag:#\u0442\u0435\u0433).").addText(
+    new import_obsidian8.Setting(containerEl).setName("\u0422\u0435\u0433 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432").setDesc("\u0414\u043E\u0431\u0430\u0432\u043B\u044F\u0435\u0442\u0441\u044F \u0432 \u0441\u0432\u043E\u0439\u0441\u0442\u0432\u0430 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430. \u041D\u0443\u0436\u0435\u043D \u0434\u043B\u044F \u0440\u0430\u0441\u043A\u0440\u0430\u0441\u043A\u0438 \u0432 \u0433\u0440\u0430\u0444\u0435 (\u0437\u0430\u043F\u0440\u043E\u0441 tag:#\u0442\u0435\u0433).").addText(
       (t) => t.setPlaceholder("folder-index").setValue(s.tag).onChange(async (v) => {
         s.tag = v.replace(/^#/, "").trim();
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0428\u0430\u0431\u043B\u043E\u043D \u043D\u043E\u0432\u043E\u0433\u043E \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430").setDesc(
+    new import_obsidian8.Setting(containerEl).setName("\u0428\u0430\u0431\u043B\u043E\u043D \u043D\u043E\u0432\u043E\u0433\u043E \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430").setDesc(
       "{{list}} \u2014 \u043C\u0435\u0441\u0442\u043E \u0434\u043B\u044F \u0441\u043F\u0438\u0441\u043A\u0430 \u0441\u0441\u044B\u043B\u043E\u043A, {{folder}} \u2014 \u0438\u043C\u044F \u043F\u0430\u043F\u043A\u0438, {{tag}} \u2014 \u0442\u0435\u0433, {{date}} \u2014 \u0434\u0430\u0442\u0430 \u0441\u043E\u0437\u0434\u0430\u043D\u0438\u044F. \u0412\u0441\u0451 \u0432\u043D\u0435 \u0441\u043F\u0438\u0441\u043A\u0430 \u043C\u043E\u0436\u043D\u043E \u0441\u0432\u043E\u0431\u043E\u0434\u043D\u043E \u0440\u0435\u0434\u0430\u043A\u0442\u0438\u0440\u043E\u0432\u0430\u0442\u044C."
     ).addTextArea((t) => {
       t.setValue(s.newNoteTemplate).onChange(async (v) => {
@@ -2116,8 +2668,8 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
         this.display();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u041A\u0430\u043A \u0432\u044B\u0433\u043B\u044F\u0434\u0438\u0442 \u0441\u043F\u0438\u0441\u043E\u043A").setHeading();
-    new import_obsidian7.Setting(containerEl).setName("\u0420\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0430").setDesc("\u041A\u0430\u043A \u0437\u0430\u043F\u0438\u0441\u044B\u0432\u0430\u0442\u044C \u0441\u0441\u044B\u043B\u043A\u0438 [[...]] \u043D\u0430 \u0444\u0430\u0439\u043B\u044B \u043F\u0430\u043F\u043A\u0438.").addDropdown(
+    new import_obsidian8.Setting(containerEl).setName("\u041A\u0430\u043A \u0432\u044B\u0433\u043B\u044F\u0434\u0438\u0442 \u0441\u043F\u0438\u0441\u043E\u043A").setHeading();
+    new import_obsidian8.Setting(containerEl).setName("\u0420\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0430").setDesc("\u041A\u0430\u043A \u0437\u0430\u043F\u0438\u0441\u044B\u0432\u0430\u0442\u044C \u0441\u0441\u044B\u043B\u043A\u0438 [[...]] \u043D\u0430 \u0444\u0430\u0439\u043B\u044B \u043F\u0430\u043F\u043A\u0438.").addDropdown(
       (d) => d.addOptions({
         list: "\u0421\u0442\u043E\u043B\u0431\u0438\u043A (\u043C\u0430\u0440\u043A\u0438\u0440\u043E\u0432\u0430\u043D\u043D\u044B\u0439 \u0441\u043F\u0438\u0441\u043E\u043A)",
         numbered: "\u041D\u0443\u043C\u0435\u0440\u043E\u0432\u0430\u043D\u043D\u044B\u0439 \u0441\u043F\u0438\u0441\u043E\u043A",
@@ -2130,13 +2682,13 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
       })
     );
     if (s.layout === "table") {
-      new import_obsidian7.Setting(containerEl).setName("\u041A\u043E\u043B\u0438\u0447\u0435\u0441\u0442\u0432\u043E \u043A\u043E\u043B\u043E\u043D\u043E\u043A").addSlider(
+      new import_obsidian8.Setting(containerEl).setName("\u041A\u043E\u043B\u0438\u0447\u0435\u0441\u0442\u0432\u043E \u043A\u043E\u043B\u043E\u043D\u043E\u043A").addSlider(
         (sl) => sl.setLimits(1, 6, 1).setValue(s.columns).setDynamicTooltip().onChange(async (v) => {
           s.columns = v;
           await save();
         })
       );
-      new import_obsidian7.Setting(containerEl).setName("\u0417\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0438 \u043A\u043E\u043B\u043E\u043D\u043E\u043A").setDesc("\u0427\u0435\u0440\u0435\u0437 \u0437\u0430\u043F\u044F\u0442\u0443\u044E. \u041F\u0443\u0441\u0442\u044B\u0435 \u2014 \u0431\u0435\u0437 \u043F\u043E\u0434\u043F\u0438\u0441\u0438.").addText(
+      new import_obsidian8.Setting(containerEl).setName("\u0417\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0438 \u043A\u043E\u043B\u043E\u043D\u043E\u043A").setDesc("\u0427\u0435\u0440\u0435\u0437 \u0437\u0430\u043F\u044F\u0442\u0443\u044E. \u041F\u0443\u0441\u0442\u044B\u0435 \u2014 \u0431\u0435\u0437 \u043F\u043E\u0434\u043F\u0438\u0441\u0438.").addText(
         (t) => t.setValue(s.tableHeaders).onChange(async (v) => {
           s.tableHeaders = v;
           await save();
@@ -2144,7 +2696,7 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
       );
     }
     if (s.layout === "custom") {
-      new import_obsidian7.Setting(containerEl).setName("\u0428\u0430\u0431\u043B\u043E\u043D \u0441\u0442\u0440\u043E\u043A\u0438").setDesc(
+      new import_obsidian8.Setting(containerEl).setName("\u0428\u0430\u0431\u043B\u043E\u043D \u0441\u0442\u0440\u043E\u043A\u0438").setDesc(
         "{{link}} \u2014 \u0441\u0441\u044B\u043B\u043A\u0430 [[...]], {{name}} \u2014 \u0438\u043C\u044F, {{ext}} \u2014 \u0440\u0430\u0441\u0448\u0438\u0440\u0435\u043D\u0438\u0435, {{path}} \u2014 \u043F\u0443\u0442\u044C, {{n}} \u2014 \u043D\u043E\u043C\u0435\u0440, {{ctime}}/{{mtime}} \u2014 \u0434\u0430\u0442\u044B \u0441\u043E\u0437\u0434\u0430\u043D\u0438\u044F/\u0438\u0437\u043C\u0435\u043D\u0435\u043D\u0438\u044F, {{type}} \u2014 file/folder. \u041F\u0440\u0438\u043C\u0435\u0440: \xAB- [ ] {{link}} ({{ctime}})\xBB."
       ).addText(
         (t) => t.setValue(s.itemTemplate).onChange(async (v) => {
@@ -2152,14 +2704,14 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
           await save();
         })
       );
-      new import_obsidian7.Setting(containerEl).setName("\u0424\u043E\u0440\u043C\u0430\u0442 \u0434\u0430\u0442\u044B").setDesc("\u0424\u043E\u0440\u043C\u0430\u0442 moment.js, \u043D\u0430\u043F\u0440\u0438\u043C\u0435\u0440 YYYY-MM-DD \u0438\u043B\u0438 DD.MM.YYYY.").addText(
+      new import_obsidian8.Setting(containerEl).setName("\u0424\u043E\u0440\u043C\u0430\u0442 \u0434\u0430\u0442\u044B").setDesc("\u0424\u043E\u0440\u043C\u0430\u0442 moment.js, \u043D\u0430\u043F\u0440\u0438\u043C\u0435\u0440 YYYY-MM-DD \u0438\u043B\u0438 DD.MM.YYYY.").addText(
         (t) => t.setValue(s.dateFormat).onChange(async (v) => {
           s.dateFormat = v;
           await save();
         })
       );
     }
-    new import_obsidian7.Setting(containerEl).setName("\u0421\u043E\u0445\u0440\u0430\u043D\u044F\u0442\u044C \u0440\u0443\u0447\u043D\u044B\u0435 \u043F\u0440\u0430\u0432\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438 \u0441\u043F\u0438\u0441\u043A\u0430").setDesc(
+    new import_obsidian8.Setting(containerEl).setName("\u0421\u043E\u0445\u0440\u0430\u043D\u044F\u0442\u044C \u0440\u0443\u0447\u043D\u044B\u0435 \u043F\u0440\u0430\u0432\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438 \u0441\u043F\u0438\u0441\u043A\u0430").setDesc(
       "\u041C\u043E\u0436\u043D\u043E \u043C\u0435\u043D\u044F\u0442\u044C \u043F\u043E\u0440\u044F\u0434\u043E\u043A \u0441\u0442\u0440\u043E\u043A, \u0434\u043E\u043F\u0438\u0441\u044B\u0432\u0430\u0442\u044C \u043F\u043E\u044F\u0441\u043D\u0435\u043D\u0438\u044F \u0440\u044F\u0434\u043E\u043C \u0441\u043E \u0441\u0441\u044B\u043B\u043A\u0430\u043C\u0438, \u0432\u0441\u0442\u0430\u0432\u043B\u044F\u0442\u044C \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0438 \u2014 \u043F\u043B\u0430\u0433\u0438\u043D \u0442\u043E\u043B\u044C\u043A\u043E \u0434\u043E\u0431\u0430\u0432\u0438\u0442 \u043D\u043E\u0432\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0432 \u043A\u043E\u043D\u0435\u0446 \u0438 \u0443\u0431\u0435\u0440\u0451\u0442 \u0441\u0442\u0440\u043E\u043A\u0438 \u0443\u0434\u0430\u043B\u0451\u043D\u043D\u044B\u0445. \u0412\u044B\u043A\u043B\u044E\u0447\u0438\u0442\u0435, \u0447\u0442\u043E\u0431\u044B \u0441\u043F\u0438\u0441\u043E\u043A \u0432\u0441\u0435\u0433\u0434\u0430 \u043F\u0435\u0440\u0435\u0441\u043E\u0431\u0438\u0440\u0430\u043B\u0441\u044F \u0441 \u0441\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u043A\u043E\u0439. (\u0414\u043B\u044F \u0442\u0430\u0431\u043B\u0438\u0446\u044B \u0432\u0441\u0435\u0433\u0434\u0430 \u043F\u0435\u0440\u0435\u0441\u043E\u0431\u0438\u0440\u0430\u0435\u0442\u0441\u044F.)"
     ).addToggle(
       (t) => t.setValue(s.preserveEdits).onChange(async (v) => {
@@ -2167,7 +2719,7 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0421\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u043A\u0430").addDropdown(
+    new import_obsidian8.Setting(containerEl).setName("\u0421\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u043A\u0430").addDropdown(
       (d) => d.addOptions({ name: "\u041F\u043E \u0438\u043C\u0435\u043D\u0438", ctime: "\u041F\u043E \u0434\u0430\u0442\u0435 \u0441\u043E\u0437\u0434\u0430\u043D\u0438\u044F", mtime: "\u041F\u043E \u0434\u0430\u0442\u0435 \u0438\u0437\u043C\u0435\u043D\u0435\u043D\u0438\u044F" }).setValue(s.sortBy).onChange(async (v) => {
         s.sortBy = v;
         await save();
@@ -2178,80 +2730,80 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u041F\u043E\u0434\u043F\u0430\u043F\u043A\u0438 \u0441\u043D\u0430\u0447\u0430\u043B\u0430").setDesc("\u0421\u0441\u044B\u043B\u043A\u0438 \u043D\u0430 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u043F\u043E\u0434\u043F\u0430\u043F\u043E\u043A \u2014 \u0432 \u043D\u0430\u0447\u0430\u043B\u0435 \u0441\u043F\u0438\u0441\u043A\u0430.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u041F\u043E\u0434\u043F\u0430\u043F\u043A\u0438 \u0441\u043D\u0430\u0447\u0430\u043B\u0430").setDesc("\u0421\u0441\u044B\u043B\u043A\u0438 \u043D\u0430 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u043F\u043E\u0434\u043F\u0430\u043F\u043E\u043A \u2014 \u0432 \u043D\u0430\u0447\u0430\u043B\u0435 \u0441\u043F\u0438\u0441\u043A\u0430.").addToggle(
       (t) => t.setValue(s.subfoldersFirst).onChange(async (v) => {
         s.subfoldersFirst = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u041A\u0430\u043A\u0438\u0435 \u0444\u0430\u0439\u043B\u044B \u043F\u043E\u043F\u0430\u0434\u0430\u044E\u0442 \u0432 \u0441\u043F\u0438\u0441\u043E\u043A").setHeading();
-    new import_obsidian7.Setting(containerEl).setName("\u041D\u0435 \u0442\u043E\u043B\u044C\u043A\u043E \u0437\u0430\u043C\u0435\u0442\u043A\u0438").setDesc("\u0412\u043A\u043B\u044E\u0447\u0430\u0442\u044C \u043A\u0430\u0440\u0442\u0438\u043D\u043A\u0438, PDF, canvas \u0438 \u0442.\u0434. \u0412\u044B\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u2014 \u0442\u043E\u043B\u044C\u043A\u043E .md.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u041A\u0430\u043A\u0438\u0435 \u0444\u0430\u0439\u043B\u044B \u043F\u043E\u043F\u0430\u0434\u0430\u044E\u0442 \u0432 \u0441\u043F\u0438\u0441\u043E\u043A").setHeading();
+    new import_obsidian8.Setting(containerEl).setName("\u041D\u0435 \u0442\u043E\u043B\u044C\u043A\u043E \u0437\u0430\u043C\u0435\u0442\u043A\u0438").setDesc("\u0412\u043A\u043B\u044E\u0447\u0430\u0442\u044C \u043A\u0430\u0440\u0442\u0438\u043D\u043A\u0438, PDF, canvas \u0438 \u0442.\u0434. \u0412\u044B\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u2014 \u0442\u043E\u043B\u044C\u043A\u043E .md.").addToggle(
       (t) => t.setValue(s.includeNonMarkdown).onChange(async (v) => {
         s.includeNonMarkdown = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0418\u0441\u043A\u043B\u044E\u0447\u0438\u0442\u044C \u0440\u0430\u0441\u0448\u0438\u0440\u0435\u043D\u0438\u044F").setDesc("\u0427\u0435\u0440\u0435\u0437 \u0437\u0430\u043F\u044F\u0442\u0443\u044E, \u043D\u0430\u043F\u0440\u0438\u043C\u0435\u0440: png, jpg, pdf").addText(
+    new import_obsidian8.Setting(containerEl).setName("\u0418\u0441\u043A\u043B\u044E\u0447\u0438\u0442\u044C \u0440\u0430\u0441\u0448\u0438\u0440\u0435\u043D\u0438\u044F").setDesc("\u0427\u0435\u0440\u0435\u0437 \u0437\u0430\u043F\u044F\u0442\u0443\u044E, \u043D\u0430\u043F\u0440\u0438\u043C\u0435\u0440: png, jpg, pdf").addText(
       (t) => t.setValue(s.excludedExtensions).onChange(async (v) => {
         s.excludedExtensions = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0421\u0432\u044F\u0437\u044B\u0432\u0430\u0442\u044C \u0441 \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0430\u043C\u0438").setDesc("\u0414\u043E\u0431\u0430\u0432\u043B\u044F\u0442\u044C \u0441\u0441\u044B\u043B\u043A\u0443 \u043D\u0430 \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043A\u0430\u0436\u0434\u043E\u0439 \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0438 \u2014 \u0432 \u0433\u0440\u0430\u0444\u0435 \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u0441\u044F \u0434\u0435\u0440\u0435\u0432\u043E: \u041C\u0435\u043D\u044E \u2192 \u041F\u043E\u0434\u043C\u0435\u043D\u044E \u2192 \u0444\u0430\u0439\u043B\u044B.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0421\u0432\u044F\u0437\u044B\u0432\u0430\u0442\u044C \u0441 \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0430\u043C\u0438").setDesc("\u0414\u043E\u0431\u0430\u0432\u043B\u044F\u0442\u044C \u0441\u0441\u044B\u043B\u043A\u0443 \u043D\u0430 \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043A\u0430\u0436\u0434\u043E\u0439 \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0438 \u2014 \u0432 \u0433\u0440\u0430\u0444\u0435 \u043F\u043E\u043B\u0443\u0447\u0438\u0442\u0441\u044F \u0434\u0435\u0440\u0435\u0432\u043E: \u041C\u0435\u043D\u044E \u2192 \u041F\u043E\u0434\u043C\u0435\u043D\u044E \u2192 \u0444\u0430\u0439\u043B\u044B.").addToggle(
       (t) => t.setValue(s.linkSubfolderIndexes).onChange(async (v) => {
         s.linkSubfolderIndexes = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0412\u043A\u043B\u044E\u0447\u0430\u0442\u044C \u0444\u0430\u0439\u043B\u044B \u0438\u0437 \u0432\u043B\u043E\u0436\u0435\u043D\u043D\u044B\u0445 \u043F\u0430\u043F\u043E\u043A").setDesc("\u041F\u0435\u0440\u0435\u0447\u0438\u0441\u043B\u044F\u0442\u044C \u0432 \u0433\u043B\u0430\u0432\u043D\u043E\u043C \u0444\u0430\u0439\u043B\u0435 \u0432\u043E\u043E\u0431\u0449\u0435 \u0432\u0441\u0435 \u0444\u0430\u0439\u043B\u044B, \u0432\u043A\u043B\u044E\u0447\u0430\u044F \u0444\u0430\u0439\u043B\u044B \u043F\u043E\u0434\u043F\u0430\u043F\u043E\u043A \u043B\u044E\u0431\u043E\u0439 \u0433\u043B\u0443\u0431\u0438\u043D\u044B.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0412\u043A\u043B\u044E\u0447\u0430\u0442\u044C \u0444\u0430\u0439\u043B\u044B \u0438\u0437 \u0432\u043B\u043E\u0436\u0435\u043D\u043D\u044B\u0445 \u043F\u0430\u043F\u043E\u043A").setDesc("\u041F\u0435\u0440\u0435\u0447\u0438\u0441\u043B\u044F\u0442\u044C \u0432 \u0433\u043B\u0430\u0432\u043D\u043E\u043C \u0444\u0430\u0439\u043B\u0435 \u0432\u043E\u043E\u0431\u0449\u0435 \u0432\u0441\u0435 \u0444\u0430\u0439\u043B\u044B, \u0432\u043A\u043B\u044E\u0447\u0430\u044F \u0444\u0430\u0439\u043B\u044B \u043F\u043E\u0434\u043F\u0430\u043F\u043E\u043A \u043B\u044E\u0431\u043E\u0439 \u0433\u043B\u0443\u0431\u0438\u043D\u044B.").addToggle(
       (t) => t.setValue(s.includeNested).onChange(async (v) => {
         s.includeNested = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0418\u0441\u043A\u043B\u044E\u0447\u0451\u043D\u043D\u044B\u0435 \u043F\u0430\u043F\u043A\u0438").setDesc("\u041F\u043E \u043E\u0434\u043D\u043E\u0439 \u043D\u0430 \u0441\u0442\u0440\u043E\u043A\u0443 (\u043F\u0443\u0442\u044C \u043E\u0442 \u043A\u043E\u0440\u043D\u044F \u0445\u0440\u0430\u043D\u0438\u043B\u0438\u0449\u0430). \u0412 \u043D\u0438\u0445 \u0438 \u0438\u0445 \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0430\u0445 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u043D\u0435 \u0441\u043E\u0437\u0434\u0430\u044E\u0442\u0441\u044F.").addTextArea((t) => {
+    new import_obsidian8.Setting(containerEl).setName("\u0418\u0441\u043A\u043B\u044E\u0447\u0451\u043D\u043D\u044B\u0435 \u043F\u0430\u043F\u043A\u0438").setDesc("\u041F\u043E \u043E\u0434\u043D\u043E\u0439 \u043D\u0430 \u0441\u0442\u0440\u043E\u043A\u0443 (\u043F\u0443\u0442\u044C \u043E\u0442 \u043A\u043E\u0440\u043D\u044F \u0445\u0440\u0430\u043D\u0438\u043B\u0438\u0449\u0430). \u0412 \u043D\u0438\u0445 \u0438 \u0438\u0445 \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0430\u0445 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u043D\u0435 \u0441\u043E\u0437\u0434\u0430\u044E\u0442\u0441\u044F.").addTextArea((t) => {
       t.setPlaceholder("Templates\nAttachments").setValue(s.excludedFolders).onChange(async (v) => {
         s.excludedFolders = v;
         await save();
       });
       t.inputEl.rows = 4;
     });
-    new import_obsidian7.Setting(containerEl).setName("\u0412\u044B\u0434\u0435\u043B\u0435\u043D\u0438\u0435 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430").setHeading();
-    new import_obsidian7.Setting(containerEl).setName("\u0412\u044B\u0434\u0435\u043B\u044F\u0442\u044C \u0432 \u043F\u0440\u043E\u0432\u043E\u0434\u043D\u0438\u043A\u0435 \u0444\u0430\u0439\u043B\u043E\u0432").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0412\u044B\u0434\u0435\u043B\u0435\u043D\u0438\u0435 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430").setHeading();
+    new import_obsidian8.Setting(containerEl).setName("\u0412\u044B\u0434\u0435\u043B\u044F\u0442\u044C \u0432 \u043F\u0440\u043E\u0432\u043E\u0434\u043D\u0438\u043A\u0435 \u0444\u0430\u0439\u043B\u043E\u0432").addToggle(
       (t) => t.setValue(s.highlightEnabled).onChange(async (v) => {
         s.highlightEnabled = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0426\u0432\u0435\u0442").setDesc("\u0418\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u0442\u0441\u044F \u0432 \u043F\u0440\u043E\u0432\u043E\u0434\u043D\u0438\u043A\u0435, \u0432 \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0435 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0438 \u0434\u043B\u044F \u0433\u0440\u0443\u043F\u043F\u044B \u0432 \u0433\u0440\u0430\u0444\u0435.").addColorPicker(
+    new import_obsidian8.Setting(containerEl).setName("\u0426\u0432\u0435\u0442").setDesc("\u0418\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u0442\u0441\u044F \u0432 \u043F\u0440\u043E\u0432\u043E\u0434\u043D\u0438\u043A\u0435, \u0432 \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0435 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0438 \u0434\u043B\u044F \u0433\u0440\u0443\u043F\u043F\u044B \u0432 \u0433\u0440\u0430\u0444\u0435.").addColorPicker(
       (c) => c.setValue(s.highlightColor).onChange(async (v) => {
         s.highlightColor = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0417\u043D\u0430\u0447\u043E\u043A").setDesc("\u0421\u0438\u043C\u0432\u043E\u043B \u043F\u0435\u0440\u0435\u0434 \u0438\u043C\u0435\u043D\u0435\u043C \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430 (\u2605, \u{1F4CC}, \u{1F5C2}, \u25C6 \u2026). \u041F\u0443\u0441\u0442\u043E \u2014 \u0431\u0435\u0437 \u0437\u043D\u0430\u0447\u043A\u0430.").addText(
+    new import_obsidian8.Setting(containerEl).setName("\u0417\u043D\u0430\u0447\u043E\u043A").setDesc("\u0421\u0438\u043C\u0432\u043E\u043B \u043F\u0435\u0440\u0435\u0434 \u0438\u043C\u0435\u043D\u0435\u043C \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430 (\u2605, \u{1F4CC}, \u{1F5C2}, \u25C6 \u2026). \u041F\u0443\u0441\u0442\u043E \u2014 \u0431\u0435\u0437 \u0437\u043D\u0430\u0447\u043A\u0430.").addText(
       (t) => t.setValue(s.highlightIcon).onChange(async (v) => {
         s.highlightIcon = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0416\u0438\u0440\u043D\u044B\u0439 \u0448\u0440\u0438\u0444\u0442").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0416\u0438\u0440\u043D\u044B\u0439 \u0448\u0440\u0438\u0444\u0442").addToggle(
       (t) => t.setValue(s.highlightBold).onChange(async (v) => {
         s.highlightBold = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u041F\u043E\u0434\u043A\u0440\u0430\u0448\u0438\u0432\u0430\u0442\u044C \u0438 \u0441\u0430\u043C\u0443 \u043F\u0430\u043F\u043A\u0443").setDesc("\u041F\u0430\u043F\u043A\u0438, \u0432 \u043A\u043E\u0442\u043E\u0440\u044B\u0445 \u0435\u0441\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B, \u0442\u043E\u0436\u0435 \u043E\u043A\u0440\u0430\u0448\u0438\u0432\u0430\u044E\u0442\u0441\u044F.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u041F\u043E\u0434\u043A\u0440\u0430\u0448\u0438\u0432\u0430\u0442\u044C \u0438 \u0441\u0430\u043C\u0443 \u043F\u0430\u043F\u043A\u0443").setDesc("\u041F\u0430\u043F\u043A\u0438, \u0432 \u043A\u043E\u0442\u043E\u0440\u044B\u0445 \u0435\u0441\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B, \u0442\u043E\u0436\u0435 \u043E\u043A\u0440\u0430\u0448\u0438\u0432\u0430\u044E\u0442\u0441\u044F.").addToggle(
       (t) => t.setValue(s.highlightFolders).onChange(async (v) => {
         s.highlightFolders = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0426\u0432\u0435\u0442 \u0432 \u0433\u0440\u0430\u0444\u0435").setDesc("\u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u0432 \u0433\u0440\u0430\u0444 \u0446\u0432\u0435\u0442\u043E\u0432\u0443\u044E \u0433\u0440\u0443\u043F\u043F\u0443 tag:#<\u0442\u0435\u0433> \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u043E\u0433\u043E \u0446\u0432\u0435\u0442\u0430 \u2014 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0431\u0443\u0434\u0443\u0442 \u0432\u044B\u0434\u0435\u043B\u0435\u043D\u044B \u0432 \u0433\u0440\u0430\u0444\u0435.").addButton(
+    new import_obsidian8.Setting(containerEl).setName("\u0426\u0432\u0435\u0442 \u0432 \u0433\u0440\u0430\u0444\u0435").setDesc("\u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u0432 \u0433\u0440\u0430\u0444 \u0446\u0432\u0435\u0442\u043E\u0432\u0443\u044E \u0433\u0440\u0443\u043F\u043F\u0443 tag:#<\u0442\u0435\u0433> \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u043E\u0433\u043E \u0446\u0432\u0435\u0442\u0430 \u2014 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0431\u0443\u0434\u0443\u0442 \u0432\u044B\u0434\u0435\u043B\u0435\u043D\u044B \u0432 \u0433\u0440\u0430\u0444\u0435.").addButton(
       (b) => b.setButtonText("\u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u0432 \u0433\u0440\u0430\u0444").onClick(() => this.plugin.addGraphColorGroup())
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0421\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432 \u0438 \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C").setHeading();
-    new import_obsidian7.Setting(containerEl).setName("\u0421\u0447\u0438\u0442\u0430\u0442\u044C \u0441\u043B\u043E\u0432\u0430 \u0437\u0430 \u0434\u0435\u043D\u044C").setDesc(
+    new import_obsidian8.Setting(containerEl).setName("\u0421\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432 \u0438 \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C").setHeading();
+    new import_obsidian8.Setting(containerEl).setName("\u0421\u0447\u0438\u0442\u0430\u0442\u044C \u0441\u043B\u043E\u0432\u0430 \u0437\u0430 \u0434\u0435\u043D\u044C").setDesc(
       "\u0423\u0447\u0438\u0442\u044B\u0432\u0430\u044E\u0442\u0441\u044F \u0441\u043B\u043E\u0432\u0430, \u043A\u043E\u0442\u043E\u0440\u044B\u0435 \u0432\u044B \u043F\u0438\u0448\u0435\u0442\u0435 \u0432 \u043E\u0442\u043A\u0440\u044B\u0442\u043E\u0439 \u0437\u0430\u043C\u0435\u0442\u043A\u0435. \u0418\u0437\u043C\u0435\u043D\u0435\u043D\u0438\u044F \u043E\u0442 \u0441\u0438\u043D\u0445\u0440\u043E\u043D\u0438\u0437\u0430\u0446\u0438\u0438 \u0438 \u0434\u0440\u0443\u0433\u0438\u0445 \u043F\u043B\u0430\u0433\u0438\u043D\u043E\u0432 \u043D\u0435 \u0441\u0447\u0438\u0442\u0430\u044E\u0442\u0441\u044F. \u041A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C \u043E\u0442\u043A\u0440\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u0437\u043D\u0430\u0447\u043A\u043E\u043C \u{1F4C5} \u043D\u0430 \u0431\u043E\u043A\u043E\u0432\u043E\u0439 \u043B\u0435\u043D\u0442\u0435 \u0438\u043B\u0438 \u043A\u043E\u043C\u0430\u043D\u0434\u043E\u0439 \xAB\u041E\u0442\u043A\u0440\u044B\u0442\u044C \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C \u0438 \u0441\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432\xBB."
     ).addToggle(
       (t) => t.setValue(s.wordCountEnabled).onChange(async (v) => {
@@ -2259,7 +2811,7 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0426\u0435\u043B\u044C \u043D\u0430 \u0434\u0435\u043D\u044C (\u0441\u043B\u043E\u0432)").setDesc("0 \u2014 \u0431\u0435\u0437 \u0446\u0435\u043B\u0438.").addText((t) => {
+    new import_obsidian8.Setting(containerEl).setName("\u0426\u0435\u043B\u044C \u043D\u0430 \u0434\u0435\u043D\u044C (\u0441\u043B\u043E\u0432)").setDesc("0 \u2014 \u0431\u0435\u0437 \u0446\u0435\u043B\u0438.").addText((t) => {
       t.inputEl.type = "number";
       t.inputEl.min = "0";
       t.setValue(String(s.dailyGoal)).onChange(async (v) => {
@@ -2268,38 +2820,38 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
         await save();
       });
     });
-    new import_obsidian7.Setting(containerEl).setName("\u041F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C \u0432 \u0441\u0442\u0440\u043E\u043A\u0435 \u0441\u043E\u0441\u0442\u043E\u044F\u043D\u0438\u044F").setDesc("\u0422\u043E\u043B\u044C\u043A\u043E \u043D\u0430 \u043A\u043E\u043C\u043F\u044C\u044E\u0442\u0435\u0440\u0435: \xAB\u270D 342 / 500\xBB \u0432\u043D\u0438\u0437\u0443 \u043E\u043A\u043D\u0430.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u041F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C \u0432 \u0441\u0442\u0440\u043E\u043A\u0435 \u0441\u043E\u0441\u0442\u043E\u044F\u043D\u0438\u044F").setDesc("\u0422\u043E\u043B\u044C\u043A\u043E \u043D\u0430 \u043A\u043E\u043C\u043F\u044C\u044E\u0442\u0435\u0440\u0435: \xAB\u270D 342 / 500\xBB \u0432\u043D\u0438\u0437\u0443 \u043E\u043A\u043D\u0430.").addToggle(
       (t) => t.setValue(s.showStatusBar).onChange(async (v) => {
         s.showStatusBar = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0410\u043D\u0438\u043C\u0430\u0446\u0438\u0438").setDesc("\u041A\u043E\u043B\u044C\u0446\u043E \u043F\u0440\u043E\u0433\u0440\u0435\u0441\u0441\u0430, \u043A\u043E\u043D\u0444\u0435\u0442\u0442\u0438, \u043F\u0435\u0440\u0435\u043B\u0438\u0441\u0442\u044B\u0432\u0430\u043D\u0438\u0435 \u043C\u0435\u0441\u044F\u0446\u0435\u0432. \u0415\u0441\u043B\u0438 \u0432 \u0441\u0438\u0441\u0442\u0435\u043C\u0435 \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u043E \xAB\u0443\u043C\u0435\u043D\u044C\u0448\u0438\u0442\u044C \u0434\u0432\u0438\u0436\u0435\u043D\u0438\u0435\xBB, \u0430\u043D\u0438\u043C\u0430\u0446\u0438\u0438 \u043E\u0442\u043A\u043B\u044E\u0447\u0430\u044E\u0442\u0441\u044F \u0441\u0430\u043C\u0438.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0410\u043D\u0438\u043C\u0430\u0446\u0438\u0438").setDesc("\u041A\u043E\u043B\u044C\u0446\u043E \u043F\u0440\u043E\u0433\u0440\u0435\u0441\u0441\u0430, \u043A\u043E\u043D\u0444\u0435\u0442\u0442\u0438, \u043F\u0435\u0440\u0435\u043B\u0438\u0441\u0442\u044B\u0432\u0430\u043D\u0438\u0435 \u043C\u0435\u0441\u044F\u0446\u0435\u0432. \u0415\u0441\u043B\u0438 \u0432 \u0441\u0438\u0441\u0442\u0435\u043C\u0435 \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u043E \xAB\u0443\u043C\u0435\u043D\u044C\u0448\u0438\u0442\u044C \u0434\u0432\u0438\u0436\u0435\u043D\u0438\u0435\xBB, \u0430\u043D\u0438\u043C\u0430\u0446\u0438\u0438 \u043E\u0442\u043A\u043B\u044E\u0447\u0430\u044E\u0442\u0441\u044F \u0441\u0430\u043C\u0438.").addToggle(
       (t) => t.setValue(s.animations).onChange(async (v) => {
         s.animations = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u041F\u0430\u043F\u043A\u0430 \u0437\u0430\u043C\u0435\u0442\u043E\u043A \u0434\u043D\u044F").setDesc("\u041F\u0443\u0441\u0442\u043E \u2014 \u0432\u0437\u044F\u0442\u044C \u0438\u0437 \u0432\u0441\u0442\u0440\u043E\u0435\u043D\u043D\u043E\u0433\u043E \u043F\u043B\u0430\u0433\u0438\u043D\u0430 \xAB\u0415\u0436\u0435\u0434\u043D\u0435\u0432\u043D\u044B\u0435 \u0437\u0430\u043C\u0435\u0442\u043A\u0438\xBB.").addText(
+    new import_obsidian8.Setting(containerEl).setName("\u041F\u0430\u043F\u043A\u0430 \u0437\u0430\u043C\u0435\u0442\u043E\u043A \u0434\u043D\u044F").setDesc("\u041F\u0443\u0441\u0442\u043E \u2014 \u0432\u0437\u044F\u0442\u044C \u0438\u0437 \u0432\u0441\u0442\u0440\u043E\u0435\u043D\u043D\u043E\u0433\u043E \u043F\u043B\u0430\u0433\u0438\u043D\u0430 \xAB\u0415\u0436\u0435\u0434\u043D\u0435\u0432\u043D\u044B\u0435 \u0437\u0430\u043C\u0435\u0442\u043A\u0438\xBB.").addText(
       (t) => t.setPlaceholder("\u0414\u043D\u0435\u0432\u043D\u0438\u043A").setValue(s.dailyFolder).onChange(async (v) => {
         s.dailyFolder = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0424\u043E\u0440\u043C\u0430\u0442 \u0438\u043C\u0435\u043D\u0438 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0434\u043D\u044F").setDesc("\u0424\u043E\u0440\u043C\u0430\u0442 moment.js, \u043D\u0430\u043F\u0440\u0438\u043C\u0435\u0440 YYYY-MM-DD \u0438\u043B\u0438 YYYY/MM/YYYY-MM-DD. \u041F\u0443\u0441\u0442\u043E \u2014 \u0438\u0437 \xAB\u0415\u0436\u0435\u0434\u043D\u0435\u0432\u043D\u044B\u0445 \u0437\u0430\u043C\u0435\u0442\u043E\u043A\xBB \u0438\u043B\u0438 YYYY-MM-DD.").addText(
+    new import_obsidian8.Setting(containerEl).setName("\u0424\u043E\u0440\u043C\u0430\u0442 \u0438\u043C\u0435\u043D\u0438 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0434\u043D\u044F").setDesc("\u0424\u043E\u0440\u043C\u0430\u0442 moment.js, \u043D\u0430\u043F\u0440\u0438\u043C\u0435\u0440 YYYY-MM-DD \u0438\u043B\u0438 YYYY/MM/YYYY-MM-DD. \u041F\u0443\u0441\u0442\u043E \u2014 \u0438\u0437 \xAB\u0415\u0436\u0435\u0434\u043D\u0435\u0432\u043D\u044B\u0445 \u0437\u0430\u043C\u0435\u0442\u043E\u043A\xBB \u0438\u043B\u0438 YYYY-MM-DD.").addText(
       (t) => t.setPlaceholder("YYYY-MM-DD").setValue(s.dailyFormat).onChange(async (v) => {
         s.dailyFormat = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0428\u0430\u0431\u043B\u043E\u043D \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0434\u043D\u044F").setDesc("\u041F\u0443\u0442\u044C \u043A \u0444\u0430\u0439\u043B\u0443-\u0448\u0430\u0431\u043B\u043E\u043D\u0443. \u041F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u044E\u0442\u0441\u044F {{date}}, {{date:DD.MM}}, {{time}}, {{title}}.").addText(
+    new import_obsidian8.Setting(containerEl).setName("\u0428\u0430\u0431\u043B\u043E\u043D \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0434\u043D\u044F").setDesc("\u041F\u0443\u0442\u044C \u043A \u0444\u0430\u0439\u043B\u0443-\u0448\u0430\u0431\u043B\u043E\u043D\u0443. \u041F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u044E\u0442\u0441\u044F {{date}}, {{date:DD.MM}}, {{time}}, {{title}}.").addText(
       (t) => t.setPlaceholder("\u0428\u0430\u0431\u043B\u043E\u043D\u044B/\u0414\u0435\u043D\u044C").setValue(s.dailyTemplate).onChange(async (v) => {
         s.dailyTemplate = v;
         await save();
       })
     );
     let armed = false;
-    new import_obsidian7.Setting(containerEl).setName("\u0421\u0431\u0440\u043E\u0441\u0438\u0442\u044C \u0441\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043A\u0443 \u0441\u043B\u043E\u0432").setDesc("\u0423\u0434\u0430\u043B\u044F\u0435\u0442 \u0438\u0441\u0442\u043E\u0440\u0438\u044E \u043F\u043E \u0432\u0441\u0435\u043C \u0434\u043D\u044F\u043C. \u0417\u0430\u043C\u0435\u0442\u043A\u0438 \u043D\u0435 \u0437\u0430\u0442\u0440\u0430\u0433\u0438\u0432\u0430\u044E\u0442\u0441\u044F.").addButton(
+    new import_obsidian8.Setting(containerEl).setName("\u0421\u0431\u0440\u043E\u0441\u0438\u0442\u044C \u0441\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043A\u0443 \u0441\u043B\u043E\u0432").setDesc("\u0423\u0434\u0430\u043B\u044F\u0435\u0442 \u0438\u0441\u0442\u043E\u0440\u0438\u044E \u043F\u043E \u0432\u0441\u0435\u043C \u0434\u043D\u044F\u043C. \u0417\u0430\u043C\u0435\u0442\u043A\u0438 \u043D\u0435 \u0437\u0430\u0442\u0440\u0430\u0433\u0438\u0432\u0430\u044E\u0442\u0441\u044F.").addButton(
       (b) => b.setButtonText("\u0421\u0431\u0440\u043E\u0441\u0438\u0442\u044C").onClick(async () => {
         if (!armed) {
           armed = true;
@@ -2315,39 +2867,39 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
         b.setButtonText("\u0421\u0431\u0440\u043E\u0448\u0435\u043D\u043E \u2713").buttonEl.removeClass("mod-warning");
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0413\u0440\u0430\u0444: \u0434\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438").setHeading();
+    new import_obsidian8.Setting(containerEl).setName("\u0413\u0440\u0430\u0444: \u0434\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438").setHeading();
     containerEl.createEl("p", {
       cls: "setting-item-description",
       text: "\u041A\u0430\u0436\u0434\u0430\u044F \u043F\u0430\u043F\u043A\u0430 \u0432\u0435\u0440\u0445\u043D\u0435\u0433\u043E \u0443\u0440\u043E\u0432\u043D\u044F \u2014 \u0432\u0435\u0442\u043A\u0430, \u043A\u043E\u0442\u043E\u0440\u0430\u044F \u0440\u0430\u0441\u0442\u0451\u0442 \u0432 \u0441\u0432\u043E\u044E \u0441\u0442\u043E\u0440\u043E\u043D\u0443. \u0413\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u043F\u0430\u043F\u043E\u043A \u0437\u0430\u043A\u0440\u0435\u043F\u043B\u044F\u044E\u0442\u0441\u044F \u043A\u0430\u043A \u0443\u0437\u043B\u044B \u043D\u0430\u0432\u044B\u043A\u043E\u0432, \u0444\u0430\u0439\u043B\u044B \u0432\u0438\u0441\u044F\u0442 \u043D\u0430 \u043D\u0438\u0445 \u043B\u0438\u0441\u0442\u044C\u044F\u043C\u0438. \u0418\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u0442 \u0432\u043D\u0443\u0442\u0440\u0435\u043D\u043D\u0438\u0435 \u043C\u0435\u0445\u0430\u043D\u0438\u0437\u043C\u044B \u0433\u0440\u0430\u0444\u0430 Obsidian: \u043F\u043E\u0441\u043B\u0435 \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u044F Obsidian \u043C\u043E\u0436\u0435\u0442 \u043F\u0435\u0440\u0435\u0441\u0442\u0430\u0442\u044C \u0440\u0430\u0431\u043E\u0442\u0430\u0442\u044C \u2014 \u0442\u043E\u0433\u0434\u0430 \u043F\u0440\u043E\u0441\u0442\u043E \u0432\u044B\u043A\u043B\u044E\u0447\u0438\u0442\u0435."
     });
-    new import_obsidian7.Setting(containerEl).setName("\u0420\u0430\u0441\u043A\u043B\u0430\u0434\u044B\u0432\u0430\u0442\u044C \u0433\u0440\u0430\u0444 \u0432\u0435\u0442\u043A\u0430\u043C\u0438").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0420\u0430\u0441\u043A\u043B\u0430\u0434\u044B\u0432\u0430\u0442\u044C \u0433\u0440\u0430\u0444 \u0432\u0435\u0442\u043A\u0430\u043C\u0438").addToggle(
       (t) => t.setValue(s.skillTreeEnabled).onChange(async (v) => {
         s.skillTreeEnabled = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0424\u043E\u0440\u043C\u0430").addDropdown(
+    new import_obsidian8.Setting(containerEl).setName("\u0424\u043E\u0440\u043C\u0430").addDropdown(
       (d) => d.addOptions({ radial: "\u0417\u0432\u0435\u0437\u0434\u0430 \u2014 \u0432\u0435\u0442\u043A\u0438 \u0432\u043E \u0432\u0441\u0435 \u0441\u0442\u043E\u0440\u043E\u043D\u044B", up: "\u0414\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438 \u2014 \u0432\u0435\u0442\u043A\u0438 \u0440\u0430\u0441\u0442\u0443\u0442 \u0432\u0432\u0435\u0440\u0445" }).setValue(s.skillTreeStyle).onChange(async (v) => {
         s.skillTreeStyle = v;
         await save();
         this.display();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0414\u043B\u0438\u043D\u0430 \u0432\u0435\u0442\u043A\u0438").setDesc("\u0420\u0430\u0441\u0441\u0442\u043E\u044F\u043D\u0438\u0435 \u043C\u0435\u0436\u0434\u0443 \u0443\u0440\u043E\u0432\u043D\u044F\u043C\u0438.").addSlider(
+    new import_obsidian8.Setting(containerEl).setName("\u0414\u043B\u0438\u043D\u0430 \u0432\u0435\u0442\u043A\u0438").setDesc("\u0420\u0430\u0441\u0441\u0442\u043E\u044F\u043D\u0438\u0435 \u043C\u0435\u0436\u0434\u0443 \u0443\u0440\u043E\u0432\u043D\u044F\u043C\u0438.").addSlider(
       (sl) => sl.setLimits(120, 700, 20).setValue(s.skillTreeStep).setDynamicTooltip().onChange(async (v) => {
         s.skillTreeStep = v;
         await save();
       })
     );
     if (s.skillTreeStyle === "radial") {
-      new import_obsidian7.Setting(containerEl).setName("\u0428\u0438\u0440\u0438\u043D\u0430 \u0432\u0435\u0435\u0440\u0430 \u0432\u0435\u0442\u043A\u0438").setDesc("\u041D\u0430\u0441\u043A\u043E\u043B\u044C\u043A\u043E \u0448\u0438\u0440\u043E\u043A\u043E \u0440\u0430\u0441\u0445\u043E\u0434\u044F\u0442\u0441\u044F \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0438 \u043E\u0434\u043D\u043E\u0439 \u0432\u0435\u0442\u043A\u0438, \u0432 \u0433\u0440\u0430\u0434\u0443\u0441\u0430\u0445.").addSlider(
+      new import_obsidian8.Setting(containerEl).setName("\u0428\u0438\u0440\u0438\u043D\u0430 \u0432\u0435\u0435\u0440\u0430 \u0432\u0435\u0442\u043A\u0438").setDesc("\u041D\u0430\u0441\u043A\u043E\u043B\u044C\u043A\u043E \u0448\u0438\u0440\u043E\u043A\u043E \u0440\u0430\u0441\u0445\u043E\u0434\u044F\u0442\u0441\u044F \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0438 \u043E\u0434\u043D\u043E\u0439 \u0432\u0435\u0442\u043A\u0438, \u0432 \u0433\u0440\u0430\u0434\u0443\u0441\u0430\u0445.").addSlider(
         (sl) => sl.setLimits(30, 180, 5).setValue(s.skillTreeSpread).setDynamicTooltip().onChange(async (v) => {
           s.skillTreeSpread = v;
           await save();
         })
       );
     }
-    new import_obsidian7.Setting(containerEl).setName("\u0417\u0430\u043A\u0440\u0435\u043F\u043B\u044F\u0442\u044C \u0438 \u0444\u0430\u0439\u043B\u044B").setDesc("\u0412\u044B\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u2014 \u0444\u0430\u0439\u043B\u044B \u0441\u0432\u043E\u0431\u043E\u0434\u043D\u043E \xAB\u043F\u043B\u0430\u0432\u0430\u044E\u0442\xBB \u0432\u043E\u043A\u0440\u0443\u0433 \u0441\u0432\u043E\u0435\u0433\u043E \u0443\u0437\u043B\u0430. \u0412\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u2014 \u0432\u044B\u0441\u0442\u0440\u0430\u0438\u0432\u0430\u044E\u0442\u0441\u044F \u0430\u043A\u043A\u0443\u0440\u0430\u0442\u043D\u044B\u043C \u0432\u0435\u0435\u0440\u043E\u043C.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0417\u0430\u043A\u0440\u0435\u043F\u043B\u044F\u0442\u044C \u0438 \u0444\u0430\u0439\u043B\u044B").setDesc("\u0412\u044B\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u2014 \u0444\u0430\u0439\u043B\u044B \u0441\u0432\u043E\u0431\u043E\u0434\u043D\u043E \xAB\u043F\u043B\u0430\u0432\u0430\u044E\u0442\xBB \u0432\u043E\u043A\u0440\u0443\u0433 \u0441\u0432\u043E\u0435\u0433\u043E \u0443\u0437\u043B\u0430. \u0412\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u2014 \u0432\u044B\u0441\u0442\u0440\u0430\u0438\u0432\u0430\u044E\u0442\u0441\u044F \u0430\u043A\u043A\u0443\u0440\u0430\u0442\u043D\u044B\u043C \u0432\u0435\u0435\u0440\u043E\u043C.").addToggle(
       (t) => t.setValue(s.skillTreePinFiles).onChange(async (v) => {
         s.skillTreePinFiles = v;
         await save();
@@ -2359,7 +2911,7 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
       for (const [k, v] of Object.entries(DIRECTIONS)) dirOptions[k] = v.label;
       containerEl.createEl("div", { cls: "setting-item-name fh-subheading", text: "\u041D\u0430\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u044F \u0432\u0435\u0442\u043E\u043A" });
       for (const root of roots) {
-        new import_obsidian7.Setting(containerEl).setName(root.name).addDropdown(
+        new import_obsidian8.Setting(containerEl).setName(root.name).addDropdown(
           (d) => d.addOptions(dirOptions).setValue(s.branchDirections[root.name] ?? "auto").onChange(async (v) => {
             if (v === "auto") delete s.branchDirections[root.name];
             else s.branchDirections[root.name] = v;
@@ -2368,32 +2920,32 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
         );
       }
     }
-    new import_obsidian7.Setting(containerEl).setName("\u0413\u0440\u0430\u0444: \u044D\u0444\u0444\u0435\u043A\u0442\u044B").setHeading();
-    new import_obsidian7.Setting(containerEl).setName("\u042D\u0444\u0444\u0435\u043A\u0442\u044B \u0432 \u0433\u0440\u0430\u0444\u0435").setDesc("\u0420\u0438\u0441\u0443\u044E\u0442\u0441\u044F \u043F\u043E\u0432\u0435\u0440\u0445 \u0433\u0440\u0430\u0444\u0430, \u0441\u0430\u043C \u0433\u0440\u0430\u0444 \u043D\u0435 \u043C\u0435\u043D\u044F\u0435\u0442\u0441\u044F. \u041E\u0442\u043A\u043B\u044E\u0447\u0430\u044E\u0442\u0441\u044F \u0432\u043C\u0435\u0441\u0442\u0435 \u0441 \u043E\u0431\u0449\u0438\u043C \u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0430\u0442\u0435\u043B\u0435\u043C \xAB\u0410\u043D\u0438\u043C\u0430\u0446\u0438\u0438\xBB.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0413\u0440\u0430\u0444: \u044D\u0444\u0444\u0435\u043A\u0442\u044B").setHeading();
+    new import_obsidian8.Setting(containerEl).setName("\u042D\u0444\u0444\u0435\u043A\u0442\u044B \u0432 \u0433\u0440\u0430\u0444\u0435").setDesc("\u0420\u0438\u0441\u0443\u044E\u0442\u0441\u044F \u043F\u043E\u0432\u0435\u0440\u0445 \u0433\u0440\u0430\u0444\u0430, \u0441\u0430\u043C \u0433\u0440\u0430\u0444 \u043D\u0435 \u043C\u0435\u043D\u044F\u0435\u0442\u0441\u044F. \u041E\u0442\u043A\u043B\u044E\u0447\u0430\u044E\u0442\u0441\u044F \u0432\u043C\u0435\u0441\u0442\u0435 \u0441 \u043E\u0431\u0449\u0438\u043C \u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0430\u0442\u0435\u043B\u0435\u043C \xAB\u0410\u043D\u0438\u043C\u0430\u0446\u0438\u0438\xBB.").addToggle(
       (t) => t.setValue(s.fxEnabled).onChange(async (v) => {
         s.fxEnabled = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0426\u0432\u0435\u0442 \u0438\u043C\u043F\u0443\u043B\u044C\u0441\u0430").addColorPicker(
+    new import_obsidian8.Setting(containerEl).setName("\u0426\u0432\u0435\u0442 \u0438\u043C\u043F\u0443\u043B\u044C\u0441\u0430").addColorPicker(
       (c) => c.setValue(s.fxColor).onChange(async (v) => {
         s.fxColor = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0418\u043D\u0442\u0435\u0440\u0432\u0430\u043B \u0438\u043C\u043F\u0443\u043B\u044C\u0441\u0430, \u0441\u0435\u043A\u0443\u043D\u0434").addSlider(
+    new import_obsidian8.Setting(containerEl).setName("\u0418\u043D\u0442\u0435\u0440\u0432\u0430\u043B \u0438\u043C\u043F\u0443\u043B\u044C\u0441\u0430, \u0441\u0435\u043A\u0443\u043D\u0434").addSlider(
       (sl) => sl.setLimits(1, 20, 1).setValue(s.fxInterval).setDynamicTooltip().onChange(async (v) => {
         s.fxInterval = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u041A\u043E\u043B\u044C\u0446\u043E").setDesc("\u041E\u0442 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430 \u0440\u0430\u0441\u0445\u043E\u0434\u0438\u0442\u0441\u044F \u043A\u043E\u043B\u044C\u0446\u043E.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u041A\u043E\u043B\u044C\u0446\u043E").setDesc("\u041E\u0442 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430 \u0440\u0430\u0441\u0445\u043E\u0434\u0438\u0442\u0441\u044F \u043A\u043E\u043B\u044C\u0446\u043E.").addToggle(
       (t) => t.setValue(s.fxRing).onChange(async (v) => {
         s.fxRing = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u041B\u0443\u0447\u0438 \u043F\u043E \u0441\u0432\u044F\u0437\u044F\u043C").setDesc("\u041E\u0442 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430 \u043F\u043E \u0441\u0432\u044F\u0437\u044F\u043C \u043A \u0444\u0430\u0439\u043B\u0430\u043C \u0438 \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0430\u043C \u0431\u0435\u0433\u0443\u0442 \u043B\u0443\u0447\u0438.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u041B\u0443\u0447\u0438 \u043F\u043E \u0441\u0432\u044F\u0437\u044F\u043C").setDesc("\u041E\u0442 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430 \u043F\u043E \u0441\u0432\u044F\u0437\u044F\u043C \u043A \u0444\u0430\u0439\u043B\u0430\u043C \u0438 \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0430\u043C \u0431\u0435\u0433\u0443\u0442 \u043B\u0443\u0447\u0438.").addToggle(
       (t) => t.setValue(s.fxWave).onChange(async (v) => {
         s.fxWave = v;
         await save();
@@ -2401,13 +2953,13 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
       })
     );
     if (s.fxWave) {
-      new import_obsidian7.Setting(containerEl).setName("\u0412\u0438\u0434 \u043B\u0443\u0447\u0430").setDesc("\u0418\u0441\u043A\u0440\u0430 \u2014 \u0441\u0432\u0435\u0442\u044F\u0449\u0430\u044F\u0441\u044F \u0442\u043E\u0447\u043A\u0430; \u041B\u0443\u0447 \u2014 \u043B\u0430\u0437\u0435\u0440 \u0441 \u044F\u0440\u043A\u0438\u043C \u043A\u043E\u043D\u0446\u043E\u043C; \u042D\u043D\u0435\u0440\u0433\u0438\u044F \u2014 \u0432\u043E\u043B\u043D\u0438\u0441\u0442\u044B\u0439 \u043F\u043E\u0442\u043E\u043A \u043F\u043B\u0430\u0437\u043C\u044B; \u042D\u043B\u0435\u043A\u0442\u0440\u0438\u0447\u0435\u0441\u0442\u0432\u043E \u2014 \u043C\u0435\u0440\u0446\u0430\u044E\u0449\u0430\u044F \u043C\u043E\u043B\u043D\u0438\u044F \u0441 \u0440\u0430\u0437\u0440\u044F\u0434\u0430\u043C\u0438.").addDropdown(
+      new import_obsidian8.Setting(containerEl).setName("\u0412\u0438\u0434 \u043B\u0443\u0447\u0430").setDesc("\u0418\u0441\u043A\u0440\u0430 \u2014 \u0441\u0432\u0435\u0442\u044F\u0449\u0430\u044F\u0441\u044F \u0442\u043E\u0447\u043A\u0430; \u041B\u0443\u0447 \u2014 \u043B\u0430\u0437\u0435\u0440 \u0441 \u044F\u0440\u043A\u0438\u043C \u043A\u043E\u043D\u0446\u043E\u043C; \u042D\u043D\u0435\u0440\u0433\u0438\u044F \u2014 \u0432\u043E\u043B\u043D\u0438\u0441\u0442\u044B\u0439 \u043F\u043E\u0442\u043E\u043A \u043F\u043B\u0430\u0437\u043C\u044B; \u042D\u043B\u0435\u043A\u0442\u0440\u0438\u0447\u0435\u0441\u0442\u0432\u043E \u2014 \u043C\u0435\u0440\u0446\u0430\u044E\u0449\u0430\u044F \u043C\u043E\u043B\u043D\u0438\u044F \u0441 \u0440\u0430\u0437\u0440\u044F\u0434\u0430\u043C\u0438.").addDropdown(
         (d) => d.addOptions(RAY_STYLES).setValue(s.rayStyle).onChange(async (v) => {
           s.rayStyle = v;
           await save();
         })
       );
-      new import_obsidian7.Setting(containerEl).setName("\u0420\u0435\u0436\u0438\u043C \u043B\u0443\u0447\u0435\u0439").addDropdown(
+      new import_obsidian8.Setting(containerEl).setName("\u0420\u0435\u0436\u0438\u043C \u043B\u0443\u0447\u0435\u0439").addDropdown(
         (d) => d.addOptions({
           pulse: "\u041F\u043E \u0438\u043C\u043F\u0443\u043B\u044C\u0441\u0443 \u2014 \u0432\u043E\u043B\u043D\u043E\u0439 \u043F\u043E \u0432\u0435\u0442\u043A\u0435",
           constant: "\u041F\u043E\u0441\u0442\u043E\u044F\u043D\u043D\u043E"
@@ -2416,20 +2968,20 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
           await save();
         })
       );
-      new import_obsidian7.Setting(containerEl).setName("\u0422\u043E\u043B\u0449\u0438\u043D\u0430 \u043B\u0443\u0447\u0435\u0439").addSlider(
+      new import_obsidian8.Setting(containerEl).setName("\u0422\u043E\u043B\u0449\u0438\u043D\u0430 \u043B\u0443\u0447\u0435\u0439").addSlider(
         (sl) => sl.setLimits(0.5, 3, 0.25).setValue(s.rayWidth).setDynamicTooltip().onChange(async (v) => {
           s.rayWidth = v;
           await save();
         })
       );
     }
-    new import_obsidian7.Setting(containerEl).setName("\u0421\u0432\u0435\u0447\u0435\u043D\u0438\u0435").setDesc("\u0413\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u043C\u044F\u0433\u043A\u043E \xAB\u0434\u044B\u0448\u0430\u0442\xBB \u0441\u0432\u0435\u0442\u043E\u043C.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0421\u0432\u0435\u0447\u0435\u043D\u0438\u0435").setDesc("\u0413\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u043C\u044F\u0433\u043A\u043E \xAB\u0434\u044B\u0448\u0430\u0442\xBB \u0441\u0432\u0435\u0442\u043E\u043C.").addToggle(
       (t) => t.setValue(s.fxGlow).onChange(async (v) => {
         s.fxGlow = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0410\u043D\u0438\u043C\u0430\u0446\u0438\u044F \u0441\u0432\u044F\u0437\u0435\u0439").setDesc("\u041F\u043E \u043B\u0438\u043D\u0438\u044F\u043C \u0431\u0435\u0433\u0443\u0442 \u0448\u0442\u0440\u0438\u0445\u0438 \u0432 \u043D\u0430\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u0438 \u0441\u0441\u044B\u043B\u043A\u0438 \u2014 \u043A\u0430\u043A \u0430\u043D\u0438\u043C\u0438\u0440\u043E\u0432\u0430\u043D\u043D\u044B\u0435 \u0441\u0442\u0440\u0435\u043B\u043A\u0438.").addDropdown(
+    new import_obsidian8.Setting(containerEl).setName("\u0410\u043D\u0438\u043C\u0430\u0446\u0438\u044F \u0441\u0432\u044F\u0437\u0435\u0439").setDesc("\u041F\u043E \u043B\u0438\u043D\u0438\u044F\u043C \u0431\u0435\u0433\u0443\u0442 \u0448\u0442\u0440\u0438\u0445\u0438 \u0432 \u043D\u0430\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u0438 \u0441\u0441\u044B\u043B\u043A\u0438 \u2014 \u043A\u0430\u043A \u0430\u043D\u0438\u043C\u0438\u0440\u043E\u0432\u0430\u043D\u043D\u044B\u0435 \u0441\u0442\u0440\u0435\u043B\u043A\u0438.").addDropdown(
       (d) => d.addOptions({ off: "\u0421\u0442\u0430\u0442\u0438\u0447\u043D\u043E", hubs: "\u0422\u043E\u043B\u044C\u043A\u043E \u043E\u0442 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432", all: "\u0412\u0441\u0435 \u0441\u0432\u044F\u0437\u0438" }).setValue(s.linkFlow).onChange(async (v) => {
         s.linkFlow = v;
         await save();
@@ -2437,7 +2989,7 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
       })
     );
     if (s.linkFlow !== "off") {
-      new import_obsidian7.Setting(containerEl).setName("\u0426\u0432\u0435\u0442 \u0438 \u0441\u043A\u043E\u0440\u043E\u0441\u0442\u044C \u043F\u043E\u0442\u043E\u043A\u0430").addColorPicker(
+      new import_obsidian8.Setting(containerEl).setName("\u0426\u0432\u0435\u0442 \u0438 \u0441\u043A\u043E\u0440\u043E\u0441\u0442\u044C \u043F\u043E\u0442\u043E\u043A\u0430").addColorPicker(
         (c) => c.setValue(s.linkFlowColor).onChange(async (v) => {
           s.linkFlowColor = v;
           await save();
@@ -2449,13 +3001,13 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
         })
       );
     }
-    new import_obsidian7.Setting(containerEl).setName("\u0420\u043E\u0441\u0442 \u0434\u0435\u0440\u0435\u0432\u0430 \u043F\u0440\u0438 \u043E\u0442\u043A\u0440\u044B\u0442\u0438\u0438").setDesc("\u0423\u0437\u043B\u044B \u0432\u044B\u0440\u0430\u0441\u0442\u0430\u044E\u0442 \u0438\u0437 \u0446\u0435\u043D\u0442\u0440\u0430 \u0432\u0435\u0442\u043A\u0430 \u0437\u0430 \u0432\u0435\u0442\u043A\u043E\u0439, \u0443\u0440\u043E\u0432\u0435\u043D\u044C \u0437\u0430 \u0443\u0440\u043E\u0432\u043D\u0435\u043C (\u043D\u0443\u0436\u043D\u0430 \u0440\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0430 \u0432\u0435\u0442\u043A\u0430\u043C\u0438).").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0420\u043E\u0441\u0442 \u0434\u0435\u0440\u0435\u0432\u0430 \u043F\u0440\u0438 \u043E\u0442\u043A\u0440\u044B\u0442\u0438\u0438").setDesc("\u0423\u0437\u043B\u044B \u0432\u044B\u0440\u0430\u0441\u0442\u0430\u044E\u0442 \u0438\u0437 \u0446\u0435\u043D\u0442\u0440\u0430 \u0432\u0435\u0442\u043A\u0430 \u0437\u0430 \u0432\u0435\u0442\u043A\u043E\u0439, \u0443\u0440\u043E\u0432\u0435\u043D\u044C \u0437\u0430 \u0443\u0440\u043E\u0432\u043D\u0435\u043C (\u043D\u0443\u0436\u043D\u0430 \u0440\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0430 \u0432\u0435\u0442\u043A\u0430\u043C\u0438).").addToggle(
       (t) => t.setValue(s.graphGrow).onChange(async (v) => {
         s.graphGrow = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u041F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C FPS").setDesc(
+    new import_obsidian8.Setting(containerEl).setName("\u041F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C FPS").setDesc(
       "\u0421\u0447\u0451\u0442\u0447\u0438\u043A \u043A\u0430\u0434\u0440\u043E\u0432 \u0432 \u0443\u0433\u043B\u0443 \u0433\u0440\u0430\u0444\u0430 \u0438 \u0442\u0435\u043A\u0443\u0449\u0435\u0435 \u043A\u0430\u0447\u0435\u0441\u0442\u0432\u043E \u044D\u0444\u0444\u0435\u043A\u0442\u043E\u0432. \u041A\u0430\u0447\u0435\u0441\u0442\u0432\u043E \u043F\u043E\u0434\u0441\u0442\u0440\u0430\u0438\u0432\u0430\u0435\u0442\u0441\u044F \u0441\u0430\u043C\u043E: \u0435\u0441\u043B\u0438 \u043A\u0430\u0434\u0440 \u0440\u0438\u0441\u0443\u0435\u0442\u0441\u044F \u0441\u043B\u0438\u0448\u043A\u043E\u043C \u0434\u043E\u043B\u0433\u043E, \u044D\u0444\u0444\u0435\u043A\u0442\u044B \u0443\u043F\u0440\u043E\u0449\u0430\u044E\u0442\u0441\u044F, \u0447\u0442\u043E\u0431\u044B \u0434\u0435\u0440\u0436\u0430\u0442\u044C 60 FPS."
     ).addToggle(
       (t) => t.setValue(s.fxShowFps).onChange(async (v) => {
@@ -2463,14 +3015,15 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0417\u0430\u043C\u043E\u0440\u043E\u0437\u0438\u0442\u044C \u0433\u0440\u0430\u0444").setDesc("\u041A\u043E\u0433\u0434\u0430 \u0443\u0437\u043B\u044B \u0443\u043B\u044F\u0433\u0443\u0442\u0441\u044F, \u043E\u043D\u0438 \u043F\u0435\u0440\u0435\u0441\u0442\u0430\u044E\u0442 \u0434\u0432\u0438\u0433\u0430\u0442\u044C\u0441\u044F. \u041C\u0435\u043D\u044C\u0448\u0435 \u043D\u0430\u0433\u0440\u0443\u0437\u043A\u0430 \u043D\u0430 \u0442\u0435\u043B\u0435\u0444\u043E\u043D. \u042D\u0444\u0444\u0435\u043A\u0442\u044B \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u044E\u0442 \u0440\u0430\u0431\u043E\u0442\u0430\u0442\u044C.").addToggle(
+    new import_obsidian8.Setting(containerEl).setName("\u0417\u0430\u043C\u043E\u0440\u043E\u0437\u0438\u0442\u044C \u0433\u0440\u0430\u0444").setDesc("\u041A\u043E\u0433\u0434\u0430 \u0443\u0437\u043B\u044B \u0443\u043B\u044F\u0433\u0443\u0442\u0441\u044F, \u043E\u043D\u0438 \u043F\u0435\u0440\u0435\u0441\u0442\u0430\u044E\u0442 \u0434\u0432\u0438\u0433\u0430\u0442\u044C\u0441\u044F. \u041C\u0435\u043D\u044C\u0448\u0435 \u043D\u0430\u0433\u0440\u0443\u0437\u043A\u0430 \u043D\u0430 \u0442\u0435\u043B\u0435\u0444\u043E\u043D. \u042D\u0444\u0444\u0435\u043A\u0442\u044B \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u044E\u0442 \u0440\u0430\u0431\u043E\u0442\u0430\u0442\u044C.").addToggle(
       (t) => t.setValue(s.graphFreeze).onChange(async (v) => {
         s.graphFreeze = v;
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0423\u0440\u043E\u0432\u043D\u0438 \u0432\u0435\u0442\u043E\u043A").setHeading();
-    new import_obsidian7.Setting(containerEl).setName("\u041F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C \u0443\u0440\u043E\u0432\u0435\u043D\u044C \u0432\u0435\u0442\u043A\u0438").setDesc(
+    this.displayModules(containerEl);
+    new import_obsidian8.Setting(containerEl).setName("\u0423\u0440\u043E\u0432\u043D\u0438 \u0432\u0435\u0442\u043E\u043A").setHeading();
+    new import_obsidian8.Setting(containerEl).setName("\u041F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C \u0443\u0440\u043E\u0432\u0435\u043D\u044C \u0432\u0435\u0442\u043A\u0438").setDesc(
       "\u041E\u043F\u044B\u0442 \u0432\u0435\u0442\u043A\u0438 = \u0441\u043B\u043E\u0432\u0430 \u0432\u043E \u0432\u0441\u0435\u0445 \u0435\u0451 \u0437\u0430\u043C\u0435\u0442\u043A\u0430\u0445 + 25 \u0437\u0430 \u043A\u0430\u0436\u0434\u0443\u044E \u0437\u0430\u043C\u0435\u0442\u043A\u0443. \u041A\u0430\u0440\u0442\u043E\u0447\u043A\u0430 \u0443\u0440\u043E\u0432\u043D\u044F \u043F\u043E\u044F\u0432\u043B\u044F\u0435\u0442\u0441\u044F \u0432 \u043D\u0430\u0447\u0430\u043B\u0435 \u0441\u043F\u0438\u0441\u043A\u0430 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430, \u0432 \u043F\u0430\u043D\u0435\u043B\u0438 \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044F \u2014 \u0441\u043F\u0438\u0441\u043E\u043A \u0432\u0435\u0442\u043E\u043A. \u041F\u0440\u0438 \u043F\u043E\u0432\u044B\u0448\u0435\u043D\u0438\u0438 \u0443\u0440\u043E\u0432\u043D\u044F \u2014 \u0443\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u0435 \u0438 \u0432\u0441\u043F\u044B\u0448\u043A\u0430 \u0432 \u0433\u0440\u0430\u0444\u0435."
     ).addToggle(
       (t) => t.setValue(s.branchLevels).onChange(async (v) => {
@@ -2479,11 +3032,150 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
         await this.plugin.updateAll(false);
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u044F").setHeading();
-    new import_obsidian7.Setting(containerEl).setName("\u0421\u043E\u0437\u0434\u0430\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0432\u043E \u0432\u0441\u0435\u0445 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u044E\u0449\u0438\u0445 \u043F\u0430\u043F\u043A\u0430\u0445").addButton((b) => b.setButtonText("\u0421\u043E\u0437\u0434\u0430\u0442\u044C").onClick(() => this.plugin.createAll()));
-    new import_obsidian7.Setting(containerEl).setName("\u041F\u0435\u0440\u0435\u0441\u0442\u0440\u043E\u0438\u0442\u044C \u0432\u0441\u0435 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B").setDesc("\u041F\u0440\u0438\u043C\u0435\u043D\u0438\u0442\u044C \u043D\u043E\u0432\u0443\u044E \u0440\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0443/\u0441\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u043A\u0443 \u043A\u043E \u0432\u0441\u0435\u043C. \u0420\u0443\u0447\u043D\u044B\u0435 \u043F\u0440\u0430\u0432\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438 \u0441\u043F\u0438\u0441\u043A\u0430 \u0431\u0443\u0434\u0443\u0442 \u0441\u0431\u0440\u043E\u0448\u0435\u043D\u044B (\u0442\u0435\u043A\u0441\u0442 \u0432\u043D\u0435 \u0441\u043F\u0438\u0441\u043A\u0430 \u043D\u0435 \u0442\u0440\u043E\u0433\u0430\u0435\u0442\u0441\u044F).").addButton(
+    new import_obsidian8.Setting(containerEl).setName("\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u044F").setHeading();
+    new import_obsidian8.Setting(containerEl).setName("\u0421\u043E\u0437\u0434\u0430\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0432\u043E \u0432\u0441\u0435\u0445 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u044E\u0449\u0438\u0445 \u043F\u0430\u043F\u043A\u0430\u0445").addButton((b) => b.setButtonText("\u0421\u043E\u0437\u0434\u0430\u0442\u044C").onClick(() => this.plugin.createAll()));
+    new import_obsidian8.Setting(containerEl).setName("\u041F\u0435\u0440\u0435\u0441\u0442\u0440\u043E\u0438\u0442\u044C \u0432\u0441\u0435 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B").setDesc("\u041F\u0440\u0438\u043C\u0435\u043D\u0438\u0442\u044C \u043D\u043E\u0432\u0443\u044E \u0440\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0443/\u0441\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u043A\u0443 \u043A\u043E \u0432\u0441\u0435\u043C. \u0420\u0443\u0447\u043D\u044B\u0435 \u043F\u0440\u0430\u0432\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438 \u0441\u043F\u0438\u0441\u043A\u0430 \u0431\u0443\u0434\u0443\u0442 \u0441\u0431\u0440\u043E\u0448\u0435\u043D\u044B (\u0442\u0435\u043A\u0441\u0442 \u0432\u043D\u0435 \u0441\u043F\u0438\u0441\u043A\u0430 \u043D\u0435 \u0442\u0440\u043E\u0433\u0430\u0435\u0442\u0441\u044F).").addButton(
       (b) => b.setButtonText("\u041F\u0435\u0440\u0435\u0441\u0442\u0440\u043E\u0438\u0442\u044C").setWarning().onClick(async () => {
         await this.plugin.updateAll(true);
+      })
+    );
+  }
+  /** "Graph: modules" section with a small editor for each module. */
+  displayModules(containerEl) {
+    const s = this.plugin.settings;
+    const changed = () => this.plugin.onModulesChanged();
+    new import_obsidian8.Setting(containerEl).setName("\u0413\u0440\u0430\u0444: \u043C\u043E\u0434\u0443\u043B\u0438").setHeading();
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "\u041C\u043E\u0434\u0443\u043B\u044C \u2014 \u0431\u0430\u0440\u044C\u0435\u0440 \u0432\u043E\u043A\u0440\u0443\u0433 \u0433\u0440\u0443\u043F\u043F\u044B \u0437\u0430\u043C\u0435\u0442\u043E\u043A (\u043F\u0430\u043F\u043A\u0438 \u0438\u043B\u0438 \u0442\u0435\u0433\u0430): \u0433\u0440\u0430\u043D\u0438\u0446\u0430 \u0441\u0432\u043E\u0435\u0433\u043E \u0446\u0432\u0435\u0442\u0430, \u043A\u043E\u0442\u043E\u0440\u0430\u044F \u0440\u0430\u0441\u0442\u0451\u0442 \u0432\u043C\u0435\u0441\u0442\u0435 \u0441 \u0447\u0438\u0441\u043B\u043E\u043C \u0437\u0430\u043C\u0435\u0442\u043E\u043A \u0438 \u0443\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442 \u0438\u0445 \u0432\u043D\u0443\u0442\u0440\u0438. \u0411\u044B\u0441\u0442\u0440\u043E \u0441\u043E\u0437\u0434\u0430\u0442\u044C: \u043F\u0440\u0430\u0432\u044B\u0439 \u043A\u043B\u0438\u043A \u043F\u043E \u043F\u0430\u043F\u043A\u0435 \u2192 \xAB\u0421\u0434\u0435\u043B\u0430\u0442\u044C \u043C\u043E\u0434\u0443\u043B\u0435\u043C \u0433\u0440\u0430\u0444\u0430\xBB."
+    });
+    new import_obsidian8.Setting(containerEl).setName("\u041F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C \u043C\u043E\u0434\u0443\u043B\u0438").addToggle(
+      (t) => t.setValue(s.modulesEnabled).onChange(async (v) => {
+        s.modulesEnabled = v;
+        await changed();
+      })
+    );
+    new import_obsidian8.Setting(containerEl).setName("\u0424\u043E\u0440\u043C\u0430 \u0433\u0440\u0430\u043D\u0438\u0446\u044B").addDropdown(
+      (d) => d.addOptions({ cloud: "\u041E\u0431\u043B\u0430\u043A\u043E \u2014 \u043F\u043E \u0444\u043E\u0440\u043C\u0435 \u0433\u0440\u0443\u043F\u043F\u044B", circle: "\u041A\u0440\u0443\u0433" }).setValue(s.moduleShape).onChange(async (v) => {
+        s.moduleShape = v;
+        await changed();
+      })
+    );
+    new import_obsidian8.Setting(containerEl).setName("\u041B\u0438\u043D\u0438\u044F \u0433\u0440\u0430\u043D\u0438\u0446\u044B \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E").addDropdown(
+      (d) => d.addOptions(LINE_STYLES).setValue(s.moduleLine).onChange(async (v) => {
+        s.moduleLine = v;
+        await changed();
+      })
+    ).addSlider(
+      (sl) => sl.setLimits(0.5, 3, 0.25).setValue(s.moduleLineWidth).setDynamicTooltip().onChange(async (v) => {
+        s.moduleLineWidth = v;
+        await changed();
+      })
+    );
+    new import_obsidian8.Setting(containerEl).setName("\u0420\u0430\u0437\u043C\u0435\u0440 \u0431\u0430\u0440\u044C\u0435\u0440\u0430").setDesc("\u041C\u043D\u043E\u0436\u0438\u0442\u0435\u043B\u044C: \u0431\u0430\u0440\u044C\u0435\u0440 \u0440\u0430\u0441\u0442\u0451\u0442 \u0441 \u043A\u043E\u043B\u0438\u0447\u0435\u0441\u0442\u0432\u043E\u043C \u0437\u0430\u043C\u0435\u0442\u043E\u043A (\u221An), \u044D\u0442\u043E \u2014 \u043E\u0431\u0449\u0438\u0439 \u043C\u0430\u0441\u0448\u0442\u0430\u0431.").addSlider(
+      (sl) => sl.setLimits(0.5, 2.5, 0.1).setValue(s.moduleSize).setDynamicTooltip().onChange(async (v) => {
+        s.moduleSize = v;
+        await changed();
+      })
+    );
+    new import_obsidian8.Setting(containerEl).setName("\u0423\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0442\u044C \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438").setDesc("\u0412\u044B\u043B\u0435\u0442\u0435\u0432\u0448\u0443\u044E \u0437\u0430 \u0431\u0430\u0440\u044C\u0435\u0440 \u0437\u0430\u043C\u0435\u0442\u043A\u0443 \u043C\u044F\u0433\u043A\u043E \u0432\u043E\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 \u0432\u043D\u0443\u0442\u0440\u044C; \u0435\u0441\u043B\u0438 \u0435\u0451 \u043F\u043E\u0441\u0442\u043E\u044F\u043D\u043D\u043E \u0432\u044B\u0442\u0430\u043B\u043A\u0438\u0432\u0430\u0435\u0442 \u2014 \u0431\u0430\u0440\u044C\u0435\u0440 \u0440\u0430\u0441\u0448\u0438\u0440\u044F\u0435\u0442\u0441\u044F.").addToggle(
+      (t) => t.setValue(s.moduleHold).onChange(async (v) => {
+        s.moduleHold = v;
+        await changed();
+      })
+    );
+    new import_obsidian8.Setting(containerEl).setName("\u0417\u0430\u043B\u0438\u0432\u043A\u0430, \u043F\u043E\u0434\u043F\u0438\u0441\u0438, \u0430\u043D\u0438\u043C\u0430\u0446\u0438\u044F \u0433\u0440\u0430\u043D\u0438\u0446\u044B").addToggle(
+      (t) => t.setTooltip("\u041F\u043E\u043B\u0443\u043F\u0440\u043E\u0437\u0440\u0430\u0447\u043D\u0430\u044F \u0437\u0430\u043B\u0438\u0432\u043A\u0430").setValue(s.moduleFill).onChange(async (v) => {
+        s.moduleFill = v;
+        await changed();
+      })
+    ).addToggle(
+      (t) => t.setTooltip("\u041F\u043E\u0434\u043F\u0438\u0441\u044C \u0441 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435\u043C \u0438 \u0447\u0438\u0441\u043B\u043E\u043C \u0437\u0430\u043C\u0435\u0442\u043E\u043A").setValue(s.moduleLabels).onChange(async (v) => {
+        s.moduleLabels = v;
+        await changed();
+      })
+    ).addToggle(
+      (t) => t.setTooltip("\u0417\u0443\u0431\u0446\u044B/\u0448\u0442\u0440\u0438\u0445\u0438/\u0432\u043E\u043B\u043D\u0430 \u043F\u043E\u043B\u0437\u0443\u0442 \u0432\u0434\u043E\u043B\u044C \u0433\u0440\u0430\u043D\u0438\u0446\u044B").setValue(s.moduleAnimate).onChange(async (v) => {
+        s.moduleAnimate = v;
+        await changed();
+      })
+    );
+    const folders = this.app.vault.getAllLoadedFiles().filter((f) => f instanceof import_obsidian9.TFolder && !f.isRoot()).map((f) => f.path).sort((a, b) => a.localeCompare(b));
+    const lineOptions = { default: `\u041F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E (${LINE_STYLES[s.moduleLine]})` };
+    for (const [k, v] of Object.entries(LINE_STYLES)) lineOptions[k] = v;
+    s.modules.forEach((m, i) => {
+      const box = containerEl.createDiv({ cls: "fh-module-box" });
+      box.style.setProperty("--fh-module-color", m.color);
+      new import_obsidian8.Setting(box).setName(`\u041C\u043E\u0434\u0443\u043B\u044C ${i + 1}`).addText(
+        (t) => t.setPlaceholder("\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435").setValue(m.name).onChange(async (v) => {
+          m.name = v;
+          await changed();
+        })
+      ).addColorPicker(
+        (c) => c.setValue(m.color).onChange(async (v) => {
+          m.color = v;
+          box.style.setProperty("--fh-module-color", v);
+          await changed();
+        })
+      ).addExtraButton(
+        (b) => b.setIcon("trash-2").setTooltip("\u0423\u0434\u0430\u043B\u0438\u0442\u044C \u043C\u043E\u0434\u0443\u043B\u044C").onClick(async () => {
+          s.modules.splice(i, 1);
+          await changed();
+          this.display();
+        })
+      );
+      const member = new import_obsidian8.Setting(box).setName("\u0421\u043E\u0441\u0442\u0430\u0432").addDropdown(
+        (d) => d.addOptions({ folder: "\u041F\u0430\u043F\u043A\u0430", tag: "\u0422\u0435\u0433" }).setValue(m.kind).onChange(async (v) => {
+          m.kind = v;
+          m.value = "";
+          await changed();
+          this.display();
+        })
+      );
+      if (m.kind === "folder" && folders.length <= 400) {
+        member.addDropdown((d) => {
+          d.addOption("", "\u2014 \u0432\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u043F\u0430\u043F\u043A\u0443 \u2014");
+          for (const f of folders) d.addOption(f, f);
+          d.setValue(m.value).onChange(async (v) => {
+            m.value = v;
+            if (!m.name || m.name === "\u041D\u043E\u0432\u044B\u0439 \u043C\u043E\u0434\u0443\u043B\u044C") m.name = v.split("/").pop() ?? v;
+            await changed();
+            this.display();
+          });
+        });
+      } else {
+        member.addText(
+          (t) => t.setPlaceholder(m.kind === "tag" ? "\u0442\u0435\u0433 \u0431\u0435\u0437 #" : "\u041F\u0443\u0442\u044C \u043A \u043F\u0430\u043F\u043A\u0435").setValue(m.value).onChange(async (v) => {
+            m.value = v.trim();
+            await changed();
+          })
+        );
+      }
+      new import_obsidian8.Setting(box).setName("\u0413\u0440\u0430\u043D\u0438\u0446\u0430 \u0438 \u0442\u043E\u0447\u043A\u0438").addDropdown(
+        (d) => d.addOptions(lineOptions).setValue(m.line).onChange(async (v) => {
+          m.line = v;
+          await changed();
+        })
+      ).addToggle(
+        (t) => t.setTooltip("\u041A\u0440\u0430\u0441\u0438\u0442\u044C \u0442\u043E\u0447\u043A\u0438 \u043C\u043E\u0434\u0443\u043B\u044F \u0432 \u0435\u0433\u043E \u0446\u0432\u0435\u0442 (\u043F\u043E\u044F\u0432\u0438\u0442\u0441\u044F \u043F\u043E\u0441\u043B\u0435 \u043F\u043E\u0432\u0442\u043E\u0440\u043D\u043E\u0433\u043E \u043E\u0442\u043A\u0440\u044B\u0442\u0438\u044F \u0433\u0440\u0430\u0444\u0430)").setValue(m.colorNodes).onChange(async (v) => {
+          m.colorNodes = v;
+          await changed();
+        })
+      );
+    });
+    new import_obsidian8.Setting(containerEl).addButton(
+      (b) => b.setButtonText("\u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u043C\u043E\u0434\u0443\u043B\u044C").setCta().onClick(async () => {
+        s.modules.push({
+          id: newModuleId(),
+          name: "\u041D\u043E\u0432\u044B\u0439 \u043C\u043E\u0434\u0443\u043B\u044C",
+          kind: "folder",
+          value: "",
+          color: MODULE_COLORS[s.modules.length % MODULE_COLORS.length],
+          colorNodes: true,
+          line: "default"
+        });
+        await changed();
+        this.display();
       })
     );
   }
@@ -2491,13 +3183,15 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
 
 // src/main.ts
 var INDEX_KEY = "folder-index";
-var FolderHubPlugin = class extends import_obsidian8.Plugin {
+var FolderHubPlugin = class extends import_obsidian10.Plugin {
   constructor() {
     super(...arguments);
     this.wordStats = {};
     this.tracker = new WordTracker(this);
     this.graphTree = new GraphTree(this);
     this.graphFx = new GraphFx(this);
+    this.modules = new GraphModules(this);
+    this.colorSyncTimer = null;
     this.levels = new BranchLevels(this);
     this.statusEl = null;
     this.saveStatsTimer = null;
@@ -2515,15 +3209,35 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     this.styleEl = document.head.createEl("style", { attr: { id: "folder-hub-dynamic" } });
     this.register(() => this.styleEl?.remove());
     this.levels.start();
+    this.modules.start();
     this.registerView(VIEW_TYPE_CALENDAR, (leaf) => new CalendarView(leaf, this));
     this.addRibbonIcon("calendar-days", "ObsOrg: \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C \u0438 \u0441\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432", () => void this.activateCalendar());
+    this.addCommand({
+      id: "module-from-current-folder",
+      name: "\u0413\u0440\u0430\u0444: \u0441\u0434\u0435\u043B\u0430\u0442\u044C \u043F\u0430\u043F\u043A\u0443 \u0442\u0435\u043A\u0443\u0449\u0435\u0439 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u043C\u043E\u0434\u0443\u043B\u0435\u043C",
+      checkCallback: (checking) => {
+        const folder = this.app.workspace.getActiveFile()?.parent;
+        if (!folder || folder.isRoot()) return false;
+        if (!checking) void this.toggleFolderModule(folder, true);
+        return true;
+      }
+    });
+    this.addCommand({
+      id: "toggle-modules",
+      name: "\u0413\u0440\u0430\u0444: \u043F\u043E\u043A\u0430\u0437\u0430\u0442\u044C/\u0441\u043A\u0440\u044B\u0442\u044C \u043C\u043E\u0434\u0443\u043B\u0438",
+      callback: async () => {
+        this.settings.modulesEnabled = !this.settings.modulesEnabled;
+        await this.saveSettings();
+        new import_obsidian10.Notice(`\u041C\u043E\u0434\u0443\u043B\u0438 \u0432 \u0433\u0440\u0430\u0444\u0435 ${this.settings.modulesEnabled ? "\u043F\u043E\u043A\u0430\u0437\u0430\u043D\u044B" : "\u0441\u043A\u0440\u044B\u0442\u044B"}`);
+      }
+    });
     this.addCommand({
       id: "toggle-skill-tree",
       name: "\u0413\u0440\u0430\u0444: \u0432\u043A\u043B\u044E\u0447\u0438\u0442\u044C/\u0432\u044B\u043A\u043B\u044E\u0447\u0438\u0442\u044C \u0434\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438",
       callback: async () => {
         this.settings.skillTreeEnabled = !this.settings.skillTreeEnabled;
         await this.saveSettings();
-        new import_obsidian8.Notice(`\u0414\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438 \u0432 \u0433\u0440\u0430\u0444\u0435 ${this.settings.skillTreeEnabled ? "\u0432\u043A\u043B\u044E\u0447\u0435\u043D\u043E" : "\u0432\u044B\u043A\u043B\u044E\u0447\u0435\u043D\u043E"}`);
+        new import_obsidian10.Notice(`\u0414\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438 \u0432 \u0433\u0440\u0430\u0444\u0435 ${this.settings.skillTreeEnabled ? "\u0432\u043A\u043B\u044E\u0447\u0435\u043D\u043E" : "\u0432\u044B\u043A\u043B\u044E\u0447\u0435\u043D\u043E"}`);
       }
     });
     this.addCommand({
@@ -2565,7 +3279,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
       name: "\u041F\u0430\u043F\u043A\u0438: \u043E\u0431\u043D\u043E\u0432\u0438\u0442\u044C \u0432\u0441\u0435 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B",
       callback: async () => {
         const n = await this.updateAll(false);
-        new import_obsidian8.Notice(`ObsOrg: \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u043E \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${n}`);
+        new import_obsidian10.Notice(`ObsOrg: \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u043E \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${n}`);
       }
     });
     this.addCommand({
@@ -2573,12 +3287,12 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
       name: "\u041F\u0430\u043F\u043A\u0438: \u043F\u0435\u0440\u0435\u0441\u0442\u0440\u043E\u0438\u0442\u044C \u0432\u0441\u0435 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0437\u0430\u043D\u043E\u0432\u043E (\u0441\u0431\u0440\u043E\u0441\u0438\u0442\u044C \u043F\u0440\u0430\u0432\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438 \u0431\u043B\u043E\u043A\u0430)",
       callback: async () => {
         const n = await this.updateAll(true);
-        new import_obsidian8.Notice(`ObsOrg: \u043F\u0435\u0440\u0435\u0441\u0442\u0440\u043E\u0435\u043D\u043E \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${n}`);
+        new import_obsidian10.Notice(`ObsOrg: \u043F\u0435\u0440\u0435\u0441\u0442\u0440\u043E\u0435\u043D\u043E \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${n}`);
       }
     });
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
-        if (!(file instanceof import_obsidian8.TFolder) || file.isRoot()) return;
+        if (!(file instanceof import_obsidian10.TFolder) || file.isRoot()) return;
         const index = this.findIndex(file);
         if (index) {
           menu.addItem(
@@ -2592,6 +3306,10 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
             (i) => i.setTitle("\u0421\u043E\u0437\u0434\u0430\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043F\u0430\u043F\u043A\u0438").setIcon("star").onClick(() => this.createIndex(file, true))
           );
         }
+        const isModule = !!this.modules.findFolderModule(file);
+        menu.addItem(
+          (i) => i.setTitle(isModule ? "\u0423\u0431\u0440\u0430\u0442\u044C \u043C\u043E\u0434\u0443\u043B\u044C \u0433\u0440\u0430\u0444\u0430" : "\u0421\u0434\u0435\u043B\u0430\u0442\u044C \u043C\u043E\u0434\u0443\u043B\u0435\u043C \u0433\u0440\u0430\u0444\u0430").setIcon(isModule ? "circle-off" : "circle-dashed").onClick(() => this.toggleFolderModule(file, !isModule))
+        );
       })
     );
     this.app.workspace.onLayoutReady(() => {
@@ -2622,6 +3340,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, settings);
     this.settings.branchDirections = { ...settings.branchDirections ?? {} };
     this.settings.managedGraphQueries = [...settings.managedGraphQueries ?? []];
+    this.settings.modules = (settings.modules ?? []).map((m) => ({ ...m }));
     this.lastCalendarSig = this.calendarSignature();
     this.lastTreeSig = this.treeSignature();
   }
@@ -2663,6 +3382,29 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     const s = this.settings;
     return JSON.stringify([s.dailyGoal, s.animations, s.dailyFolder, s.dailyFormat, s.tag, s.indexName]);
   }
+  // ------------------------------------------------------------ modules
+  /** Call after editing modules: refreshes membership, colours and the graph overlay. */
+  async onModulesChanged() {
+    this.modules.invalidate();
+    await this.saveSettings();
+    this.graphFx.sync();
+    if (this.colorSyncTimer !== null) window.clearTimeout(this.colorSyncTimer);
+    this.colorSyncTimer = window.setTimeout(() => {
+      this.colorSyncTimer = null;
+      void this.graphTree.syncColorGroups(false, false);
+    }, 1e3);
+  }
+  async toggleFolderModule(folder, on) {
+    if (on) {
+      const m = this.modules.addFolderModule(folder);
+      new import_obsidian10.Notice(`\u041C\u043E\u0434\u0443\u043B\u044C \xAB${m.name}\xBB \u0434\u043E\u0431\u0430\u0432\u043B\u0435\u043D \u0432 \u0433\u0440\u0430\u0444`);
+    } else {
+      const m = this.modules.findFolderModule(folder);
+      if (m) this.modules.remove(m.id);
+      new import_obsidian10.Notice(`\u041C\u043E\u0434\u0443\u043B\u044C \xAB${folder.name}\xBB \u0443\u0431\u0440\u0430\u043D \u0438\u0437 \u0433\u0440\u0430\u0444\u0430`);
+    }
+    await this.onModulesChanged();
+  }
   // ------------------------------------------------------ words & calendar
   calendarViews() {
     return this.app.workspace.getLeavesOfType(VIEW_TYPE_CALENDAR).map((l) => l.view).filter((v) => v instanceof CalendarView);
@@ -2692,7 +3434,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     const goal = this.settings.dailyGoal;
     if (goal > 0 && before < goal && after >= goal) {
       views.forEach((v) => v.celebrate());
-      new import_obsidian8.Notice(`\u{1F389} \u0426\u0435\u043B\u044C \u043D\u0430 \u0441\u0435\u0433\u043E\u0434\u043D\u044F \u0432\u044B\u043F\u043E\u043B\u043D\u0435\u043D\u0430: ${after.toLocaleString()} ${pluralRu(after, ["\u0441\u043B\u043E\u0432\u043E", "\u0441\u043B\u043E\u0432\u0430", "\u0441\u043B\u043E\u0432"])}!`);
+      new import_obsidian10.Notice(`\u{1F389} \u0426\u0435\u043B\u044C \u043D\u0430 \u0441\u0435\u0433\u043E\u0434\u043D\u044F \u0432\u044B\u043F\u043E\u043B\u043D\u0435\u043D\u0430: ${after.toLocaleString()} ${pluralRu(after, ["\u0441\u043B\u043E\u0432\u043E", "\u0441\u043B\u043E\u0432\u0430", "\u0441\u043B\u043E\u0432"])}!`);
     }
   }
   updateStatusBar(pulse = false) {
@@ -2705,7 +3447,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     const goal = this.settings.dailyGoal;
     el.setText(goal > 0 ? `\u270D ${added.toLocaleString()} / ${goal.toLocaleString()}` : `\u270D ${added.toLocaleString()}`);
     el.toggleClass("is-done", goal > 0 && added >= goal);
-    (0, import_obsidian8.setTooltip)(el, "\u0421\u043B\u043E\u0432 \u043D\u0430\u043F\u0438\u0441\u0430\u043D\u043E \u0441\u0435\u0433\u043E\u0434\u043D\u044F. \u041D\u0430\u0436\u043C\u0438\u0442\u0435, \u0447\u0442\u043E\u0431\u044B \u043E\u0442\u043A\u0440\u044B\u0442\u044C \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C.", { placement: "top" });
+    (0, import_obsidian10.setTooltip)(el, "\u0421\u043B\u043E\u0432 \u043D\u0430\u043F\u0438\u0441\u0430\u043D\u043E \u0441\u0435\u0433\u043E\u0434\u043D\u044F. \u041D\u0430\u0436\u043C\u0438\u0442\u0435, \u0447\u0442\u043E\u0431\u044B \u043E\u0442\u043A\u0440\u044B\u0442\u044C \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C.", { placement: "top" });
     if (pulse && this.settings.animations) {
       el.removeClass("fh-pulse");
       void el.offsetWidth;
@@ -2720,10 +3462,10 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
   }
   // ---------------------------------------------------------------- events
   onCreate(file) {
-    if (file instanceof import_obsidian8.TFolder && this.settings.autoCreate && !this.isExcluded(file)) {
+    if (file instanceof import_obsidian10.TFolder && this.settings.autoCreate && !this.isExcluded(file)) {
       window.setTimeout(() => {
         const folder = this.app.vault.getAbstractFileByPath(file.path);
-        if (folder instanceof import_obsidian8.TFolder && !this.findIndex(folder)) {
+        if (folder instanceof import_obsidian10.TFolder && !this.findIndex(folder)) {
           void this.createIndex(folder, false);
         }
       }, 800);
@@ -2735,7 +3477,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     this.refreshHighlight();
   }
   onRename(file, oldPath) {
-    if (file instanceof import_obsidian8.TFolder && this.settings.renameWithFolder) {
+    if (file instanceof import_obsidian10.TFolder && this.settings.renameWithFolder) {
       const oldName = baseName(oldPath);
       if (oldName !== file.name) {
         window.setTimeout(() => void this.renameIndexWithFolder(file, oldName), 150);
@@ -2748,12 +3490,12 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     this.refreshHighlight();
   }
   async renameIndexWithFolder(folder, oldFolderName) {
-    if (!(this.app.vault.getAbstractFileByPath(folder.path) instanceof import_obsidian8.TFolder)) return;
+    if (!(this.app.vault.getAbstractFileByPath(folder.path) instanceof import_obsidian10.TFolder)) return;
     const oldIndex = this.app.vault.getAbstractFileByPath(
-      (0, import_obsidian8.normalizePath)(`${folder.path}/${this.indexNameFor(oldFolderName)}.md`)
+      (0, import_obsidian10.normalizePath)(`${folder.path}/${this.indexNameFor(oldFolderName)}.md`)
     );
     const newPath = this.expectedIndexPath(folder);
-    if (!(oldIndex instanceof import_obsidian8.TFile) || oldIndex.path === newPath) return;
+    if (!(oldIndex instanceof import_obsidian10.TFile) || oldIndex.path === newPath) return;
     if (this.app.vault.getAbstractFileByPath(newPath)) return;
     try {
       await this.app.fileManager.renameFile(oldIndex, newPath);
@@ -2777,7 +3519,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
       paths.sort((a, b) => b.split("/").length - a.split("/").length);
       for (const p2 of paths) {
         const folder = this.app.vault.getAbstractFileByPath(p2);
-        if (folder instanceof import_obsidian8.TFolder) this.enqueue(() => this.updateFolder(folder, false));
+        if (folder instanceof import_obsidian10.TFolder) this.enqueue(() => this.updateFolder(folder, false));
       }
     }, 400);
   }
@@ -2795,14 +3537,14 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     return name || folderName;
   }
   expectedIndexPath(folder) {
-    return (0, import_obsidian8.normalizePath)(`${folder.path}/${this.indexNameFor(folder.name)}.md`);
+    return (0, import_obsidian10.normalizePath)(`${folder.path}/${this.indexNameFor(folder.name)}.md`);
   }
   findIndex(folder) {
     if (folder.isRoot()) return null;
     const byName = this.app.vault.getAbstractFileByPath(this.expectedIndexPath(folder));
-    if (byName instanceof import_obsidian8.TFile) return byName;
+    if (byName instanceof import_obsidian10.TFile) return byName;
     for (const child of folder.children) {
-      if (child instanceof import_obsidian8.TFile && child.extension === "md" && this.app.metadataCache.getFileCache(child)?.frontmatter?.[INDEX_KEY] === true) {
+      if (child instanceof import_obsidian10.TFile && child.extension === "md" && this.app.metadataCache.getFileCache(child)?.frontmatter?.[INDEX_KEY] === true) {
         return child;
       }
     }
@@ -2810,11 +3552,11 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
   }
   isExcluded(folder) {
     if (folder.isRoot()) return true;
-    const list = this.settings.excludedFolders.split("\n").map((s) => (0, import_obsidian8.normalizePath)(s.trim())).filter((s) => s && s !== "/");
+    const list = this.settings.excludedFolders.split("\n").map((s) => (0, import_obsidian10.normalizePath)(s.trim())).filter((s) => s && s !== "/");
     return list.some((p) => folder.path === p || folder.path.startsWith(p + "/"));
   }
   allFolders() {
-    return this.app.vault.getAllLoadedFiles().filter((f) => f instanceof import_obsidian8.TFolder && !f.isRoot());
+    return this.app.vault.getAllLoadedFiles().filter((f) => f instanceof import_obsidian10.TFolder && !f.isRoot());
   }
   // -------------------------------------------------------- index content
   fileAllowed(file) {
@@ -2826,11 +3568,11 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
     const files = /* @__PURE__ */ new Map();
     const walk = (dir) => {
       for (const child of dir.children) {
-        if (child instanceof import_obsidian8.TFile) {
+        if (child instanceof import_obsidian10.TFile) {
           if (child === index) continue;
           if (dir !== folder && this.findIndex(dir) === child) continue;
           if (this.fileAllowed(child)) files.set(child.path, { file: child, sub: false });
-        } else if (child instanceof import_obsidian8.TFolder) {
+        } else if (child instanceof import_obsidian10.TFolder) {
           if (this.isExcluded(child)) continue;
           const sub = this.findIndex(child);
           if (sub && this.settings.linkSubfolderIndexes) {
@@ -2862,7 +3604,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
       columns: this.settings.columns,
       tableHeaders: this.settings.tableHeaders,
       itemTemplate: this.settings.itemTemplate,
-      formatDate: (ms) => (0, import_obsidian8.moment)(ms).format(fmt)
+      formatDate: (ms) => (0, import_obsidian10.moment)(ms).format(fmt)
     };
   }
   computeBody(index, items, content, force) {
@@ -2880,7 +3622,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
   }
   /** Rewrites the managed block of the folder's index note. Returns true if it changed. */
   async updateFolder(folder, force) {
-    if (!(this.app.vault.getAbstractFileByPath(folder.path) instanceof import_obsidian8.TFolder)) return false;
+    if (!(this.app.vault.getAbstractFileByPath(folder.path) instanceof import_obsidian10.TFolder)) return false;
     if (this.isExcluded(folder)) return false;
     const index = this.findIndex(folder);
     if (!index) return false;
@@ -2917,16 +3659,16 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
           {
             folder: folder.name,
             tag: this.settings.tag.replace(/^#/, "").trim(),
-            date: (0, import_obsidian8.moment)().format(this.settings.dateFormat || "YYYY-MM-DD")
+            date: (0, import_obsidian10.moment)().format(this.settings.dateFormat || "YYYY-MM-DD")
           },
           buildBlock([])
         );
         index = await this.app.vault.create(path, content);
       } catch (e) {
         const existing = this.app.vault.getAbstractFileByPath(path);
-        if (!(existing instanceof import_obsidian8.TFile)) {
+        if (!(existing instanceof import_obsidian10.TFile)) {
           console.error("ObsOrg: failed to create index", e);
-          new import_obsidian8.Notice(`ObsOrg: \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0441\u043E\u0437\u0434\u0430\u0442\u044C ${path}`);
+          new import_obsidian10.Notice(`ObsOrg: \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0441\u043E\u0437\u0434\u0430\u0442\u044C ${path}`);
           return null;
         }
         index = existing;
@@ -2963,7 +3705,7 @@ var FolderHubPlugin = class extends import_obsidian8.Plugin {
       if (this.isExcluded(folder) || this.findIndex(folder)) continue;
       if (await this.createIndex(folder, false)) created++;
     }
-    new import_obsidian8.Notice(`ObsOrg: \u0441\u043E\u0437\u0434\u0430\u043D\u043E \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${created}`);
+    new import_obsidian10.Notice(`ObsOrg: \u0441\u043E\u0437\u0434\u0430\u043D\u043E \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u2014 ${created}`);
   }
   // ------------------------------------------------------------ highlight
   refreshHighlight() {

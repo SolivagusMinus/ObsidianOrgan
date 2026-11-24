@@ -218,3 +218,52 @@ test("level fence is stripped wherever it is, other lines kept", () => {
 	assert.deepEqual(stripLevelFence([...LEVEL_FENCE, ...body]), ["- [[A]]", "text"]);
 	assert.deepEqual(stripLevelFence(["```", "```folder-hub-level"]), ["```", "```folder-hub-level"]);
 });
+
+// ---------------------------------------------------------------- modules
+import { convexHull, moduleOutline, moduleRadius, resampleClosed, smoothClosed } from "../src/module-shapes";
+
+const inside = (poly: { x: number; y: number }[], p: { x: number; y: number }) => {
+	let c = false;
+	for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+		const a = poly[i], b = poly[j];
+		if (a.y > p.y !== b.y > p.y && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x) c = !c;
+	}
+	return c;
+};
+
+test("convex hull of a square with an inner point", () => {
+	const h = convexHull([{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }, { x: 5, y: 5 }]);
+	assert.equal(h.length, 4);
+});
+
+test("module outline encloses every member with padding, both shapes", () => {
+	const pts = [{ x: 0, y: 0 }, { x: 300, y: 40 }, { x: 120, y: 260 }, { x: -80, y: 150 }, { x: 60, y: 90 }];
+	for (const shape of ["cloud", "circle"] as const) {
+		const o = moduleOutline(pts, shape, 30, 50);
+		for (const p of pts) {
+			assert.ok(inside(o, p), `${shape}: member inside`);
+			for (const d of [{ x: 25, y: 0 }, { x: -25, y: 0 }, { x: 0, y: 25 }, { x: 0, y: -25 }]) {
+				assert.ok(inside(o, { x: p.x + d.x, y: p.y + d.y }), `${shape}: padding around member`);
+			}
+		}
+		const smooth = smoothClosed(o, 6);
+		assert.ok(smooth.length >= o.length * 5);
+	}
+	assert.ok(moduleOutline([], "cloud", 30, 50).length === 0);
+	assert.ok(moduleOutline([{ x: 5, y: 5 }], "cloud", 30, 50).length >= 3, "single note still gets a barrier");
+});
+
+test("barrier grows with the number of notes", () => {
+	assert.ok(moduleRadius(1) < moduleRadius(10) && moduleRadius(10) < moduleRadius(100));
+	assert.ok(moduleRadius(50, 2) > moduleRadius(50, 1));
+});
+
+test("resampleClosed spaces points evenly around the outline", () => {
+	const square = [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }];
+	const pts = resampleClosed(square, 10, 3);
+	assert.equal(pts.length, 40);
+	for (let i = 1; i < pts.length; i++) {
+		const d = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+		assert.ok(d > 7 && d <= 10.01, `step ${d}`);
+	}
+});

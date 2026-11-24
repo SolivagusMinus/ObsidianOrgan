@@ -53,7 +53,6 @@ export interface FolderHubSettings {
 	skillTreePinFiles: boolean;
 	/** Top-level folder name → key of DIRECTIONS ("auto" when absent). */
 	branchDirections: Record<string, string>;
-	branchColors: boolean;
 	/** Colour-group queries this plugin wrote to graph.json (so it can replace them). */
 	managedGraphQueries: string[];
 }
@@ -112,7 +111,6 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	skillTreeSpread: 110,
 	skillTreePinFiles: false,
 	branchDirections: {},
-	branchColors: true,
 	managedGraphQueries: [],
 };
 
@@ -416,6 +414,13 @@ export class FolderHubSettingTab extends PluginSettingTab {
 				}),
 			);
 
+		new Setting(containerEl)
+			.setName("Цвет в графе")
+			.setDesc("Добавить в граф цветовую группу tag:#<тег> выбранного цвета — главные файлы будут выделены в графе.")
+			.addButton((b) =>
+				b.setButtonText("Добавить в граф").onClick(() => this.plugin.addGraphColorGroup()),
+			);
+
 		// ------------------------------------------------------------------
 		new Setting(containerEl).setName("Счётчик слов и календарь").setHeading();
 
@@ -607,19 +612,6 @@ export class FolderHubSettingTab extends PluginSettingTab {
 				);
 			}
 		}
-
-		new Setting(containerEl)
-			.setName("Свой цвет каждой ветке")
-			.setDesc("Файлы ветки окрашиваются в её цвет, главные файлы — в цвет выделения. Новые ветки раскрашиваются сами.")
-			.addToggle((t) =>
-				t.setValue(s.branchColors).onChange(async (v) => {
-					s.branchColors = v;
-					await save();
-				}),
-			)
-			.addButton((b) =>
-				b.setButtonText("Раскрасить сейчас").onClick(() => this.plugin.graphTree.applyBranchColors(true)),
-			);
 
 		// ------------------------------------------------------------------
 		new Setting(containerEl).setName("Действия").setHeading();

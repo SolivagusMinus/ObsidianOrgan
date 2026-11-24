@@ -69,11 +69,6 @@ export default class FolderHubPlugin extends Plugin {
 			},
 		});
 		this.addCommand({
-			id: "color-branches",
-			name: "Граф: раскрасить ветки",
-			callback: () => void this.graphTree.applyBranchColors(true),
-		});
-		this.addCommand({
 			id: "open-calendar",
 			name: "Открыть календарь и счётчик слов",
 			callback: () => void this.activateCalendar(),
@@ -642,8 +637,8 @@ export default class FolderHubPlugin extends Plugin {
 
 	// ---------------------------------------------------------------- graph
 
-	/** Writes graph colour groups: index notes + one colour per branch. */
+	/** Adds the index-note colour group ("tag:#<tag>") to the graph. */
 	async addGraphColorGroup() {
-		await this.graphTree.applyBranchColors(true);
+		await this.graphTree.syncColorGroups(true, true);
 	}
 }

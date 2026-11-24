@@ -690,16 +690,12 @@ function layoutSkillTree(roots, o) {
 }
 
 // src/graph.ts
-var PALETTE = {
-  light: ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"],
-  dark: ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#0ca30c", "#9085e9", "#e66767"]
-};
 var hexToRgb = (hex) => {
   const h = hex.replace("#", "");
   const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h.slice(0, 6);
   return parseInt(full, 16) || 0;
 };
-var escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+var isBranchQuery = (q) => q.startsWith("path:/^");
 var GraphTree = class {
   constructor(plugin) {
     this.plugin = plugin;
@@ -708,7 +704,6 @@ var GraphTree = class {
     this.pinned = /* @__PURE__ */ new Map();
     this.timers = /* @__PURE__ */ new Map();
     this.refreshTimer = null;
-    this.colorTimer = null;
   }
   get app() {
     return this.plugin.app;
@@ -718,12 +713,12 @@ var GraphTree = class {
     p.registerEvent(this.app.workspace.on("layout-change", () => this.scan()));
     const onTreeChange = (f) => {
       if (f instanceof import_obsidian4.TFolder || f instanceof import_obsidian4.TFile && f.extension === "md") this.refreshSoon();
-      if (f instanceof import_obsidian4.TFolder && this.plugin.settings.branchColors) this.recolorSoon();
     };
     p.registerEvent(this.app.vault.on("create", onTreeChange));
     p.registerEvent(this.app.vault.on("delete", onTreeChange));
     p.registerEvent(this.app.vault.on("rename", onTreeChange));
     this.scan();
+    if (this.plugin.settings.managedGraphQueries.some(isBranchQuery)) void this.syncColorGroups(false, false);
   }
   stop() {
     for (const r of [...this.originals.keys()]) {
@@ -735,7 +730,6 @@ var GraphTree = class {
     this.views.clear();
     this.timers.forEach((t) => window.clearTimeout(t));
     if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
-    if (this.colorTimer !== null) window.clearTimeout(this.colorTimer);
   }
   /** Re-applies the layout to every open global graph. */
   refresh() {
@@ -748,13 +742,6 @@ var GraphTree = class {
       this.refreshTimer = null;
       this.refresh();
     }, 1200);
-  }
-  recolorSoon() {
-    if (this.colorTimer !== null) window.clearTimeout(this.colorTimer);
-    this.colorTimer = window.setTimeout(() => {
-      this.colorTimer = null;
-      void this.applyBranchColors(false);
-    }, 2e3);
   }
   /** Finds open graph views and hooks their renderer. */
   scan() {
@@ -877,12 +864,17 @@ var GraphTree = class {
   }
   // ------------------------------------------------------------- colours
   /**
-   * Writes graph colour groups: the index-note tag first (highest priority),
-   * then one group per top-level branch. Groups the user created are kept;
-   * groups this plugin created earlier are replaced.
+   * Keeps graph colour groups tidy: optionally puts the index-note tag group
+   * first (highest priority), and removes branch groups written by v1.2.0.
+   * Groups the user created are never touched.
    */
-  async applyBranchColors(notify) {
+  async syncColorGroups(addIndexGroup, notify) {
     const s = this.plugin.settings;
+    const tag = s.tag.replace(/^#/, "").trim();
+    if (addIndexGroup && !tag) {
+      if (notify) new import_obsidian4.Notice("Folder Hub: \u0441\u043D\u0430\u0447\u0430\u043B\u0430 \u0443\u043A\u0430\u0436\u0438\u0442\u0435 \u0442\u0435\u0433 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432.");
+      return;
+    }
     const adapter = this.app.vault.adapter;
     const path = (0, import_obsidian4.normalizePath)(`${this.app.vault.configDir}/graph.json`);
     let cfg = {};
@@ -893,41 +885,30 @@ var GraphTree = class {
       if (notify) new import_obsidian4.Notice("Folder Hub: \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u0440\u043E\u0447\u0438\u0442\u0430\u0442\u044C \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438 \u0433\u0440\u0430\u0444\u0430.");
       return;
     }
-    const ours = [];
-    const tag = s.tag.replace(/^#/, "").trim();
-    if (tag) ours.push({ query: `tag:#${tag}`, color: { a: 1, rgb: hexToRgb(s.highlightColor) } });
-    let skipped = 0;
-    if (s.branchColors) {
-      const palette = document.body.hasClass("theme-dark") ? PALETTE.dark : PALETTE.light;
-      const roots = this.buildTree().sort((a, b) => a.name.localeCompare(b.name));
-      roots.forEach((root, i) => {
-        if (i >= palette.length) {
-          skipped++;
-          return;
-        }
-        const folder = root.id.slice(0, root.id.lastIndexOf("/"));
-        ours.push({ query: `path:/^${escapeRegex(folder)}\\//`, color: { a: 1, rgb: hexToRgb(palette[i]) } });
-      });
-    }
     const managed = new Set(s.managedGraphQueries);
-    const userGroups = (cfg.colorGroups ?? []).filter((g) => !managed.has(g.query) && !ours.some((o) => o.query === g.query));
-    const next = [...ours, ...userGroups];
-    const changed = JSON.stringify(next) !== JSON.stringify(cfg.colorGroups ?? []);
-    if (changed) {
-      cfg.colorGroups = next;
+    let groups = (cfg.colorGroups ?? []).filter((g) => !(managed.has(g.query) && isBranchQuery(g.query)));
+    const nextManaged = s.managedGraphQueries.filter((q) => !isBranchQuery(q));
+    if (addIndexGroup) {
+      const query = `tag:#${tag}`;
+      groups = [{ query, color: { a: 1, rgb: hexToRgb(s.highlightColor) } }, ...groups.filter((g) => g.query !== query)];
+      if (!nextManaged.includes(query)) nextManaged.push(query);
+    }
+    if (JSON.stringify(groups) !== JSON.stringify(cfg.colorGroups ?? [])) {
+      cfg.colorGroups = groups;
       await adapter.write(path, JSON.stringify(cfg, null, 2));
       try {
         const graph = this.app.internalPlugins?.getPluginById?.("graph");
         const opts = graph?.instance?.options;
-        if (opts) opts.colorGroups = next;
+        if (opts) opts.colorGroups = groups;
       } catch {
       }
     }
-    s.managedGraphQueries = ours.map((g) => g.query);
-    await this.plugin.saveSettings();
+    if (JSON.stringify(nextManaged) !== JSON.stringify(s.managedGraphQueries)) {
+      s.managedGraphQueries = nextManaged;
+      await this.plugin.saveSettings();
+    }
     if (notify) {
-      const extra = skipped ? ` \u0412\u0435\u0442\u043E\u043A \u0431\u043E\u043B\u044C\u0448\u0435 8 \u2014 \u0435\u0449\u0451 ${skipped} \u043E\u0441\u0442\u0430\u043B\u0438\u0441\u044C \u0431\u0435\u0437 \u0441\u0432\u043E\u0435\u0433\u043E \u0446\u0432\u0435\u0442\u0430.` : "";
-      new import_obsidian4.Notice(`Folder Hub: \u0446\u0432\u0435\u0442\u0430 \u0432\u0435\u0442\u043E\u043A \u0437\u0430\u043F\u0438\u0441\u0430\u043D\u044B.${extra} \u0417\u0430\u043A\u0440\u043E\u0439\u0442\u0435 \u0438 \u0441\u043D\u043E\u0432\u0430 \u043E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0433\u0440\u0430\u0444.`, 8e3);
+      new import_obsidian4.Notice("Folder Hub: \u0446\u0432\u0435\u0442 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u0434\u043E\u0431\u0430\u0432\u043B\u0435\u043D \u0432 \u0433\u0440\u0430\u0444. \u0417\u0430\u043A\u0440\u043E\u0439\u0442\u0435 \u0438 \u0441\u043D\u043E\u0432\u0430 \u043E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0433\u0440\u0430\u0444.", 8e3);
     }
   }
 };
@@ -1126,7 +1107,6 @@ var DEFAULT_SETTINGS = {
   skillTreeSpread: 110,
   skillTreePinFiles: false,
   branchDirections: {},
-  branchColors: true,
   managedGraphQueries: []
 };
 var FolderHubSettingTab = class extends import_obsidian5.PluginSettingTab {
@@ -1311,6 +1291,9 @@ var FolderHubSettingTab = class extends import_obsidian5.PluginSettingTab {
         await save();
       })
     );
+    new import_obsidian5.Setting(containerEl).setName("\u0426\u0432\u0435\u0442 \u0432 \u0433\u0440\u0430\u0444\u0435").setDesc("\u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u0432 \u0433\u0440\u0430\u0444 \u0446\u0432\u0435\u0442\u043E\u0432\u0443\u044E \u0433\u0440\u0443\u043F\u043F\u0443 tag:#<\u0442\u0435\u0433> \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u043E\u0433\u043E \u0446\u0432\u0435\u0442\u0430 \u2014 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0431\u0443\u0434\u0443\u0442 \u0432\u044B\u0434\u0435\u043B\u0435\u043D\u044B \u0432 \u0433\u0440\u0430\u0444\u0435.").addButton(
+      (b) => b.setButtonText("\u0414\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u0432 \u0433\u0440\u0430\u0444").onClick(() => this.plugin.addGraphColorGroup())
+    );
     new import_obsidian5.Setting(containerEl).setName("\u0421\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432 \u0438 \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C").setHeading();
     new import_obsidian5.Setting(containerEl).setName("\u0421\u0447\u0438\u0442\u0430\u0442\u044C \u0441\u043B\u043E\u0432\u0430 \u0437\u0430 \u0434\u0435\u043D\u044C").setDesc(
       "\u0423\u0447\u0438\u0442\u044B\u0432\u0430\u044E\u0442\u0441\u044F \u0441\u043B\u043E\u0432\u0430, \u043A\u043E\u0442\u043E\u0440\u044B\u0435 \u0432\u044B \u043F\u0438\u0448\u0435\u0442\u0435 \u0432 \u043E\u0442\u043A\u0440\u044B\u0442\u043E\u0439 \u0437\u0430\u043C\u0435\u0442\u043A\u0435. \u0418\u0437\u043C\u0435\u043D\u0435\u043D\u0438\u044F \u043E\u0442 \u0441\u0438\u043D\u0445\u0440\u043E\u043D\u0438\u0437\u0430\u0446\u0438\u0438 \u0438 \u0434\u0440\u0443\u0433\u0438\u0445 \u043F\u043B\u0430\u0433\u0438\u043D\u043E\u0432 \u043D\u0435 \u0441\u0447\u0438\u0442\u0430\u044E\u0442\u0441\u044F. \u041A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C \u043E\u0442\u043A\u0440\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u0437\u043D\u0430\u0447\u043A\u043E\u043C \u{1F4C5} \u043D\u0430 \u0431\u043E\u043A\u043E\u0432\u043E\u0439 \u043B\u0435\u043D\u0442\u0435 \u0438\u043B\u0438 \u043A\u043E\u043C\u0430\u043D\u0434\u043E\u0439 \xAB\u041E\u0442\u043A\u0440\u044B\u0442\u044C \u043A\u0430\u043B\u0435\u043D\u0434\u0430\u0440\u044C \u0438 \u0441\u0447\u0451\u0442\u0447\u0438\u043A \u0441\u043B\u043E\u0432\xBB."
@@ -1429,14 +1412,6 @@ var FolderHubSettingTab = class extends import_obsidian5.PluginSettingTab {
         );
       }
     }
-    new import_obsidian5.Setting(containerEl).setName("\u0421\u0432\u043E\u0439 \u0446\u0432\u0435\u0442 \u043A\u0430\u0436\u0434\u043E\u0439 \u0432\u0435\u0442\u043A\u0435").setDesc("\u0424\u0430\u0439\u043B\u044B \u0432\u0435\u0442\u043A\u0438 \u043E\u043A\u0440\u0430\u0448\u0438\u0432\u0430\u044E\u0442\u0441\u044F \u0432 \u0435\u0451 \u0446\u0432\u0435\u0442, \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u2014 \u0432 \u0446\u0432\u0435\u0442 \u0432\u044B\u0434\u0435\u043B\u0435\u043D\u0438\u044F. \u041D\u043E\u0432\u044B\u0435 \u0432\u0435\u0442\u043A\u0438 \u0440\u0430\u0441\u043A\u0440\u0430\u0448\u0438\u0432\u0430\u044E\u0442\u0441\u044F \u0441\u0430\u043C\u0438.").addToggle(
-      (t) => t.setValue(s.branchColors).onChange(async (v) => {
-        s.branchColors = v;
-        await save();
-      })
-    ).addButton(
-      (b) => b.setButtonText("\u0420\u0430\u0441\u043A\u0440\u0430\u0441\u0438\u0442\u044C \u0441\u0435\u0439\u0447\u0430\u0441").onClick(() => this.plugin.graphTree.applyBranchColors(true))
-    );
     new import_obsidian5.Setting(containerEl).setName("\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u044F").setHeading();
     new import_obsidian5.Setting(containerEl).setName("\u0421\u043E\u0437\u0434\u0430\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u0432\u043E \u0432\u0441\u0435\u0445 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u044E\u0449\u0438\u0445 \u043F\u0430\u043F\u043A\u0430\u0445").addButton((b) => b.setButtonText("\u0421\u043E\u0437\u0434\u0430\u0442\u044C").onClick(() => this.plugin.createAll()));
     new import_obsidian5.Setting(containerEl).setName("\u041F\u0435\u0440\u0435\u0441\u0442\u0440\u043E\u0438\u0442\u044C \u0432\u0441\u0435 \u0433\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B").setDesc("\u041F\u0440\u0438\u043C\u0435\u043D\u0438\u0442\u044C \u043D\u043E\u0432\u0443\u044E \u0440\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0443/\u0441\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u043A\u0443 \u043A\u043E \u0432\u0441\u0435\u043C. \u0420\u0443\u0447\u043D\u044B\u0435 \u043F\u0440\u0430\u0432\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438 \u0441\u043F\u0438\u0441\u043A\u0430 \u0431\u0443\u0434\u0443\u0442 \u0441\u0431\u0440\u043E\u0448\u0435\u043D\u044B (\u0442\u0435\u043A\u0441\u0442 \u0432\u043D\u0435 \u0441\u043F\u0438\u0441\u043A\u0430 \u043D\u0435 \u0442\u0440\u043E\u0433\u0430\u0435\u0442\u0441\u044F).").addButton(
@@ -1480,11 +1455,6 @@ var FolderHubPlugin = class extends import_obsidian6.Plugin {
         await this.saveSettings();
         new import_obsidian6.Notice(`\u0414\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438 \u0432 \u0433\u0440\u0430\u0444\u0435 ${this.settings.skillTreeEnabled ? "\u0432\u043A\u043B\u044E\u0447\u0435\u043D\u043E" : "\u0432\u044B\u043A\u043B\u044E\u0447\u0435\u043D\u043E"}`);
       }
-    });
-    this.addCommand({
-      id: "color-branches",
-      name: "\u0413\u0440\u0430\u0444: \u0440\u0430\u0441\u043A\u0440\u0430\u0441\u0438\u0442\u044C \u0432\u0435\u0442\u043A\u0438",
-      callback: () => void this.graphTree.applyBranchColors(true)
     });
     this.addCommand({
       id: "open-calendar",
@@ -1958,8 +1928,8 @@ var FolderHubPlugin = class extends import_obsidian6.Plugin {
     return rules.join("\n");
   }
   // ---------------------------------------------------------------- graph
-  /** Writes graph colour groups: index notes + one colour per branch. */
+  /** Adds the index-note colour group ("tag:#<tag>") to the graph. */
   async addGraphColorGroup() {
-    await this.graphTree.applyBranchColors(true);
+    await this.graphTree.syncColorGroups(true, true);
   }
 };

@@ -29,12 +29,6 @@ type AppWithInternals = App & {
 	};
 };
 
-/** Validated categorical palette (8 hues), stepped separately for light and dark themes. */
-const PALETTE = {
-	light: ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"],
-	dark: ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#0ca30c", "#9085e9", "#e66767"],
-};
-
 interface ColorGroup {
 	query: string;
 	color: { a: number; rgb: number };
@@ -46,7 +40,8 @@ const hexToRgb = (hex: string): number => {
 	return parseInt(full, 16) || 0;
 };
 
-const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+/** Branch colour groups written by v1.2.0 (removed since). */
+const isBranchQuery = (q: string) => q.startsWith("path:/^");
 
 export class GraphTree {
 	private originals = new Map<GraphRenderer, (data: unknown) => void>();
@@ -54,7 +49,6 @@ export class GraphTree {
 	private pinned = new Map<GraphRenderer, Set<string>>();
 	private timers = new Map<GraphRenderer, number>();
 	private refreshTimer: number | null = null;
-	private colorTimer: number | null = null;
 
 	constructor(private plugin: FolderHubPlugin) {}
 
@@ -67,12 +61,13 @@ export class GraphTree {
 		p.registerEvent(this.app.workspace.on("layout-change", () => this.scan()));
 		const onTreeChange = (f: unknown) => {
 			if (f instanceof TFolder || (f instanceof TFile && f.extension === "md")) this.refreshSoon();
-			if (f instanceof TFolder && this.plugin.settings.branchColors) this.recolorSoon();
 		};
 		p.registerEvent(this.app.vault.on("create", onTreeChange));
 		p.registerEvent(this.app.vault.on("delete", onTreeChange));
 		p.registerEvent(this.app.vault.on("rename", onTreeChange));
 		this.scan();
+		// Clean up branch colours left by v1.2.0.
+		if (this.plugin.settings.managedGraphQueries.some(isBranchQuery)) void this.syncColorGroups(false, false);
 	}
 
 	stop() {
@@ -85,7 +80,6 @@ export class GraphTree {
 		this.views.clear();
 		this.timers.forEach((t) => window.clearTimeout(t));
 		if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
-		if (this.colorTimer !== null) window.clearTimeout(this.colorTimer);
 	}
 
 	/** Re-applies the layout to every open global graph. */
@@ -100,14 +94,6 @@ export class GraphTree {
 			this.refreshTimer = null;
 			this.refresh();
 		}, 1200);
-	}
-
-	private recolorSoon() {
-		if (this.colorTimer !== null) window.clearTimeout(this.colorTimer);
-		this.colorTimer = window.setTimeout(() => {
-			this.colorTimer = null;
-			void this.applyBranchColors(false);
-		}, 2000);
 	}
 
 	/** Finds open graph views and hooks their renderer. */
@@ -251,12 +237,17 @@ export class GraphTree {
 	// ------------------------------------------------------------- colours
 
 	/**
-	 * Writes graph colour groups: the index-note tag first (highest priority),
-	 * then one group per top-level branch. Groups the user created are kept;
-	 * groups this plugin created earlier are replaced.
+	 * Keeps graph colour groups tidy: optionally puts the index-note tag group
+	 * first (highest priority), and removes branch groups written by v1.2.0.
+	 * Groups the user created are never touched.
 	 */
-	async applyBranchColors(notify: boolean) {
+	async syncColorGroups(addIndexGroup: boolean, notify: boolean) {
 		const s = this.plugin.settings;
+		const tag = s.tag.replace(/^#/, "").trim();
+		if (addIndexGroup && !tag) {
+			if (notify) new Notice("Folder Hub: сначала укажите тег главных файлов.");
+			return;
+		}
 		const adapter = this.app.vault.adapter;
 		const path = normalizePath(`${this.app.vault.configDir}/graph.json`);
 		let cfg: { colorGroups?: ColorGroup[] } & Record<string, unknown> = {};
@@ -268,46 +259,32 @@ export class GraphTree {
 			return;
 		}
 
-		const ours: ColorGroup[] = [];
-		const tag = s.tag.replace(/^#/, "").trim();
-		if (tag) ours.push({ query: `tag:#${tag}`, color: { a: 1, rgb: hexToRgb(s.highlightColor) } });
-
-		let skipped = 0;
-		if (s.branchColors) {
-			const palette = document.body.hasClass("theme-dark") ? PALETTE.dark : PALETTE.light;
-			const roots = this.buildTree().sort((a, b) => a.name.localeCompare(b.name));
-			roots.forEach((root, i) => {
-				if (i >= palette.length) {
-					skipped++;
-					return;
-				}
-				const folder = root.id.slice(0, root.id.lastIndexOf("/"));
-				ours.push({ query: `path:/^${escapeRegex(folder)}\\//`, color: { a: 1, rgb: hexToRgb(palette[i]) } });
-			});
+		const managed = new Set(s.managedGraphQueries);
+		let groups = (cfg.colorGroups ?? []).filter((g) => !(managed.has(g.query) && isBranchQuery(g.query)));
+		const nextManaged = s.managedGraphQueries.filter((q) => !isBranchQuery(q));
+		if (addIndexGroup) {
+			const query = `tag:#${tag}`;
+			groups = [{ query, color: { a: 1, rgb: hexToRgb(s.highlightColor) } }, ...groups.filter((g) => g.query !== query)];
+			if (!nextManaged.includes(query)) nextManaged.push(query);
 		}
 
-		const managed = new Set(s.managedGraphQueries);
-		const userGroups = (cfg.colorGroups ?? []).filter((g) => !managed.has(g.query) && !ours.some((o) => o.query === g.query));
-		const next = [...ours, ...userGroups];
-		const changed = JSON.stringify(next) !== JSON.stringify(cfg.colorGroups ?? []);
-
-		if (changed) {
-			cfg.colorGroups = next;
+		if (JSON.stringify(groups) !== JSON.stringify(cfg.colorGroups ?? [])) {
+			cfg.colorGroups = groups;
 			await adapter.write(path, JSON.stringify(cfg, null, 2));
 			try {
 				const graph = (this.app as AppWithInternals).internalPlugins?.getPluginById?.("graph");
 				const opts = graph?.instance?.options;
-				if (opts) opts.colorGroups = next;
+				if (opts) opts.colorGroups = groups;
 			} catch {
 				/* ignore */
 			}
 		}
-		s.managedGraphQueries = ours.map((g) => g.query);
-		await this.plugin.saveSettings();
-
+		if (JSON.stringify(nextManaged) !== JSON.stringify(s.managedGraphQueries)) {
+			s.managedGraphQueries = nextManaged;
+			await this.plugin.saveSettings();
+		}
 		if (notify) {
-			const extra = skipped ? ` Веток больше 8 — ещё ${skipped} остались без своего цвета.` : "";
-			new Notice(`Folder Hub: цвета веток записаны.${extra} Закройте и снова откройте граф.`, 8000);
+			new Notice("Folder Hub: цвет главных файлов добавлен в граф. Закройте и снова откройте граф.", 8000);
 		}
 	}
 }

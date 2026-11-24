@@ -1281,8 +1281,180 @@ var GraphTree = class {
 
 // src/graph-fx.ts
 var import_obsidian6 = require("obsidian");
+
+// src/rays.ts
+var RAY_STYLES = {
+  spark: "\u0418\u0441\u043A\u0440\u0430",
+  beam: "\u041B\u0443\u0447",
+  energy: "\u042D\u043D\u0435\u0440\u0433\u0438\u044F",
+  lightning: "\u042D\u043B\u0435\u043A\u0442\u0440\u0438\u0447\u0435\u0441\u0442\u0432\u043E"
+};
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = a + 1831565813 >>> 0;
+    let t = a;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var lerp = (a, b, k) => ({ x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k });
+var WHITE = (a) => `rgba(255,255,255,${a})`;
+function drawRay(ctx, a, b, p) {
+  const len = Math.hypot(b.x - a.x, b.y - a.y);
+  if (len < 2 || p.alpha <= 0.01 || p.head <= 0) return;
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  switch (p.style) {
+    case "beam":
+      drawBeam(ctx, a, b, len, p);
+      break;
+    case "energy":
+      drawEnergy(ctx, a, b, len, p);
+      break;
+    case "lightning":
+      drawLightning(ctx, a, b, len, p);
+      break;
+    default:
+      drawSpark(ctx, a, b, p);
+  }
+  ctx.restore();
+}
+function drawSpark(ctx, a, b, p) {
+  const k = p.constant ? (p.t * 0.55 + p.seed * 0.137) % 1 : p.head;
+  const h = lerp(a, b, k);
+  ctx.shadowColor = p.color(0.9 * p.alpha);
+  ctx.shadowBlur = 10;
+  ctx.fillStyle = p.color(0.95 * p.alpha);
+  ctx.beginPath();
+  ctx.arc(h.x, h.y, 2.6 * p.width, 0, Math.PI * 2);
+  ctx.fill();
+}
+function drawBeam(ctx, a, b, _len, p) {
+  let alpha = p.alpha;
+  if (p.constant) alpha *= 0.55 + 0.45 * Math.sin(p.t * 3.2 + p.seed);
+  const head = lerp(a, b, p.head);
+  const tail = p.constant ? a : lerp(a, b, Math.max(0, p.head - 0.5));
+  ctx.shadowColor = p.color(alpha);
+  ctx.shadowBlur = 14;
+  ctx.strokeStyle = p.color(0.22 * alpha);
+  ctx.lineWidth = 6 * p.width;
+  ctx.beginPath();
+  ctx.moveTo(tail.x, tail.y);
+  ctx.lineTo(head.x, head.y);
+  ctx.stroke();
+  const g = ctx.createLinearGradient(tail.x, tail.y, head.x, head.y);
+  g.addColorStop(0, p.color(p.constant ? 0.5 * alpha : 0));
+  g.addColorStop(0.7, p.color(0.9 * alpha));
+  g.addColorStop(1, WHITE(alpha));
+  ctx.shadowBlur = 6;
+  ctx.strokeStyle = g;
+  ctx.lineWidth = 1.8 * p.width;
+  ctx.beginPath();
+  ctx.moveTo(tail.x, tail.y);
+  ctx.lineTo(head.x, head.y);
+  ctx.stroke();
+  if (!p.constant && p.head < 1) {
+    ctx.fillStyle = WHITE(alpha);
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.arc(head.x, head.y, 2.4 * p.width, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+function drawEnergy(ctx, a, b, len, p) {
+  const ux = (b.x - a.x) / len;
+  const uy = (b.y - a.y) / len;
+  const nx = -uy;
+  const ny = ux;
+  const amp = 3.6 * p.width;
+  const steps = Math.max(10, Math.round(len * p.head / 5));
+  const at = (s, phaseShift) => {
+    const taper = Math.sin(Math.PI * Math.min(1, s));
+    const off = amp * taper * Math.sin(s * len / 9 - p.t * 7 + p.seed + phaseShift);
+    return { x: a.x + ux * s * len + nx * off, y: a.y + uy * s * len + ny * off };
+  };
+  for (const [shift, width, alpha] of [
+    [0, 4.5, 0.22],
+    [0, 1.6, 0.95],
+    [Math.PI, 1.1, 0.6]
+  ]) {
+    ctx.shadowColor = p.color(p.alpha);
+    ctx.shadowBlur = width > 2 ? 16 : 8;
+    ctx.strokeStyle = p.color(alpha * p.alpha);
+    ctx.lineWidth = width * p.width;
+    ctx.beginPath();
+    for (let i = 0; i <= steps; i++) {
+      const pt = at(i / steps * p.head, shift);
+      if (i === 0) ctx.moveTo(pt.x, pt.y);
+      else ctx.lineTo(pt.x, pt.y);
+    }
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 12;
+  for (let j = 0; j < 3; j++) {
+    const s = (p.t * 0.7 + j / 3 + p.seed * 0.171) % 1;
+    if (s > p.head) continue;
+    const pt = at(s, 0);
+    ctx.fillStyle = WHITE(0.9 * p.alpha);
+    ctx.beginPath();
+    ctx.arc(pt.x, pt.y, 2.2 * p.width, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+function drawLightning(ctx, a, b, len, p) {
+  const r = rng(Math.floor(p.t * 18) * 9973 + p.seed * 7919);
+  const end = lerp(a, b, p.head);
+  const segLen = Math.hypot(end.x - a.x, end.y - a.y);
+  if (segLen < 2) return;
+  const ux = (end.x - a.x) / segLen;
+  const uy = (end.y - a.y) / segLen;
+  const nx = -uy;
+  const ny = ux;
+  const n = Math.max(4, Math.round(segLen / 13));
+  const jitter = Math.min(14, len * 0.08) * (0.7 + 0.3 * p.width);
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const s = i / n;
+    const off = i === 0 || i === n ? 0 : (r() * 2 - 1) * jitter * Math.sin(Math.PI * s);
+    pts.push({ x: a.x + ux * s * segLen + nx * off, y: a.y + uy * s * segLen + ny * off });
+  }
+  const alpha = p.alpha * (0.55 + r() * 0.45);
+  const stroke = (path, width, style, blur) => {
+    ctx.shadowColor = p.color(alpha);
+    ctx.shadowBlur = blur;
+    ctx.strokeStyle = style;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    path.forEach((pt, i) => i ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y));
+    ctx.stroke();
+  };
+  stroke(pts, 4.5 * p.width, p.color(0.35 * alpha), 18);
+  stroke(pts, 1.3 * p.width, WHITE(0.95 * alpha), 6);
+  for (let i = 1; i < pts.length - 1; i++) {
+    if (r() > 0.2) continue;
+    const dir = Math.atan2(uy, ux) + (r() < 0.5 ? -1 : 1) * (0.4 + r() * 0.6);
+    const branch = [pts[i]];
+    let cur = pts[i];
+    const parts = 2 + Math.floor(r() * 2);
+    for (let k = 0; k < parts; k++) {
+      const l = 6 + r() * 10;
+      const d = dir + (r() * 2 - 1) * 0.5;
+      cur = { x: cur.x + Math.cos(d) * l, y: cur.y + Math.sin(d) * l };
+      branch.push(cur);
+    }
+    stroke(branch, 2.4 * p.width, p.color(0.3 * alpha), 10);
+    stroke(branch, 0.8 * p.width, WHITE(0.8 * alpha), 4);
+  }
+}
+
+// src/graph-fx.ts
 var MAX_LINKS = 1500;
 var TRAVEL = 0.9;
+var LINGER = 0.35;
+var MAX_RAYS = 400;
 var RING = 1.4;
 function rgba(hex, alpha) {
   const h = hex.replace("#", "");
@@ -1472,23 +1644,25 @@ var GraphFx = class {
       }
     }
     if (s.fxWave && links.length) {
-      ctx.save();
-      ctx.shadowColor = rgba(s.fxColor, 0.9);
-      ctx.shadowBlur = 10;
-      ctx.fillStyle = rgba(s.fxColor, 0.95);
-      for (const l of links) {
-        if (!hubs.has(l.source.id)) continue;
-        const age = phase - emitAt(l.source.id);
-        if (age < 0 || age > TRAVEL) continue;
+      const color = (a) => rgba(s.fxColor, a);
+      const constant = s.rayMode === "constant";
+      let count = 0;
+      links.forEach((l, i) => {
+        if (count >= MAX_RAYS || !hubs.has(l.source.id)) return;
+        let head = 1;
+        let alpha = 1;
+        if (!constant) {
+          const age = phase - emitAt(l.source.id);
+          if (age < 0 || age > TRAVEL + LINGER) return;
+          head = easeInOut(Math.min(1, age / TRAVEL));
+          alpha = age <= TRAVEL ? 1 : 1 - (age - TRAVEL) / LINGER;
+        }
         const a = pos(l.source);
         const b = pos(l.target);
-        if (!onScreen(a) && !onScreen(b)) continue;
-        const k = easeInOut(age / TRAVEL);
-        ctx.beginPath();
-        ctx.arc(a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k, 2.6, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.restore();
+        if (!onScreen(a) && !onScreen(b)) return;
+        count++;
+        drawRay(ctx, a, b, { style: s.rayStyle, head, alpha, t, seed: i, color, width: s.rayWidth, constant });
+      });
     }
     for (const b of this.bursts) {
       const n = nodes.find((x) => x.id === b.id);
@@ -1710,6 +1884,9 @@ var DEFAULT_SETTINGS = {
   fxInterval: 4,
   fxRing: true,
   fxWave: true,
+  rayStyle: "beam",
+  rayMode: "pulse",
+  rayWidth: 1,
   fxGlow: false,
   linkFlow: "hubs",
   linkFlowColor: "#9a9a9a",
@@ -2045,12 +2222,36 @@ var FolderHubSettingTab = class extends import_obsidian7.PluginSettingTab {
         await save();
       })
     );
-    new import_obsidian7.Setting(containerEl).setName("\u0412\u043E\u043B\u043D\u0430 \u043F\u043E \u0432\u0435\u0442\u043A\u0435").setDesc("\u0418\u0441\u043A\u0440\u0430 \u0431\u0435\u0436\u0438\u0442 \u043E\u0442 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430 \u043F\u043E \u0441\u0432\u044F\u0437\u044F\u043C \u043A \u0444\u0430\u0439\u043B\u0430\u043C \u0438 \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0430\u043C, \u0434\u0430\u043B\u044C\u0448\u0435 \u2014 \u0433\u043B\u0443\u0431\u0436\u0435 \u043F\u043E \u0432\u0435\u0442\u043A\u0435.").addToggle(
+    new import_obsidian7.Setting(containerEl).setName("\u041B\u0443\u0447\u0438 \u043F\u043E \u0441\u0432\u044F\u0437\u044F\u043C").setDesc("\u041E\u0442 \u0433\u043B\u0430\u0432\u043D\u043E\u0433\u043E \u0444\u0430\u0439\u043B\u0430 \u043F\u043E \u0441\u0432\u044F\u0437\u044F\u043C \u043A \u0444\u0430\u0439\u043B\u0430\u043C \u0438 \u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0430\u043C \u0431\u0435\u0433\u0443\u0442 \u043B\u0443\u0447\u0438.").addToggle(
       (t) => t.setValue(s.fxWave).onChange(async (v) => {
         s.fxWave = v;
         await save();
+        this.display();
       })
     );
+    if (s.fxWave) {
+      new import_obsidian7.Setting(containerEl).setName("\u0412\u0438\u0434 \u043B\u0443\u0447\u0430").setDesc("\u0418\u0441\u043A\u0440\u0430 \u2014 \u0441\u0432\u0435\u0442\u044F\u0449\u0430\u044F\u0441\u044F \u0442\u043E\u0447\u043A\u0430; \u041B\u0443\u0447 \u2014 \u043B\u0430\u0437\u0435\u0440 \u0441 \u044F\u0440\u043A\u0438\u043C \u043A\u043E\u043D\u0446\u043E\u043C; \u042D\u043D\u0435\u0440\u0433\u0438\u044F \u2014 \u0432\u043E\u043B\u043D\u0438\u0441\u0442\u044B\u0439 \u043F\u043E\u0442\u043E\u043A \u043F\u043B\u0430\u0437\u043C\u044B; \u042D\u043B\u0435\u043A\u0442\u0440\u0438\u0447\u0435\u0441\u0442\u0432\u043E \u2014 \u043C\u0435\u0440\u0446\u0430\u044E\u0449\u0430\u044F \u043C\u043E\u043B\u043D\u0438\u044F \u0441 \u0440\u0430\u0437\u0440\u044F\u0434\u0430\u043C\u0438.").addDropdown(
+        (d) => d.addOptions(RAY_STYLES).setValue(s.rayStyle).onChange(async (v) => {
+          s.rayStyle = v;
+          await save();
+        })
+      );
+      new import_obsidian7.Setting(containerEl).setName("\u0420\u0435\u0436\u0438\u043C \u043B\u0443\u0447\u0435\u0439").addDropdown(
+        (d) => d.addOptions({
+          pulse: "\u041F\u043E \u0438\u043C\u043F\u0443\u043B\u044C\u0441\u0443 \u2014 \u0432\u043E\u043B\u043D\u043E\u0439 \u043F\u043E \u0432\u0435\u0442\u043A\u0435",
+          constant: "\u041F\u043E\u0441\u0442\u043E\u044F\u043D\u043D\u043E"
+        }).setValue(s.rayMode).onChange(async (v) => {
+          s.rayMode = v;
+          await save();
+        })
+      );
+      new import_obsidian7.Setting(containerEl).setName("\u0422\u043E\u043B\u0449\u0438\u043D\u0430 \u043B\u0443\u0447\u0435\u0439").addSlider(
+        (sl) => sl.setLimits(0.5, 3, 0.25).setValue(s.rayWidth).setDynamicTooltip().onChange(async (v) => {
+          s.rayWidth = v;
+          await save();
+        })
+      );
+    }
     new import_obsidian7.Setting(containerEl).setName("\u0421\u0432\u0435\u0447\u0435\u043D\u0438\u0435").setDesc("\u0413\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u043C\u044F\u0433\u043A\u043E \xAB\u0434\u044B\u0448\u0430\u0442\xBB \u0441\u0432\u0435\u0442\u043E\u043C.").addToggle(
       (t) => t.setValue(s.fxGlow).onChange(async (v) => {
         s.fxGlow = v;

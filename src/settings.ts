@@ -2,6 +2,7 @@ import { App, PluginSettingTab, Setting } from "obsidian";
 import type FolderHubPlugin from "./main";
 import type { Layout, SortBy, SortOrder } from "./render";
 import { DIRECTIONS, TreeStyle } from "./skilltree";
+import { RAY_STYLES, RayStyle } from "./rays";
 
 export interface FolderHubSettings {
 	// Creation
@@ -65,6 +66,9 @@ export interface FolderHubSettings {
 	fxInterval: number;
 	fxRing: boolean;
 	fxWave: boolean;
+	rayStyle: RayStyle;
+	rayMode: "pulse" | "constant";
+	rayWidth: number;
 	fxGlow: boolean;
 	linkFlow: "off" | "all" | "hubs";
 	linkFlowColor: string;
@@ -136,6 +140,9 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	fxInterval: 4,
 	fxRing: true,
 	fxWave: true,
+	rayStyle: "beam",
+	rayMode: "pulse",
+	rayWidth: 1,
 	fxGlow: false,
 	linkFlow: "hubs",
 	linkFlowColor: "#9a9a9a",
@@ -689,14 +696,58 @@ export class FolderHubSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Волна по ветке")
-			.setDesc("Искра бежит от главного файла по связям к файлам и подпапкам, дальше — глубже по ветке.")
+			.setName("Лучи по связям")
+			.setDesc("От главного файла по связям к файлам и подпапкам бегут лучи.")
 			.addToggle((t) =>
 				t.setValue(s.fxWave).onChange(async (v) => {
 					s.fxWave = v;
 					await save();
+					this.display();
 				}),
 			);
+
+		if (s.fxWave) {
+			new Setting(containerEl)
+				.setName("Вид луча")
+				.setDesc("Искра — светящаяся точка; Луч — лазер с ярким концом; Энергия — волнистый поток плазмы; Электричество — мерцающая молния с разрядами.")
+				.addDropdown((d) =>
+					d
+						.addOptions(RAY_STYLES)
+						.setValue(s.rayStyle)
+						.onChange(async (v) => {
+							s.rayStyle = v as RayStyle;
+							await save();
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Режим лучей")
+				.addDropdown((d) =>
+					d
+						.addOptions({
+							pulse: "По импульсу — волной по ветке",
+							constant: "Постоянно",
+						})
+						.setValue(s.rayMode)
+						.onChange(async (v) => {
+							s.rayMode = v as FolderHubSettings["rayMode"];
+							await save();
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName("Толщина лучей")
+				.addSlider((sl) =>
+					sl
+						.setLimits(0.5, 3, 0.25)
+						.setValue(s.rayWidth)
+						.setDynamicTooltip()
+						.onChange(async (v) => {
+							s.rayWidth = v;
+							await save();
+						}),
+				);
+		}
 
 		new Setting(containerEl)
 			.setName("Свечение")

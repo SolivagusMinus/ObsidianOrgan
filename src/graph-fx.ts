@@ -1,5 +1,6 @@
 import { Platform, View } from "obsidian";
 import type FolderHubPlugin from "./main";
+import { drawRay } from "./rays";
 
 // ---------------------------------------------------------------------------
 // Visual effects drawn on a transparent canvas laid over the graph view:
@@ -47,6 +48,8 @@ interface Burst {
 
 const MAX_LINKS = 1500;
 const TRAVEL = 0.9; // seconds for a wave to cross one link
+const LINGER = 0.35; // seconds a ray stays visible after arriving
+const MAX_RAYS = 400;
 const RING = 1.4; // seconds a ring lives
 
 function rgba(hex: string, alpha: number): string {
@@ -264,25 +267,27 @@ export class GraphFx {
 			}
 		}
 
-		// ---- wave: a glowing spark runs from each hub along its links
+		// ---- rays: spark / beam / energy / electricity from each hub along its links
 		if (s.fxWave && links.length) {
-			ctx.save();
-			ctx.shadowColor = rgba(s.fxColor, 0.9);
-			ctx.shadowBlur = 10;
-			ctx.fillStyle = rgba(s.fxColor, 0.95);
-			for (const l of links) {
-				if (!hubs.has(l.source.id)) continue;
-				const age = phase - emitAt(l.source.id);
-				if (age < 0 || age > TRAVEL) continue;
+			const color = (a: number) => rgba(s.fxColor, a);
+			const constant = s.rayMode === "constant";
+			let count = 0;
+			links.forEach((l, i) => {
+				if (count >= MAX_RAYS || !hubs.has(l.source.id)) return;
+				let head = 1;
+				let alpha = 1;
+				if (!constant) {
+					const age = phase - emitAt(l.source.id);
+					if (age < 0 || age > TRAVEL + LINGER) return;
+					head = easeInOut(Math.min(1, age / TRAVEL));
+					alpha = age <= TRAVEL ? 1 : 1 - (age - TRAVEL) / LINGER;
+				}
 				const a = pos(l.source);
 				const b = pos(l.target);
-				if (!onScreen(a) && !onScreen(b)) continue;
-				const k = easeInOut(age / TRAVEL);
-				ctx.beginPath();
-				ctx.arc(a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k, 2.6, 0, Math.PI * 2);
-				ctx.fill();
-			}
-			ctx.restore();
+				if (!onScreen(a) && !onScreen(b)) return;
+				count++;
+				drawRay(ctx, a, b, { style: s.rayStyle, head, alpha, t, seed: i, color, width: s.rayWidth, constant });
+			});
 		}
 
 		// ---- level-up bursts: three big rings

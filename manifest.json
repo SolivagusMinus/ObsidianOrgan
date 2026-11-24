@@ -1,0 +1,9 @@
+{
+  "id": "folder-hub",
+  "name": "Folder Hub",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Автоматически создаёт в каждой папке главный файл с её именем и держит в нём [[ссылки]] на все файлы папки — связи видны в графе.",
+  "author": "SolivagusMinus",
+  "isDesktopOnly": false
+}

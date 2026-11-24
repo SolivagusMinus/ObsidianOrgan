@@ -1,0 +1,541 @@
+import {
+	App,
+	Menu,
+	Notice,
+	Plugin,
+	TAbstractFile,
+	TFile,
+	TFolder,
+	moment,
+	normalizePath,
+} from "obsidian";
+import {
+	BLOCK_START,
+	Item,
+	RenderOptions,
+	applyBlock,
+	baseName,
+	buildBlock,
+	cssString,
+	extractBlockBody,
+	fillNoteTemplate,
+	mergePreserving,
+	parentPath,
+	renderItems,
+	sortItems,
+} from "./render";
+import { DEFAULT_SETTINGS, FolderHubSettings, FolderHubSettingTab } from "./settings";
+
+/** Frontmatter key that marks a note as a folder index. */
+export const INDEX_KEY = "folder-index";
+
+export default class FolderHubPlugin extends Plugin {
+	settings!: FolderHubSettings;
+
+	private pending = new Set<string>();
+	private flushTimer: number | null = null;
+	private highlightTimer: number | null = null;
+	private queue: Promise<void> = Promise.resolve();
+	private styleEl: HTMLStyleElement | null = null;
+
+	async onload() {
+		await this.loadSettings();
+		this.addSettingTab(new FolderHubSettingTab(this.app, this));
+
+		this.styleEl = document.head.createEl("style", { attr: { id: "folder-hub-dynamic" } });
+		this.register(() => this.styleEl?.remove());
+
+		this.addCommand({
+			id: "create-index-current-folder",
+			name: "Создать/обновить главный файл в папке текущей заметки",
+			checkCallback: (checking) => {
+				const folder = this.app.workspace.getActiveFile()?.parent;
+				if (!folder || folder.isRoot()) return false;
+				if (!checking) void this.createIndex(folder, true);
+				return true;
+			},
+		});
+		this.addCommand({
+			id: "open-index-current-folder",
+			name: "Открыть главный файл текущей папки",
+			checkCallback: (checking) => {
+				const folder = this.app.workspace.getActiveFile()?.parent;
+				const index = folder && !folder.isRoot() ? this.findIndex(folder) : null;
+				if (!index) return false;
+				if (!checking) void this.app.workspace.getLeaf(false).openFile(index);
+				return true;
+			},
+		});
+		this.addCommand({
+			id: "create-index-all-folders",
+			name: "Создать главные файлы во всех папках хранилища",
+			callback: () => void this.createAll(),
+		});
+		this.addCommand({
+			id: "update-all-indexes",
+			name: "Обновить все главные файлы",
+			callback: async () => {
+				const n = await this.updateAll(false);
+				new Notice(`Folder Hub: обновлено файлов — ${n}`);
+			},
+		});
+		this.addCommand({
+			id: "rebuild-all-indexes",
+			name: "Перестроить все главные файлы заново (сбросить правки внутри блока)",
+			callback: async () => {
+				const n = await this.updateAll(true);
+				new Notice(`Folder Hub: перестроено файлов — ${n}`);
+			},
+		});
+
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu: Menu, file: TAbstractFile) => {
+				if (!(file instanceof TFolder) || file.isRoot()) return;
+				const index = this.findIndex(file);
+				if (index) {
+					menu.addItem((i) =>
+						i
+							.setTitle("Открыть главный файл папки")
+							.setIcon("star")
+							.onClick(() => this.app.workspace.getLeaf(false).openFile(index)),
+					);
+					menu.addItem((i) =>
+						i
+							.setTitle("Обновить главный файл папки")
+							.setIcon("refresh-cw")
+							.onClick(() => this.enqueue(() => this.updateFolder(file, false))),
+					);
+				} else {
+					menu.addItem((i) =>
+						i
+							.setTitle("Создать главный файл папки")
+							.setIcon("star")
+							.onClick(() => this.createIndex(file, true)),
+					);
+				}
+			}),
+		);
+
+		// Vault events fire for every file during startup, so subscribe only once
+		// the workspace is ready.
+		this.app.workspace.onLayoutReady(() => {
+			this.registerEvent(this.app.vault.on("create", (f) => this.onCreate(f)));
+			this.registerEvent(this.app.vault.on("delete", (f) => this.onDelete(f)));
+			this.registerEvent(this.app.vault.on("rename", (f, old) => this.onRename(f, old)));
+			// Catch up with changes made while Obsidian was closed.
+			void this.updateAll(false);
+			this.refreshHighlight();
+		});
+	}
+
+	onunload() {
+		if (this.flushTimer !== null) window.clearTimeout(this.flushTimer);
+		if (this.highlightTimer !== null) window.clearTimeout(this.highlightTimer);
+	}
+
+	async loadSettings() {
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+	}
+
+	async saveSettings() {
+		await this.saveData(this.settings);
+		this.refreshHighlight();
+	}
+
+	// ---------------------------------------------------------------- events
+
+	private onCreate(file: TAbstractFile) {
+		if (file instanceof TFolder && this.settings.autoCreate && !this.isExcluded(file)) {
+			// Small delay: sync tools may deliver the folder's existing index right
+			// after the folder itself, and we don't want a duplicate.
+			window.setTimeout(() => {
+				const folder = this.app.vault.getAbstractFileByPath(file.path);
+				if (folder instanceof TFolder && !this.findIndex(folder)) {
+					void this.createIndex(folder, false);
+				}
+			}, 800);
+		}
+		this.scheduleAncestors(parentPath(file.path));
+	}
+
+	private onDelete(file: TAbstractFile) {
+		this.scheduleAncestors(parentPath(file.path));
+		this.refreshHighlight();
+	}
+
+	private onRename(file: TAbstractFile, oldPath: string) {
+		if (file instanceof TFolder && this.settings.renameWithFolder) {
+			const oldName = baseName(oldPath);
+			if (oldName !== file.name) {
+				// Obsidian also fires rename for every child; let that settle first.
+				window.setTimeout(() => void this.renameIndexWithFolder(file, oldName), 150);
+			}
+		}
+		const oldParent = parentPath(oldPath);
+		const newParent = parentPath(file.path);
+		this.scheduleAncestors(oldParent);
+		if (newParent !== oldParent) this.scheduleAncestors(newParent);
+		this.refreshHighlight();
+	}
+
+	private async renameIndexWithFolder(folder: TFolder, oldFolderName: string) {
+		if (!(this.app.vault.getAbstractFileByPath(folder.path) instanceof TFolder)) return;
+		const oldIndex = this.app.vault.getAbstractFileByPath(
+			normalizePath(`${folder.path}/${this.indexNameFor(oldFolderName)}.md`),
+		);
+		const newPath = this.expectedIndexPath(folder);
+		if (!(oldIndex instanceof TFile) || oldIndex.path === newPath) return;
+		if (this.app.vault.getAbstractFileByPath(newPath)) return;
+		try {
+			// fileManager.renameFile also rewrites links to the note.
+			await this.app.fileManager.renameFile(oldIndex, newPath);
+		} catch (e) {
+			console.error("Folder Hub: failed to rename index", e);
+		}
+	}
+
+	// ------------------------------------------------------------ scheduling
+
+	/** Schedules an update for the folder at `path` and all its ancestors. */
+	private scheduleAncestors(path: string) {
+		let p = path;
+		while (p && p !== "/") {
+			this.pending.add(p);
+			p = parentPath(p);
+		}
+		if (this.flushTimer !== null) window.clearTimeout(this.flushTimer);
+		this.flushTimer = window.setTimeout(() => {
+			this.flushTimer = null;
+			const paths = [...this.pending];
+			this.pending.clear();
+			// Deepest folders first, so sub-index notes exist before parents link them.
+			paths.sort((a, b) => b.split("/").length - a.split("/").length);
+			for (const p of paths) {
+				const folder = this.app.vault.getAbstractFileByPath(p);
+				if (folder instanceof TFolder) this.enqueue(() => this.updateFolder(folder, false));
+			}
+		}, 400);
+	}
+
+	/** Serialises writes so two updates never race on the same note. */
+	private enqueue(task: () => Promise<unknown>): Promise<void> {
+		this.queue = this.queue.then(task).then(
+			() => undefined,
+			(e) => console.error("Folder Hub:", e),
+		);
+		return this.queue;
+	}
+
+	// --------------------------------------------------------- index lookup
+
+	indexNameFor(folderName: string): string {
+		const name = this.settings.indexName.replace(/\{\{folder\}\}/g, folderName).trim();
+		return name || folderName;
+	}
+
+	expectedIndexPath(folder: TFolder): string {
+		return normalizePath(`${folder.path}/${this.indexNameFor(folder.name)}.md`);
+	}
+
+	findIndex(folder: TFolder): TFile | null {
+		if (folder.isRoot()) return null;
+		const byName = this.app.vault.getAbstractFileByPath(this.expectedIndexPath(folder));
+		if (byName instanceof TFile) return byName;
+		for (const child of folder.children) {
+			if (
+				child instanceof TFile &&
+				child.extension === "md" &&
+				this.app.metadataCache.getFileCache(child)?.frontmatter?.[INDEX_KEY] === true
+			) {
+				return child;
+			}
+		}
+		return null;
+	}
+
+	isExcluded(folder: TFolder): boolean {
+		if (folder.isRoot()) return true;
+		const list = this.settings.excludedFolders
+			.split("\n")
+			.map((s) => normalizePath(s.trim()))
+			.filter((s) => s && s !== "/");
+		return list.some((p) => folder.path === p || folder.path.startsWith(p + "/"));
+	}
+
+	private allFolders(): TFolder[] {
+		return this.app.vault
+			.getAllLoadedFiles()
+			.filter((f): f is TFolder => f instanceof TFolder && !f.isRoot());
+	}
+
+	// -------------------------------------------------------- index content
+
+	private fileAllowed(file: TFile): boolean {
+		if (!this.settings.includeNonMarkdown && file.extension !== "md") return false;
+		const excluded = this.settings.excludedExtensions
+			.split(",")
+			.map((s) => s.trim().replace(/^\./, "").toLowerCase())
+			.filter(Boolean);
+		return !excluded.includes(file.extension.toLowerCase());
+	}
+
+	private collectItems(folder: TFolder, index: TFile): Item[] {
+		const files = new Map<string, { file: TFile; sub: boolean }>();
+		const walk = (dir: TFolder) => {
+			for (const child of dir.children) {
+				if (child instanceof TFile) {
+					if (child === index) continue;
+					// Index notes of nested folders are handled in the folder branch.
+					if (dir !== folder && this.findIndex(dir) === child) continue;
+					if (this.fileAllowed(child)) files.set(child.path, { file: child, sub: false });
+				} else if (child instanceof TFolder) {
+					if (this.isExcluded(child)) continue;
+					const sub = this.findIndex(child);
+					if (sub && this.settings.linkSubfolderIndexes) {
+						files.set(sub.path, { file: sub, sub: true });
+					}
+					if (this.settings.includeNested) walk(child);
+				}
+			}
+		};
+		walk(folder);
+
+		const items: Item[] = [];
+		for (const { file, sub } of files.values()) {
+			items.push({
+				linktext: this.app.metadataCache.fileToLinktext(file, index.path, true),
+				name: file.basename,
+				ext: file.extension,
+				path: file.path,
+				ctime: file.stat.ctime,
+				mtime: file.stat.mtime,
+				isSubIndex: sub,
+			});
+		}
+		return sortItems(items, this.settings.sortBy, this.settings.sortOrder, this.settings.subfoldersFirst);
+	}
+
+	private renderOptions(): RenderOptions {
+		const fmt = this.settings.dateFormat || "YYYY-MM-DD";
+		return {
+			layout: this.settings.layout,
+			columns: this.settings.columns,
+			tableHeaders: this.settings.tableHeaders,
+			itemTemplate: this.settings.itemTemplate,
+			formatDate: (ms) => moment(ms).format(fmt),
+		};
+	}
+
+	private computeBody(index: TFile, items: Item[], content: string, force: boolean): string[] {
+		const opts = this.renderOptions();
+		const existing = extractBlockBody(content);
+		const preserve =
+			!force && this.settings.preserveEdits && this.settings.layout !== "table" && existing !== null;
+		if (!preserve) return renderItems(items, opts);
+		return mergePreserving(
+			existing,
+			items,
+			(linkpath) => this.app.metadataCache.getFirstLinkpathDest(linkpath, index.path)?.path ?? null,
+			opts,
+		);
+	}
+
+	/** Rewrites the managed block of the folder's index note. Returns true if it changed. */
+	async updateFolder(folder: TFolder, force: boolean): Promise<boolean> {
+		if (!(this.app.vault.getAbstractFileByPath(folder.path) instanceof TFolder)) return false;
+		if (this.isExcluded(folder)) return false;
+		const index = this.findIndex(folder);
+		if (!index) return false;
+
+		const items = this.collectItems(folder, index);
+		const current = await this.app.vault.read(index);
+		const next = applyBlock(current, this.computeBody(index, items, current, force));
+		if (next === current) return false;
+
+		await this.app.vault.process(index, (data) =>
+			applyBlock(data, this.computeBody(index, items, data, force)),
+		);
+		return true;
+	}
+
+	async updateAll(force: boolean): Promise<number> {
+		let changed = 0;
+		const folders = this.allFolders().sort(
+			(a, b) => b.path.split("/").length - a.path.split("/").length,
+		);
+		for (const folder of folders) {
+			await this.enqueue(async () => {
+				if (await this.updateFolder(folder, force)) changed++;
+			});
+		}
+		return changed;
+	}
+
+	async createIndex(folder: TFolder, open: boolean): Promise<TFile | null> {
+		if (folder.isRoot()) return null;
+		let index = this.findIndex(folder);
+
+		if (!index) {
+			const path = this.expectedIndexPath(folder);
+			try {
+				// Create with an empty block first so the index exists before we
+				// compute links relative to it.
+				const content = fillNoteTemplate(
+					this.settings.newNoteTemplate,
+					{
+						folder: folder.name,
+						tag: this.settings.tag.replace(/^#/, "").trim(),
+						date: moment().format(this.settings.dateFormat || "YYYY-MM-DD"),
+					},
+					buildBlock([]),
+				);
+				index = await this.app.vault.create(path, content);
+			} catch (e) {
+				// Most likely the file appeared in the meantime (sync, double event).
+				const existing = this.app.vault.getAbstractFileByPath(path);
+				if (!(existing instanceof TFile)) {
+					console.error("Folder Hub: failed to create index", e);
+					new Notice(`Folder Hub: не удалось создать ${path}`);
+					return null;
+				}
+				index = existing;
+			}
+		} else {
+			await this.adoptExisting(index);
+		}
+
+		await this.enqueue(() => this.updateFolder(folder, false));
+		this.scheduleAncestors(parentPath(folder.path));
+		this.refreshHighlight();
+		if (open) await this.app.workspace.getLeaf(false).openFile(index);
+		return index;
+	}
+
+	/** Makes an existing note a proper index: frontmatter flag, tag, block. */
+	private async adoptExisting(index: TFile) {
+		const tag = this.settings.tag.replace(/^#/, "").trim();
+		await this.app.fileManager.processFrontMatter(index, (fm: Record<string, unknown>) => {
+			fm[INDEX_KEY] = true;
+			if (tag) {
+				const tags = fm.tags;
+				const list = Array.isArray(tags)
+					? tags.map(String)
+					: typeof tags === "string"
+						? tags.split(/[,\s]+/).filter(Boolean)
+						: [];
+				if (!list.map((t) => t.replace(/^#/, "")).includes(tag)) list.push(tag);
+				fm.tags = list;
+			}
+		});
+		const content = await this.app.vault.read(index);
+		if (!content.includes(BLOCK_START)) {
+			await this.app.vault.process(index, (data) => applyBlock(data, []));
+		}
+	}
+
+	async createAll() {
+		let created = 0;
+		for (const folder of this.allFolders()) {
+			if (this.isExcluded(folder) || this.findIndex(folder)) continue;
+			if (await this.createIndex(folder, false)) created++;
+		}
+		new Notice(`Folder Hub: создано главных файлов — ${created}`);
+	}
+
+	// ------------------------------------------------------------ highlight
+
+	refreshHighlight() {
+		if (this.highlightTimer !== null) window.clearTimeout(this.highlightTimer);
+		this.highlightTimer = window.setTimeout(() => {
+			this.highlightTimer = null;
+			if (this.styleEl) this.styleEl.textContent = this.buildCss();
+		}, 200);
+	}
+
+	private buildCss(): string {
+		const s = this.settings;
+		const color = /^#[0-9a-fA-F]{3,8}$/.test(s.highlightColor) ? s.highlightColor : "#e5a50a";
+		const rules: string[] = [`body { --folder-hub-color: ${color}; }`];
+		if (!s.highlightEnabled) return rules.join("\n");
+
+		const filePaths: string[] = [];
+		const folderPaths: string[] = [];
+		for (const folder of this.allFolders()) {
+			const index = this.findIndex(folder);
+			if (!index) continue;
+			filePaths.push(index.path);
+			folderPaths.push(folder.path);
+		}
+
+		const weight = s.highlightBold ? "font-weight: 600;" : "";
+		const icon = s.highlightIcon ? `content: ${cssString(s.highlightIcon + " ")};` : "";
+
+		// Note title inside the editor (via cssclasses: folder-hub-index).
+		rules.push(`.folder-hub-index .inline-title { color: var(--folder-hub-color); }`);
+		if (icon) rules.push(`.folder-hub-index .inline-title::before { ${icon} }`);
+
+		if (filePaths.length) {
+			const sel = (suffix: string) =>
+				filePaths.map((p) => `.nav-file-title[data-path=${cssString(p)}]${suffix}`).join(",\n");
+			rules.push(`${sel("")} { color: var(--folder-hub-color); ${weight} }`);
+			if (icon) rules.push(`${sel(" .nav-file-title-content::before")} { ${icon} }`);
+		}
+		if (s.highlightFolders && folderPaths.length) {
+			const sel = folderPaths
+				.map((p) => `.nav-folder-title[data-path=${cssString(p)}]`)
+				.join(",\n");
+			rules.push(`${sel} { color: var(--folder-hub-color); }`);
+		}
+		return rules.join("\n");
+	}
+
+	// ---------------------------------------------------------------- graph
+
+	/** Adds (or recolours) a graph colour group "tag:#<tag>" in graph.json. */
+	async addGraphColorGroup() {
+		const tag = this.settings.tag.replace(/^#/, "").trim();
+		if (!tag) {
+			new Notice("Folder Hub: сначала укажите тег главных файлов.");
+			return;
+		}
+		const adapter = this.app.vault.adapter;
+		const path = normalizePath(`${this.app.vault.configDir}/graph.json`);
+		let cfg: { colorGroups?: { query: string; color: { a: number; rgb: number } }[] } = {};
+		try {
+			if (await adapter.exists(path)) cfg = JSON.parse(await adapter.read(path));
+		} catch (e) {
+			console.error("Folder Hub: cannot read graph.json", e);
+		}
+		const query = `tag:#${tag}`;
+		const hex = this.settings.highlightColor.replace("#", "");
+		const full = hex.length === 3 ? hex.split("").map((c) => c + c).join("") : hex.slice(0, 6);
+		const color = { a: 1, rgb: parseInt(full, 16) || 0xe5a50a };
+
+		cfg.colorGroups = cfg.colorGroups ?? [];
+		const existing = cfg.colorGroups.find((g) => g.query === query);
+		if (existing) existing.color = color;
+		else cfg.colorGroups.unshift({ query, color }); // first group has priority
+
+		await adapter.write(path, JSON.stringify(cfg, null, 2));
+
+		// Best effort: also update the running graph plugin (undocumented API).
+		try {
+			const graph = (this.app as AppWithInternals).internalPlugins?.getPluginById?.("graph");
+			const opts = graph?.instance?.options;
+			if (opts) opts.colorGroups = cfg.colorGroups;
+		} catch {
+			/* ignore */
+		}
+		new Notice(
+			"Folder Hub: цветовая группа добавлена в граф. Закройте и снова откройте граф (если цвет не появился — перезапустите Obsidian).",
+			8000,
+		);
+	}
+}
+
+type AppWithInternals = App & {
+	internalPlugins?: {
+		getPluginById?: (id: string) => { instance?: { options?: Record<string, unknown> } } | null;
+	};
+};
+

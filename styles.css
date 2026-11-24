@@ -1,0 +1,14 @@
+/* Folder Hub — static styles. Per-file highlight rules are generated at runtime
+   from the settings (colour, icon) and injected as <style id="folder-hub-dynamic">. */
+
+.folder-hub-textarea {
+	width: 100%;
+	min-width: 280px;
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+}
+
+/* The index note itself (cssclasses: folder-hub-index). */
+.folder-hub-index .inline-title {
+	color: var(--folder-hub-color, var(--text-accent));
+}

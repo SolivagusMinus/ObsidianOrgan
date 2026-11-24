@@ -124,3 +124,29 @@ test("fillNoteTemplate substitutes vars and drops empty tag line", () => {
 	assert.equal(fillNoteTemplate(tpl, { folder: "Меню", tag: "", date: "d" }, "B"), "---\ntags:\n---\n# Меню\nB\n");
 	assert.equal(fillNoteTemplate("Intro", { folder: "M", tag: "", date: "d" }, "B"), "Intro\n\nB\n");
 });
+
+// ---------------------------------------------------------------- words
+import { addDays, computeStreak, countWords, heatLevel, pluralRu } from "../src/words";
+
+test("countWords ignores frontmatter and comments, handles Cyrillic and CJK", () => {
+	assert.equal(countWords("---\ntags: [a, b]\n---\nПривет, мир! Это тест."), 4);
+	assert.equal(countWords("one %%hidden words here%% two"), 2);
+	assert.equal(countWords("[[Суп]] и [[План статьи|план]] — don't stop"), 7);
+	assert.equal(countWords("日本語 text"), 4);
+	assert.equal(countWords(""), 0);
+});
+
+test("streak counts back from today or yesterday", () => {
+	const s = { "2026-11-21": { added: 600, removed: 0 }, "2026-11-22": { added: 500, removed: 0 }, "2026-11-23": { added: 501, removed: 0 }, "2026-11-24": { added: 10, removed: 0 } };
+	assert.equal(computeStreak(s, "2026-11-24", 500), 3); // today not done yet → from yesterday
+	assert.equal(computeStreak(s, "2026-11-24", 0), 4); // no goal → any words
+	assert.equal(computeStreak(s, "2026-11-26", 500), 0);
+	assert.equal(addDays("2026-12-31", 1), "2027-01-01");
+	assert.equal(addDays("2026-03-01", -1), "2026-02-28");
+});
+
+test("heat levels and Russian plurals", () => {
+	assert.deepEqual([0, 50, 200, 300, 500, 900].map((w) => heatLevel(w, 500)), [0, 1, 2, 3, 4, 4]);
+	const f: [string, string, string] = ["слово", "слова", "слов"];
+	assert.deepEqual([1, 2, 5, 11, 21, 22, 112].map((n) => pluralRu(n, f)), ["слово", "слова", "слов", "слов", "слово", "слова", "слов"]);
+});

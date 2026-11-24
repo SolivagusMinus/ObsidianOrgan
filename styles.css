@@ -12,3 +12,279 @@
 .folder-hub-index .inline-title {
 	color: var(--folder-hub-color, var(--text-accent));
 }
+
+/* ===================================================================
+   Calendar & daily word counter
+   Heat colours: one hue (the theme accent), light → dark = fewer → more words.
+   =================================================================== */
+
+.fh-cal {
+	--fh-accent: var(--interactive-accent);
+	--fh-heat-1: hsla(var(--accent-h), var(--accent-s), var(--accent-l), 0.18);
+	--fh-heat-2: hsla(var(--accent-h), var(--accent-s), var(--accent-l), 0.36);
+	--fh-heat-3: hsla(var(--accent-h), var(--accent-s), var(--accent-l), 0.6);
+	--fh-heat-4: hsla(var(--accent-h), var(--accent-s), var(--accent-l), 0.92);
+	--fh-ease: cubic-bezier(0.22, 1, 0.36, 1);
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	padding: 12px !important;
+	user-select: none;
+}
+
+.fh-card {
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 12px;
+	padding: 12px;
+	animation: fh-card-in 0.5s var(--fh-ease) both;
+}
+.fh-card:nth-child(2) { animation-delay: 60ms; }
+.fh-card:nth-child(3) { animation-delay: 120ms; }
+.fh-card:nth-child(4) { animation-delay: 180ms; }
+
+.fh-title {
+	font-weight: 600;
+	font-size: var(--font-ui-medium);
+	color: var(--text-normal);
+}
+.fh-subtitle {
+	margin-top: 10px;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+.fh-muted { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.fh-row-between { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+
+/* ---- Today: progress ring ---------------------------------------- */
+
+.fh-today { display: flex; align-items: center; gap: 14px; }
+
+.fh-ring { position: relative; width: 112px; height: 112px; flex: none; }
+.fh-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); overflow: visible; }
+.fh-ring circle { fill: none; stroke-width: 10; }
+.fh-ring-track { stroke: var(--background-modifier-border); }
+.fh-ring-fg {
+	stroke: var(--fh-accent);
+	stroke-linecap: round;
+	transition: stroke-dashoffset 1s var(--fh-ease), stroke 0.4s ease;
+}
+.fh-ring.is-done .fh-ring-fg { stroke: var(--color-green); }
+.fh-ring.is-celebrating { animation: fh-ring-pop 0.7s var(--fh-ease); }
+.fh-ring.is-celebrating .fh-ring-fg { filter: drop-shadow(0 0 6px var(--color-green)); }
+
+.fh-ring-center {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	line-height: 1.1;
+}
+.fh-ring-num {
+	font-size: 1.6em;
+	font-weight: 700;
+	font-variant-numeric: tabular-nums;
+	color: var(--text-normal);
+}
+.fh-ring-goal { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+
+.fh-today-side { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.fh-meta { display: flex; flex-direction: column; gap: 4px; }
+
+.fh-badge {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	width: fit-content;
+	padding: 2px 8px;
+	border-radius: 999px;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-normal);
+	background: hsla(var(--accent-h), var(--accent-s), var(--accent-l), 0.15);
+	animation: fh-badge-in 0.5s var(--fh-ease) both;
+}
+.fh-badge svg { width: 14px; height: 14px; color: var(--color-green); }
+
+.fh-streak { display: flex; align-items: center; gap: 4px; font-size: var(--font-ui-small); color: var(--text-muted); }
+.fh-streak .fh-flame { filter: grayscale(1); opacity: 0.5; }
+.fh-streak.is-active { color: var(--text-normal); }
+.fh-streak.is-active .fh-flame {
+	filter: none;
+	opacity: 1;
+	display: inline-block;
+	transform-origin: 50% 90%;
+	animation: fh-flicker 1.6s ease-in-out infinite;
+}
+
+/* Confetti burst from the ring centre */
+.fh-confetti { position: absolute; left: 50%; top: 50%; pointer-events: none; }
+.fh-confetti span {
+	position: absolute;
+	width: 6px;
+	height: 10px;
+	border-radius: 2px;
+	animation: fh-confetti 1.2s var(--fh-ease) forwards;
+}
+
+/* ---- Week chart --------------------------------------------------- */
+
+.fh-bars {
+	position: relative;
+	display: flex;
+	align-items: flex-end;
+	gap: 6px;
+	height: 72px;
+	margin-top: 10px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+.fh-bar-col {
+	flex: 1;
+	height: 100%;
+	display: flex;
+	align-items: flex-end;
+	justify-content: center;
+	cursor: pointer;
+}
+.fh-bar {
+	width: 100%;
+	max-width: 22px;
+	border-radius: 4px 4px 0 0;
+	background: var(--fh-heat-3);
+	transform-origin: bottom;
+	transition: height 0.6s var(--fh-ease), background 0.3s ease;
+	animation: fh-grow 0.7s var(--fh-ease) both;
+}
+.fh-bar-col.is-today .fh-bar { background: var(--fh-accent); }
+.fh-bar-col:hover .fh-bar { filter: brightness(1.15); }
+.fh-goal-line {
+	position: absolute;
+	left: 0;
+	right: 0;
+	border-top: 1px dashed var(--text-faint);
+	transition: bottom 0.6s var(--fh-ease);
+	z-index: 1;
+}
+.fh-bar-labels { display: flex; gap: 6px; margin-top: 4px; }
+.fh-bar-label { flex: 1; text-align: center; text-transform: capitalize; font-size: var(--font-ui-smaller); color: var(--text-faint); }
+.fh-bar-label.is-today { color: var(--text-normal); font-weight: 600; }
+
+/* ---- Month grid --------------------------------------------------- */
+
+.fh-month-head { display: flex; align-items: center; gap: 4px; margin-bottom: 8px; }
+.fh-month-title { flex: 1; text-align: center; font-weight: 600; }
+.fh-cal .fh-nav { padding: 4px; }
+.fh-cal .fh-today-btn { font-size: var(--font-ui-smaller); padding: 2px 8px; height: auto; }
+
+.fh-grid-wrap { overflow: hidden; }
+.fh-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.fh-grid.fh-slide-left { animation: fh-slide-left 0.38s var(--fh-ease); }
+.fh-grid.fh-slide-right { animation: fh-slide-right 0.38s var(--fh-ease); }
+
+.fh-weekday {
+	text-align: center;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+	text-transform: capitalize;
+	padding-bottom: 2px;
+}
+
+.fh-cal .fh-day {
+	position: relative;
+	aspect-ratio: 1;
+	min-width: 0;
+	height: auto;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	border-radius: 8px;
+	border: 1px solid transparent;
+	background: transparent;
+	box-shadow: none;
+	color: var(--text-normal);
+	font-size: var(--font-ui-small);
+	font-variant-numeric: tabular-nums;
+	cursor: pointer;
+	transition: transform 0.15s ease, background 0.4s ease, border-color 0.2s ease;
+	animation: fh-pop 0.35s var(--fh-ease) both;
+	animation-delay: calc(var(--i, 0) * 10ms);
+}
+.fh-cal .fh-day:hover { transform: scale(1.08); background-color: var(--background-modifier-hover); z-index: 1; }
+.fh-cal .fh-day.is-other { opacity: 0.35; }
+.fh-cal .fh-day.fh-heat-1 { background: var(--fh-heat-1); }
+.fh-cal .fh-day.fh-heat-2 { background: var(--fh-heat-2); }
+.fh-cal .fh-day.fh-heat-3 { background: var(--fh-heat-3); }
+.fh-cal .fh-day.fh-heat-4 { background: var(--fh-heat-4); color: var(--text-on-accent); }
+.fh-cal .fh-day.is-selected { border-color: var(--text-normal); }
+.fh-cal .fh-day.is-today { font-weight: 700; }
+.fh-cal .fh-day.is-today::after {
+	content: "";
+	position: absolute;
+	inset: -1px;
+	border-radius: 8px;
+	border: 2px solid var(--fh-accent);
+	animation: fh-today-pulse 2.4s ease-in-out infinite;
+	pointer-events: none;
+}
+/* Daily note exists: small marker in the corner */
+.fh-cal .fh-day.has-daily::before {
+	content: "";
+	position: absolute;
+	top: 3px;
+	right: 3px;
+	width: 5px;
+	height: 5px;
+	border-radius: 50%;
+	background: currentColor;
+	opacity: 0.7;
+}
+.fh-dots { display: flex; gap: 2px; height: 4px; margin-top: 2px; }
+.fh-dots span { width: 4px; height: 4px; border-radius: 50%; background: currentColor; opacity: 0.55; }
+
+/* ---- Day details -------------------------------------------------- */
+
+.fh-details.fh-fade { animation: fh-card-in 0.35s var(--fh-ease) both; }
+.fh-detail-line { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin: 6px 0 10px; color: var(--text-normal); }
+.fh-icon svg { width: 14px; height: 14px; color: var(--text-muted); vertical-align: -2px; }
+.fh-daily-btn { display: inline-flex; align-items: center; gap: 6px; width: 100%; justify-content: center; }
+.fh-daily-btn svg { width: 16px; height: 16px; }
+.fh-note-list { margin: 6px 0 0; padding-left: 18px; }
+.fh-note-list li { animation: fh-card-in 0.35s var(--fh-ease) both; animation-delay: calc(var(--i, 0) * 30ms); }
+
+/* ---- Status bar --------------------------------------------------- */
+
+.fh-status { font-variant-numeric: tabular-nums; }
+.fh-status.is-done { color: var(--color-green); }
+.fh-status.fh-pulse { animation: fh-pulse 0.5s ease; }
+
+/* ---- Keyframes ---------------------------------------------------- */
+
+@keyframes fh-card-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes fh-pop { from { opacity: 0; transform: scale(0.6); } to { opacity: 1; transform: none; } }
+@keyframes fh-grow { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+@keyframes fh-slide-left { from { opacity: 0; transform: translateX(32px); } to { opacity: 1; transform: none; } }
+@keyframes fh-slide-right { from { opacity: 0; transform: translateX(-32px); } to { opacity: 1; transform: none; } }
+@keyframes fh-badge-in { from { opacity: 0; transform: scale(0.7); } 60% { transform: scale(1.08); } to { opacity: 1; transform: none; } }
+@keyframes fh-ring-pop { 0% { transform: scale(1); } 40% { transform: scale(1.1); } 100% { transform: scale(1); } }
+@keyframes fh-flicker { 0%, 100% { transform: rotate(-4deg) scale(1); } 50% { transform: rotate(4deg) scale(1.12); } }
+@keyframes fh-today-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@keyframes fh-pulse { 0% { transform: scale(1); } 40% { transform: scale(1.15); color: var(--text-accent); } 100% { transform: scale(1); } }
+@keyframes fh-confetti {
+	0% { opacity: 1; transform: translate(-50%, -50%) rotate(0); }
+	100% { opacity: 0; transform: translate(calc(-50% + var(--dx)), calc(-50% + var(--dy) + 30px)) rotate(var(--rot)); }
+}
+
+/* Animations off (setting) or the OS asks for reduced motion */
+.fh-cal.fh-no-anim *,
+.fh-cal.fh-no-anim {
+	animation: none !important;
+	transition: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+	.fh-cal *, .fh-cal, .fh-status { animation: none !important; transition: none !important; }
+}

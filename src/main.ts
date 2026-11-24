@@ -8,7 +8,11 @@ import {
 	TFolder,
 	moment,
 	normalizePath,
+	setTooltip,
 } from "obsidian";
+import { CalendarView, VIEW_TYPE_CALENDAR } from "./calendar-view";
+import { WordTracker } from "./tracker";
+import { StatsData, pluralRu } from "./words";
 import {
 	BLOCK_START,
 	Item,
@@ -31,6 +35,11 @@ export const INDEX_KEY = "folder-index";
 
 export default class FolderHubPlugin extends Plugin {
 	settings!: FolderHubSettings;
+	wordStats: StatsData = {};
+	tracker = new WordTracker(this);
+
+	private statusEl: HTMLElement | null = null;
+	private saveStatsTimer: number | null = null;
 
 	private pending = new Set<string>();
 	private flushTimer: number | null = null;
@@ -44,6 +53,18 @@ export default class FolderHubPlugin extends Plugin {
 
 		this.styleEl = document.head.createEl("style", { attr: { id: "folder-hub-dynamic" } });
 		this.register(() => this.styleEl?.remove());
+
+		// ---- Calendar & daily word counter
+		this.registerView(VIEW_TYPE_CALENDAR, (leaf) => new CalendarView(leaf, this));
+		this.addRibbonIcon("calendar-days", "Календарь и счётчик слов", () => void this.activateCalendar());
+		this.addCommand({
+			id: "open-calendar",
+			name: "Открыть календарь и счётчик слов",
+			callback: () => void this.activateCalendar(),
+		});
+		this.statusEl = this.addStatusBarItem();
+		this.statusEl.addClass("fh-status", "mod-clickable");
+		this.statusEl.addEventListener("click", () => void this.activateCalendar());
 
 		this.addCommand({
 			id: "create-index-current-folder",
@@ -122,6 +143,8 @@ export default class FolderHubPlugin extends Plugin {
 			this.registerEvent(this.app.vault.on("create", (f) => this.onCreate(f)));
 			this.registerEvent(this.app.vault.on("delete", (f) => this.onDelete(f)));
 			this.registerEvent(this.app.vault.on("rename", (f, old) => this.onRename(f, old)));
+			this.tracker.start();
+			this.updateStatusBar();
 			// Catch up with changes made while Obsidian was closed.
 			void this.updateAll(false);
 			this.refreshHighlight();
@@ -131,15 +154,108 @@ export default class FolderHubPlugin extends Plugin {
 	onunload() {
 		if (this.flushTimer !== null) window.clearTimeout(this.flushTimer);
 		if (this.highlightTimer !== null) window.clearTimeout(this.highlightTimer);
+		if (this.saveStatsTimer !== null) {
+			window.clearTimeout(this.saveStatsTimer);
+			void this.persist();
+		}
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const raw = ((await this.loadData()) ?? {}) as Partial<FolderHubSettings> & { wordStats?: StatsData };
+		const { wordStats, ...settings } = raw;
+		this.wordStats = wordStats ?? {};
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, settings);
+		this.lastCalendarSig = this.calendarSignature();
+	}
+
+	/** Settings and word statistics live together in data.json. */
+	private async persist() {
+		await this.saveData({ ...this.settings, wordStats: this.wordStats });
 	}
 
 	async saveSettings() {
-		await this.saveData(this.settings);
+		await this.persist();
 		this.refreshHighlight();
+		this.updateStatusBar();
+		// Re-render the calendar only when settings it depends on changed.
+		const sig = this.calendarSignature();
+		if (sig !== this.lastCalendarSig) {
+			this.lastCalendarSig = sig;
+			this.calendarViews().forEach((v) => v.render());
+		}
+	}
+
+	private lastCalendarSig = "";
+	private calendarSignature(): string {
+		const s = this.settings;
+		return JSON.stringify([s.dailyGoal, s.animations, s.dailyFolder, s.dailyFormat, s.tag, s.indexName]);
+	}
+
+	// ------------------------------------------------------ words & calendar
+
+	calendarViews(): CalendarView[] {
+		return this.app.workspace
+			.getLeavesOfType(VIEW_TYPE_CALENDAR)
+			.map((l) => l.view)
+			.filter((v): v is CalendarView => v instanceof CalendarView);
+	}
+
+	async activateCalendar() {
+		const { workspace } = this.app;
+		let leaf = workspace.getLeavesOfType(VIEW_TYPE_CALENDAR)[0];
+		if (!leaf) {
+			leaf = workspace.getRightLeaf(false) ?? workspace.getLeaf(true);
+			await leaf.setViewState({ type: VIEW_TYPE_CALENDAR, active: true });
+		}
+		await workspace.revealLeaf(leaf);
+	}
+
+	isIndexNote(file: TFile): boolean {
+		return !!file.parent && !file.parent.isRoot() && this.findIndex(file.parent) === file;
+	}
+
+	/** Called by the tracker after today's word count changed. */
+	onWordsChanged(before: number, after: number) {
+		if (this.saveStatsTimer !== null) window.clearTimeout(this.saveStatsTimer);
+		this.saveStatsTimer = window.setTimeout(() => {
+			this.saveStatsTimer = null;
+			void this.persist();
+		}, 3000);
+
+		this.updateStatusBar(true);
+		const views = this.calendarViews();
+		views.forEach((v) => v.updateToday());
+
+		const goal = this.settings.dailyGoal;
+		if (goal > 0 && before < goal && after >= goal) {
+			views.forEach((v) => v.celebrate());
+			new Notice(`🎉 Цель на сегодня выполнена: ${after.toLocaleString()} ${pluralRu(after, ["слово", "слова", "слов"])}!`);
+		}
+	}
+
+	private updateStatusBar(pulse = false) {
+		const el = this.statusEl;
+		if (!el) return;
+		const show = this.settings.wordCountEnabled && this.settings.showStatusBar;
+		el.toggle(show);
+		if (!show) return;
+		const added = this.tracker.today().added;
+		const goal = this.settings.dailyGoal;
+		el.setText(goal > 0 ? `✍ ${added.toLocaleString()} / ${goal.toLocaleString()}` : `✍ ${added.toLocaleString()}`);
+		el.toggleClass("is-done", goal > 0 && added >= goal);
+		setTooltip(el, "Слов написано сегодня. Нажмите, чтобы открыть календарь.", { placement: "top" });
+		if (pulse && this.settings.animations) {
+			el.removeClass("fh-pulse");
+			void el.offsetWidth;
+			el.addClass("fh-pulse");
+		}
+	}
+
+	async resetStats() {
+		this.wordStats = {};
+		await this.persist();
+		this.updateStatusBar();
+		this.calendarViews().forEach((v) => v.render());
 	}
 
 	// ---------------------------------------------------------------- events

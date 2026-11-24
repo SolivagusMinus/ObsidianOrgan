@@ -34,6 +34,15 @@ export interface FolderHubSettings {
 	highlightIcon: string;
 	highlightBold: boolean;
 	highlightFolders: boolean;
+
+	// Word counter & calendar
+	wordCountEnabled: boolean;
+	dailyGoal: number;
+	showStatusBar: boolean;
+	animations: boolean;
+	dailyFolder: string;
+	dailyFormat: string;
+	dailyTemplate: string;
 }
 
 export const DEFAULT_NOTE_TEMPLATE = `---
@@ -75,6 +84,14 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	highlightIcon: "★",
 	highlightBold: true,
 	highlightFolders: false,
+
+	wordCountEnabled: true,
+	dailyGoal: 500,
+	showStatusBar: true,
+	animations: true,
+	dailyFolder: "",
+	dailyFormat: "",
+	dailyTemplate: "",
 };
 
 export class FolderHubSettingTab extends PluginSettingTab {
@@ -382,6 +399,106 @@ export class FolderHubSettingTab extends PluginSettingTab {
 			.setDesc("Добавить в граф цветовую группу tag:#<тег> выбранного цвета.")
 			.addButton((b) =>
 				b.setButtonText("Добавить в граф").onClick(() => this.plugin.addGraphColorGroup()),
+			);
+
+		// ------------------------------------------------------------------
+		new Setting(containerEl).setName("Счётчик слов и календарь").setHeading();
+
+		new Setting(containerEl)
+			.setName("Считать слова за день")
+			.setDesc(
+				"Учитываются слова, которые вы пишете в открытой заметке. Изменения от синхронизации и других плагинов не считаются. " +
+					"Календарь открывается значком 📅 на боковой ленте или командой «Открыть календарь и счётчик слов».",
+			)
+			.addToggle((t) =>
+				t.setValue(s.wordCountEnabled).onChange(async (v) => {
+					s.wordCountEnabled = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Цель на день (слов)")
+			.setDesc("0 — без цели.")
+			.addText((t) => {
+				t.inputEl.type = "number";
+				t.inputEl.min = "0";
+				t.setValue(String(s.dailyGoal)).onChange(async (v) => {
+					const n = Math.max(0, Math.floor(Number(v)) || 0);
+					s.dailyGoal = n;
+					await save();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName("Показывать в строке состояния")
+			.setDesc("Только на компьютере: «✍ 342 / 500» внизу окна.")
+			.addToggle((t) =>
+				t.setValue(s.showStatusBar).onChange(async (v) => {
+					s.showStatusBar = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Анимации")
+			.setDesc("Кольцо прогресса, конфетти, перелистывание месяцев. Если в системе включено «уменьшить движение», анимации отключаются сами.")
+			.addToggle((t) =>
+				t.setValue(s.animations).onChange(async (v) => {
+					s.animations = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Папка заметок дня")
+			.setDesc("Пусто — взять из встроенного плагина «Ежедневные заметки».")
+			.addText((t) =>
+				t.setPlaceholder("Дневник").setValue(s.dailyFolder).onChange(async (v) => {
+					s.dailyFolder = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Формат имени заметки дня")
+			.setDesc("Формат moment.js, например YYYY-MM-DD или YYYY/MM/YYYY-MM-DD. Пусто — из «Ежедневных заметок» или YYYY-MM-DD.")
+			.addText((t) =>
+				t.setPlaceholder("YYYY-MM-DD").setValue(s.dailyFormat).onChange(async (v) => {
+					s.dailyFormat = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Шаблон заметки дня")
+			.setDesc("Путь к файлу-шаблону. Поддерживаются {{date}}, {{date:DD.MM}}, {{time}}, {{title}}.")
+			.addText((t) =>
+				t.setPlaceholder("Шаблоны/День").setValue(s.dailyTemplate).onChange(async (v) => {
+					s.dailyTemplate = v;
+					await save();
+				}),
+			);
+
+		let armed = false;
+		new Setting(containerEl)
+			.setName("Сбросить статистику слов")
+			.setDesc("Удаляет историю по всем дням. Заметки не затрагиваются.")
+			.addButton((b) =>
+				b.setButtonText("Сбросить").onClick(async () => {
+					if (!armed) {
+						armed = true;
+						b.setButtonText("Точно сбросить?").setWarning();
+						window.setTimeout(() => {
+							armed = false;
+							b.setButtonText("Сбросить").buttonEl.removeClass("mod-warning");
+						}, 4000);
+						return;
+					}
+					armed = false;
+					await this.plugin.resetStats();
+					b.setButtonText("Сброшено ✓").buttonEl.removeClass("mod-warning");
+				}),
 			);
 
 		// ------------------------------------------------------------------

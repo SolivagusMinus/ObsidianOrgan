@@ -1,6 +1,6 @@
 {
   "name": "obsidian-folder-hub",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Auto-creates an index note in every folder and keeps [[links]] to all files inside it.",
   "main": "main.js",
   "scripts": {
@@ -8,7 +8,13 @@
     "build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production",
     "test": "node esbuild.config.mjs test && node --test test-dist/render.test.mjs"
   },
-  "keywords": ["obsidian", "plugin", "folder", "index", "moc"],
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "folder",
+    "index",
+    "moc"
+  ],
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.0.0",

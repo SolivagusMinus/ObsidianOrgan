@@ -150,3 +150,46 @@ test("heat levels and Russian plurals", () => {
 	const f: [string, string, string] = ["слово", "слова", "слов"];
 	assert.deepEqual([1, 2, 5, 11, 21, 22, 112].map((n) => pluralRu(n, f)), ["слово", "слова", "слов", "слов", "слово", "слова", "слов"]);
 });
+
+// ---------------------------------------------------------------- skill tree
+import { TreeNode, branchAngles, layoutSkillTree } from "../src/skilltree";
+
+const node = (name: string, children: TreeNode[] = [], files = 0): TreeNode => ({
+	id: `${name}/${name}.md`,
+	name,
+	children,
+	files: Array.from({ length: files }, (_, i) => `${name}/f${i}.md`),
+});
+const opts3 = { style: "radial" as const, step: 300, spreadDeg: 110, pinFiles: false, directions: {} };
+
+test("branches point in different directions, deeper levels further out", () => {
+	const roots = [node("A", [node("A1"), node("A2")]), node("B", [node("B1")]), node("C")];
+	const pos = layoutSkillTree(roots, opts3);
+	const ang = (id: string) => Math.atan2(pos.get(id)!.y, pos.get(id)!.x);
+	const dist = (id: string) => Math.hypot(pos.get(id)!.x, pos.get(id)!.y);
+	assert.ok(Math.abs(dist("A/A.md") - 300) < 1e-6);
+	assert.ok(Math.abs(dist("A1/A1.md") - 600) < 1e-6);
+	// children stay inside their branch: A's kids closer in angle to A than to B or C
+	const d = (a: number, b: number) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+	for (const kid of ["A1/A1.md", "A2/A2.md"]) {
+		assert.ok(d(ang(kid), ang("A/A.md")) < d(ang(kid), ang("B/B.md")));
+		assert.ok(d(ang(kid), ang("A/A.md")) < d(ang(kid), ang("C/C.md")));
+	}
+	// branch centres are at least 60° apart
+	const c = [ang("A/A.md"), ang("B/B.md"), ang("C/C.md")];
+	for (let i = 0; i < 3; i++) for (let j = i + 1; j < 3; j++) assert.ok(d(c[i], c[j]) > Math.PI / 3);
+});
+
+test("direction overrides are respected, auto branches take the largest gap", () => {
+	const a = branchAngles([node("Меню"), node("Учёба")], { Меню: -90 });
+	assert.ok(Math.abs(a[0] - (3 * Math.PI) / 2) < 1e-9); // -90° normalised = up
+	assert.ok(Math.abs(a[1] - Math.PI / 2) < 1e-9); // opposite side = down
+});
+
+test("up style grows upward, files fan when pinned", () => {
+	const roots = [node("A", [node("A1", [], 3)]), node("B")];
+	const pos = layoutSkillTree(roots, { ...opts3, style: "up", pinFiles: true });
+	assert.ok(pos.get("A1/A1.md")!.y < pos.get("A/A.md")!.y, "child above parent");
+	assert.ok(pos.has("A1/f0.md") && pos.has("A1/f2.md"));
+	assert.ok(pos.get("A1/f1.md")!.y < pos.get("A1/A1.md")!.y, "files above their node");
+});

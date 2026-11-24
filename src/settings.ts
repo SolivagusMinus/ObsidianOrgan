@@ -1,6 +1,7 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type FolderHubPlugin from "./main";
 import type { Layout, SortBy, SortOrder } from "./render";
+import { DIRECTIONS, TreeStyle } from "./skilltree";
 
 export interface FolderHubSettings {
 	// Creation
@@ -43,6 +44,18 @@ export interface FolderHubSettings {
 	dailyFolder: string;
 	dailyFormat: string;
 	dailyTemplate: string;
+
+	// Graph: skill tree
+	skillTreeEnabled: boolean;
+	skillTreeStyle: TreeStyle;
+	skillTreeStep: number;
+	skillTreeSpread: number;
+	skillTreePinFiles: boolean;
+	/** Top-level folder name → key of DIRECTIONS ("auto" when absent). */
+	branchDirections: Record<string, string>;
+	branchColors: boolean;
+	/** Colour-group queries this plugin wrote to graph.json (so it can replace them). */
+	managedGraphQueries: string[];
 }
 
 export const DEFAULT_NOTE_TEMPLATE = `---
@@ -92,6 +105,15 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	dailyFolder: "",
 	dailyFormat: "",
 	dailyTemplate: "",
+
+	skillTreeEnabled: true,
+	skillTreeStyle: "radial",
+	skillTreeStep: 300,
+	skillTreeSpread: 110,
+	skillTreePinFiles: false,
+	branchDirections: {},
+	branchColors: true,
+	managedGraphQueries: [],
 };
 
 export class FolderHubSettingTab extends PluginSettingTab {
@@ -394,13 +416,6 @@ export class FolderHubSettingTab extends PluginSettingTab {
 				}),
 			);
 
-		new Setting(containerEl)
-			.setName("Цвет в графе")
-			.setDesc("Добавить в граф цветовую группу tag:#<тег> выбранного цвета.")
-			.addButton((b) =>
-				b.setButtonText("Добавить в граф").onClick(() => this.plugin.addGraphColorGroup()),
-			);
-
 		// ------------------------------------------------------------------
 		new Setting(containerEl).setName("Счётчик слов и календарь").setHeading();
 
@@ -499,6 +514,111 @@ export class FolderHubSettingTab extends PluginSettingTab {
 					await this.plugin.resetStats();
 					b.setButtonText("Сброшено ✓").buttonEl.removeClass("mod-warning");
 				}),
+			);
+
+		// ------------------------------------------------------------------
+		new Setting(containerEl).setName("Граф: дерево прокачки").setHeading();
+
+		containerEl.createEl("p", {
+			cls: "setting-item-description",
+			text:
+				"Каждая папка верхнего уровня — ветка, которая растёт в свою сторону. Главные файлы папок закрепляются " +
+				"как узлы навыков, файлы висят на них листьями. Использует внутренние механизмы графа Obsidian: " +
+				"после обновления Obsidian может перестать работать — тогда просто выключите.",
+		});
+
+		new Setting(containerEl)
+			.setName("Раскладывать граф ветками")
+			.addToggle((t) =>
+				t.setValue(s.skillTreeEnabled).onChange(async (v) => {
+					s.skillTreeEnabled = v;
+					await save();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Форма")
+			.addDropdown((d) =>
+				d
+					.addOptions({ radial: "Звезда — ветки во все стороны", up: "Дерево прокачки — ветки растут вверх" })
+					.setValue(s.skillTreeStyle)
+					.onChange(async (v) => {
+						s.skillTreeStyle = v as TreeStyle;
+						await save();
+						this.display();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Длина ветки")
+			.setDesc("Расстояние между уровнями.")
+			.addSlider((sl) =>
+				sl
+					.setLimits(120, 700, 20)
+					.setValue(s.skillTreeStep)
+					.setDynamicTooltip()
+					.onChange(async (v) => {
+						s.skillTreeStep = v;
+						await save();
+					}),
+			);
+
+		if (s.skillTreeStyle === "radial") {
+			new Setting(containerEl)
+				.setName("Ширина веера ветки")
+				.setDesc("Насколько широко расходятся подпапки одной ветки, в градусах.")
+				.addSlider((sl) =>
+					sl
+						.setLimits(30, 180, 5)
+						.setValue(s.skillTreeSpread)
+						.setDynamicTooltip()
+						.onChange(async (v) => {
+							s.skillTreeSpread = v;
+							await save();
+						}),
+				);
+		}
+
+		new Setting(containerEl)
+			.setName("Закреплять и файлы")
+			.setDesc("Выключено — файлы свободно «плавают» вокруг своего узла. Включено — выстраиваются аккуратным веером.")
+			.addToggle((t) =>
+				t.setValue(s.skillTreePinFiles).onChange(async (v) => {
+					s.skillTreePinFiles = v;
+					await save();
+				}),
+			);
+
+		const roots = this.plugin.graphTree.buildTree().sort((a, b) => a.name.localeCompare(b.name));
+		if (s.skillTreeStyle === "radial" && roots.length) {
+			const dirOptions: Record<string, string> = { auto: "Авто" };
+			for (const [k, v] of Object.entries(DIRECTIONS)) dirOptions[k] = v.label;
+			containerEl.createEl("div", { cls: "setting-item-name fh-subheading", text: "Направления веток" });
+			for (const root of roots) {
+				new Setting(containerEl).setName(root.name).addDropdown((d) =>
+					d
+						.addOptions(dirOptions)
+						.setValue(s.branchDirections[root.name] ?? "auto")
+						.onChange(async (v) => {
+							if (v === "auto") delete s.branchDirections[root.name];
+							else s.branchDirections[root.name] = v;
+							await save();
+						}),
+				);
+			}
+		}
+
+		new Setting(containerEl)
+			.setName("Свой цвет каждой ветке")
+			.setDesc("Файлы ветки окрашиваются в её цвет, главные файлы — в цвет выделения. Новые ветки раскрашиваются сами.")
+			.addToggle((t) =>
+				t.setValue(s.branchColors).onChange(async (v) => {
+					s.branchColors = v;
+					await save();
+				}),
+			)
+			.addButton((b) =>
+				b.setButtonText("Раскрасить сейчас").onClick(() => this.plugin.graphTree.applyBranchColors(true)),
 			);
 
 		// ------------------------------------------------------------------

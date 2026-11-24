@@ -11,6 +11,7 @@ import {
 	setTooltip,
 } from "obsidian";
 import { CalendarView, VIEW_TYPE_CALENDAR } from "./calendar-view";
+import { GraphTree } from "./graph";
 import { WordTracker } from "./tracker";
 import { StatsData, pluralRu } from "./words";
 import {
@@ -37,6 +38,7 @@ export default class FolderHubPlugin extends Plugin {
 	settings!: FolderHubSettings;
 	wordStats: StatsData = {};
 	tracker = new WordTracker(this);
+	graphTree = new GraphTree(this);
 
 	private statusEl: HTMLElement | null = null;
 	private saveStatsTimer: number | null = null;
@@ -57,6 +59,20 @@ export default class FolderHubPlugin extends Plugin {
 		// ---- Calendar & daily word counter
 		this.registerView(VIEW_TYPE_CALENDAR, (leaf) => new CalendarView(leaf, this));
 		this.addRibbonIcon("calendar-days", "Календарь и счётчик слов", () => void this.activateCalendar());
+		this.addCommand({
+			id: "toggle-skill-tree",
+			name: "Граф: включить/выключить дерево прокачки",
+			callback: async () => {
+				this.settings.skillTreeEnabled = !this.settings.skillTreeEnabled;
+				await this.saveSettings();
+				new Notice(`Дерево прокачки в графе ${this.settings.skillTreeEnabled ? "включено" : "выключено"}`);
+			},
+		});
+		this.addCommand({
+			id: "color-branches",
+			name: "Граф: раскрасить ветки",
+			callback: () => void this.graphTree.applyBranchColors(true),
+		});
 		this.addCommand({
 			id: "open-calendar",
 			name: "Открыть календарь и счётчик слов",
@@ -145,6 +161,7 @@ export default class FolderHubPlugin extends Plugin {
 			this.registerEvent(this.app.vault.on("rename", (f, old) => this.onRename(f, old)));
 			this.tracker.start();
 			this.updateStatusBar();
+			this.graphTree.start();
 			// Catch up with changes made while Obsidian was closed.
 			void this.updateAll(false);
 			this.refreshHighlight();
@@ -152,6 +169,7 @@ export default class FolderHubPlugin extends Plugin {
 	}
 
 	onunload() {
+		this.graphTree.stop();
 		if (this.flushTimer !== null) window.clearTimeout(this.flushTimer);
 		if (this.highlightTimer !== null) window.clearTimeout(this.highlightTimer);
 		if (this.saveStatsTimer !== null) {
@@ -165,7 +183,11 @@ export default class FolderHubPlugin extends Plugin {
 		const { wordStats, ...settings } = raw;
 		this.wordStats = wordStats ?? {};
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, settings);
+		// Copy nested objects so DEFAULT_SETTINGS is never mutated.
+		this.settings.branchDirections = { ...(settings.branchDirections ?? {}) };
+		this.settings.managedGraphQueries = [...(settings.managedGraphQueries ?? [])];
 		this.lastCalendarSig = this.calendarSignature();
+		this.lastTreeSig = this.treeSignature();
 	}
 
 	/** Settings and word statistics live together in data.json. */
@@ -177,6 +199,11 @@ export default class FolderHubPlugin extends Plugin {
 		await this.persist();
 		this.refreshHighlight();
 		this.updateStatusBar();
+		const treeSig = this.treeSignature();
+		if (treeSig !== this.lastTreeSig) {
+			this.lastTreeSig = treeSig;
+			this.graphTree.refresh();
+		}
 		// Re-render the calendar only when settings it depends on changed.
 		const sig = this.calendarSignature();
 		if (sig !== this.lastCalendarSig) {
@@ -186,6 +213,14 @@ export default class FolderHubPlugin extends Plugin {
 	}
 
 	private lastCalendarSig = "";
+	private lastTreeSig = "";
+	private treeSignature(): string {
+		const s = this.settings;
+		return JSON.stringify([
+			s.skillTreeEnabled, s.skillTreeStyle, s.skillTreeStep, s.skillTreeSpread,
+			s.skillTreePinFiles, s.branchDirections, s.indexName, s.excludedFolders,
+		]);
+	}
 	private calendarSignature(): string {
 		const s = this.settings;
 		return JSON.stringify([s.dailyGoal, s.animations, s.dailyFolder, s.dailyFormat, s.tag, s.indexName]);
@@ -607,51 +642,8 @@ export default class FolderHubPlugin extends Plugin {
 
 	// ---------------------------------------------------------------- graph
 
-	/** Adds (or recolours) a graph colour group "tag:#<tag>" in graph.json. */
+	/** Writes graph colour groups: index notes + one colour per branch. */
 	async addGraphColorGroup() {
-		const tag = this.settings.tag.replace(/^#/, "").trim();
-		if (!tag) {
-			new Notice("Folder Hub: сначала укажите тег главных файлов.");
-			return;
-		}
-		const adapter = this.app.vault.adapter;
-		const path = normalizePath(`${this.app.vault.configDir}/graph.json`);
-		let cfg: { colorGroups?: { query: string; color: { a: number; rgb: number } }[] } = {};
-		try {
-			if (await adapter.exists(path)) cfg = JSON.parse(await adapter.read(path));
-		} catch (e) {
-			console.error("Folder Hub: cannot read graph.json", e);
-		}
-		const query = `tag:#${tag}`;
-		const hex = this.settings.highlightColor.replace("#", "");
-		const full = hex.length === 3 ? hex.split("").map((c) => c + c).join("") : hex.slice(0, 6);
-		const color = { a: 1, rgb: parseInt(full, 16) || 0xe5a50a };
-
-		cfg.colorGroups = cfg.colorGroups ?? [];
-		const existing = cfg.colorGroups.find((g) => g.query === query);
-		if (existing) existing.color = color;
-		else cfg.colorGroups.unshift({ query, color }); // first group has priority
-
-		await adapter.write(path, JSON.stringify(cfg, null, 2));
-
-		// Best effort: also update the running graph plugin (undocumented API).
-		try {
-			const graph = (this.app as AppWithInternals).internalPlugins?.getPluginById?.("graph");
-			const opts = graph?.instance?.options;
-			if (opts) opts.colorGroups = cfg.colorGroups;
-		} catch {
-			/* ignore */
-		}
-		new Notice(
-			"Folder Hub: цветовая группа добавлена в граф. Закройте и снова откройте граф (если цвет не появился — перезапустите Obsidian).",
-			8000,
-		);
+		await this.graphTree.applyBranchColors(true);
 	}
 }
-
-type AppWithInternals = App & {
-	internalPlugins?: {
-		getPluginById?: (id: string) => { instance?: { options?: Record<string, unknown> } } | null;
-	};
-};
-

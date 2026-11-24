@@ -288,3 +288,6 @@
 @media (prefers-reduced-motion: reduce) {
 	.fh-cal *, .fh-cal, .fh-status { animation: none !important; transition: none !important; }
 }
+
+/* Settings: sub-heading for per-branch directions */
+.fh-subheading { margin: 12px 0 4px; font-weight: 600; }

@@ -1281,6 +1281,12 @@ var GraphTree = class {
     this.holdStrikesReset = 0;
     /** Notes kept in place by their module (offset from the module centre), per graph. */
     this.held = /* @__PURE__ */ new Map();
+    this.lastNudge = /* @__PURE__ */ new Map();
+    /** Physics nudges left in this "episode"; when none are left, stubborn notes rest against the wall. */
+    this.nudgeBudget = /* @__PURE__ */ new Map();
+    /** Notes resting against a barrier (pinned until the layout changes). */
+    this.resting = /* @__PURE__ */ new Map();
+    this.lastNodeCount = /* @__PURE__ */ new Map();
     /** Target positions last sent to each graph, to skip no-op updates. */
     this.sent = /* @__PURE__ */ new Map();
   }
@@ -1302,7 +1308,7 @@ var GraphTree = class {
     p.registerEvent(this.app.vault.on("rename", onTreeChange));
     this.scan();
     void this.syncColorGroups(false, false);
-    this.holdTimer = window.setInterval(() => this.holdTick(), 400);
+    this.holdTimer = window.setInterval(() => this.holdTick(), 150);
     this.plugin.registerInterval(this.holdTimer);
   }
   stop() {
@@ -1310,6 +1316,7 @@ var GraphTree = class {
     for (const [r, ids] of this.holdRelease) for (const id of ids) this.post(r, { forceNode: { id, x: null, y: null } });
     this.holdRelease.clear();
     for (const r of this.held.keys()) this.releaseHeld(r);
+    for (const r of this.resting.keys()) this.releaseResting(r);
     this.growing.forEach((id) => window.cancelAnimationFrame(id));
     this.freezeTimers.forEach((t) => window.clearTimeout(t));
     for (const r of [...this.originals.keys()]) {
@@ -1409,7 +1416,6 @@ var GraphTree = class {
     let moved = false;
     for (const [id, p] of target) {
       if (!this.hasNode(r, id)) continue;
-      this.post(r, { forceNode: { id, x: p.x, y: p.y } });
       now.add(id);
       const q = last.get(id);
       if (!q || Math.abs(q.x - p.x) > 0.5 || Math.abs(q.y - p.y) > 0.5) moved = true;
@@ -1421,6 +1427,19 @@ var GraphTree = class {
       }
     }
     this.pinned.set(r, now);
+    if (moved || this.lastNodeCount.get(r) !== r.nodes.length) {
+      this.lastNodeCount.set(r, r.nodes.length);
+      this.releaseResting(r);
+      this.nudgeBudget.set(r, 4);
+    }
+    if (moved && last.size && s.animations && !reduced) {
+      this.animatePins(r, last, target, now);
+      return;
+    }
+    for (const id of now) {
+      const p = target.get(id);
+      this.post(r, { forceNode: { id, x: p.x, y: p.y } });
+    }
     this.sent.set(r, new Map([...now].map((id) => [id, target.get(id)])));
     if (moved) {
       this.reheat(r);
@@ -1428,6 +1447,28 @@ var GraphTree = class {
     } else if (this.plugin.settings.graphFreeze && !this.frozen.has(r)) {
       this.scheduleFreeze(r);
     }
+  }
+  /** Moves pinned nodes from their old to their new places over ~0.6 s (ease-out-back). */
+  animatePins(r, from, to, ids) {
+    const list = [...ids].map((id) => ({ id, a: from.get(id) ?? to.get(id), b: to.get(id) }));
+    const DUR = 600;
+    const t0 = performance.now();
+    const back = (k) => 1 + 2.70158 * Math.pow(k - 1, 3) + 1.70158 * Math.pow(k - 1, 2);
+    this.reheat(r);
+    const step = (now) => {
+      const k = Math.min(1, (now - t0) / DUR);
+      const e = back(k);
+      for (const o of list) this.post(r, { forceNode: { id: o.id, x: o.a.x + (o.b.x - o.a.x) * e, y: o.a.y + (o.b.y - o.a.y) * e } });
+      if (k < 1) {
+        this.growing.set(r, window.requestAnimationFrame(step));
+      } else {
+        this.growing.delete(r);
+        this.sent.set(r, new Map(list.map((o) => [o.id, o.b])));
+        this.scheduleFreeze(r);
+        this.schedule(r);
+      }
+    };
+    this.growing.set(r, window.requestAnimationFrame(step));
   }
   /** Branch by branch, level by level: nodes glide from the centre to their places. */
   animateGrow(r, target) {
@@ -1572,46 +1613,51 @@ var GraphTree = class {
       modules.centers.clear();
       return base;
     }
-    const key = [modules.version, modules.sizeKey(), s.moduleSize, s.moduleGap, r.nodes.length, JSON.stringify(s.modules.map((m) => [m.id, m.kind, m.value]))].join("|");
-    if (this.modLayout && this.modLayout.key === key && this.modLayout.base === base) return this.modLayout.target;
     const members = modules.members();
     const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
     const pad2 = 38 * s.moduleSize;
-    const median = (v) => {
-      v.sort((p, q) => p - q);
-      const mid = v.length >> 1;
-      return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+    const pos = (id) => {
+      const p = base.get(id) ?? nodeById.get(id);
+      return Number.isFinite(p.x) && Number.isFinite(p.y) ? p : { x: 0, y: 0 };
     };
-    const circles = [];
+    const infos = [];
     for (const m of modules.list) {
       const ids = [...members.get(m.id) ?? []].filter((id) => nodeById.has(id));
       if (!ids.length) continue;
+      const anchor = ids.find((id) => {
+        const f = this.app.vault.getAbstractFileByPath(id);
+        return f instanceof import_obsidian5.TFile && this.plugin.isIndexNote(f);
+      }) ?? ids[0];
       const pinnedIds = ids.filter((id) => base.has(id));
       const baseC = pinnedIds.length ? centroid(pinnedIds.map((id) => base.get(id))) : null;
-      let extent = modules.radius(m.id, ids.length);
+      const c0 = baseC ?? pos(anchor);
+      const dists = ids.map((id) => Math.hypot(pos(id).x - c0.x, pos(id).y - c0.y));
+      let extent = modules.barrierRadius(ids.length, dists);
       if (baseC) for (const id of pinnedIds) extent = Math.max(extent, Math.hypot(base.get(id).x - baseC.x, base.get(id).y - baseC.y) + 30);
-      const start = modules.centers.get(m.id) ?? baseC ?? { x: median(ids.map((id) => nodeById.get(id).x)), y: median(ids.map((id) => nodeById.get(id).y)) };
-      circles.push({ x: start.x, y: start.y, r: extent + pad2, id: m.id, ids, baseC });
+      infos.push({ id: m.id, ids, anchor, baseC, c0, bucket: Math.ceil(Math.log(Math.max(20, extent)) / Math.log(1.25)) });
     }
+    const key = [modules.version, s.moduleSize, s.moduleGap, nodeById.size, infos.map((i) => `${i.id}:${i.bucket}:${i.anchor}`).join(",")].join("|");
+    if (this.modLayout && this.modLayout.key === key && this.modLayout.base === base) return this.modLayout.target;
+    const circles = infos.map((info) => {
+      const start = modules.centers.get(info.id) ?? info.c0;
+      return { x: start.x, y: start.y, r: Math.pow(1.25, info.bucket) + pad2, info };
+    });
     separateCircles(circles, s.moduleGap);
     const target = new Map(base);
     const alive = /* @__PURE__ */ new Set();
     for (const c of circles) {
-      alive.add(c.id);
-      modules.centers.set(c.id, { x: c.x, y: c.y, hold: c.r - pad2 });
-      if (c.baseC) {
-        const dx = c.x - c.baseC.x;
-        const dy = c.y - c.baseC.y;
-        for (const id of c.ids) {
+      const { info } = c;
+      alive.add(info.id);
+      modules.centers.set(info.id, { x: c.x, y: c.y, hold: c.r - pad2 });
+      if (info.baseC) {
+        const dx = c.x - info.baseC.x;
+        const dy = c.y - info.baseC.y;
+        for (const id of info.ids) {
           const p = base.get(id);
           if (p) target.set(id, { x: p.x + dx, y: p.y + dy });
         }
       } else {
-        const anchor = c.ids.find((id) => {
-          const f = this.app.vault.getAbstractFileByPath(id);
-          return f instanceof import_obsidian5.TFile && this.plugin.isIndexNote(f);
-        }) ?? c.ids[0];
-        target.set(anchor, { x: c.x, y: c.y });
+        target.set(info.anchor, { x: c.x, y: c.y });
       }
     }
     for (const id of [...modules.centers.keys()]) if (!alive.has(id)) modules.centers.delete(id);
@@ -1619,19 +1665,16 @@ var GraphTree = class {
     return target;
   }
   /**
-   * Keeps module members inside their barrier: a note that drifted outside
-   * is pinned just inside for one tick and released on the next, so the
-   * physics carries on from there. If a note keeps escaping (the layout
-   * wants it outside), the barrier grows instead of fighting the physics.
+   * Solid barriers. About 7 times a second: a member that left its module is
+   * put back on the inner edge, a note from elsewhere that got inside is put
+   * on the outer edge — pinned for one tick and released on the next, so it
+   * keeps floating (nothing stays frozen). The physics is nudged at most every
+   * 1.5 s and only while something is out of place, so the graph can settle.
    */
   holdTick() {
     const s = this.plugin.settings;
     const modules = this.plugin.modules;
     const now = performance.now();
-    if (now - this.holdStrikesReset > 3e4) {
-      this.holdStrikes.clear();
-      this.holdStrikesReset = now;
-    }
     const median = (v) => {
       v.sort((p, q) => p - q);
       const mid = v.length >> 1;
@@ -1639,79 +1682,88 @@ var GraphTree = class {
     };
     for (const r of this.originals.keys()) {
       const release = this.holdRelease.get(r) ?? /* @__PURE__ */ new Set();
-      for (const id of release) this.post(r, { forceNode: { id, x: null, y: null } });
+      const layoutPins = this.pinned.get(r);
+      for (const id of release) if (!layoutPins?.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
       release.clear();
       this.holdRelease.set(r, release);
-      const held = this.held.get(r) ?? /* @__PURE__ */ new Map();
-      this.held.set(r, held);
-      if (!s.moduleHold || !s.modulesEnabled || !modules.list.length || !r.nodes?.length || this.growing.has(r)) {
-        this.releaseHeld(r);
+      this.releaseHeld(r);
+      if (!s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
+        this.releaseResting(r);
         continue;
       }
+      if (this.growing.has(r)) continue;
       const pinned = this.pinned.get(r);
       const frozen = this.frozen.get(r);
       const members = modules.members();
-      const live = new Set(modules.list.map((m) => m.id));
-      let clamped = 0;
-      for (const [id, h] of [...held]) {
-        const isMember = members.get(h.mod)?.has(id) ?? false;
-        if (!live.has(h.mod) || isMember !== h.inside || pinned?.has(id)) {
-          this.post(r, { forceNode: { id, x: null, y: null } });
-          held.delete(id);
-        }
-      }
+      const owner = /* @__PURE__ */ new Map();
+      for (const [id, set] of members) for (const path of set) owner.set(path, id);
+      const pad2 = 38 * s.moduleSize;
+      const walls = [];
       for (const m of modules.list) {
-        modules.relax(m.id);
-        const set = members.get(m.id);
-        if (!set?.size) continue;
-        const nodes = r.nodes.filter((n) => set.has(n.id));
-        if (!nodes.length) continue;
         const placed = s.moduleSeparate ? modules.centers.get(m.id) : void 0;
-        const cx = placed?.x ?? median(nodes.map((n) => n.x));
-        const cy = placed?.y ?? median(nodes.map((n) => n.y));
-        const R = placed?.hold ?? modules.radius(m.id, nodes.length);
-        for (const [id, h] of held) {
-          if (h.mod !== m.id) continue;
-          const x = cx + h.dx;
-          const y = cy + h.dy;
-          if (Math.abs(x - h.x) > 0.5 || Math.abs(y - h.y) > 0.5) {
-            this.post(r, { forceNode: { id, x, y } });
-            h.x = x;
-            h.y = y;
-            clamped++;
+        if (placed?.hold) {
+          walls.push({ id: m.id, x: placed.x, y: placed.y, R: placed.hold });
+          continue;
+        }
+        const set = members.get(m.id);
+        const nodes = set?.size ? r.nodes.filter((n) => set.has(n.id) && Number.isFinite(n.x)) : [];
+        if (!nodes.length) continue;
+        const x = median(nodes.map((n) => n.x));
+        const y = median(nodes.map((n) => n.y));
+        walls.push({ id: m.id, x, y, R: modules.barrierRadius(nodes.length, nodes.map((n) => Math.hypot(n.x - x, n.y - y))) });
+      }
+      if (!walls.length) continue;
+      const resting = this.resting.get(r) ?? /* @__PURE__ */ new Set();
+      this.resting.set(r, resting);
+      const fixes = [];
+      for (const n of r.nodes) {
+        if (pinned?.has(n.id) || frozen?.has(n.id) || resting.has(n.id) || !Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
+        const own = owner.get(n.id);
+        const home = own ? walls.find((w) => w.id === own) : void 0;
+        if (home) {
+          const dx = n.x - home.x;
+          const dy = n.y - home.y;
+          const d = Math.hypot(dx, dy) || 1e-3;
+          if (d > home.R) {
+            const k = home.R * 0.96 / d;
+            fixes.push({ id: n.id, x: home.x + dx * k, y: home.y + dy * k, depth: d - home.R });
+            continue;
           }
         }
-        const correct = (id, dx, dy, d, radius, inside) => {
-          const key = inside ? id : `${id}|out`;
-          const strikes = (this.holdStrikes.get(key) ?? 0) + 1;
-          this.holdStrikes.set(key, strikes);
-          const k = radius / (d || 1);
-          const rx = (d ? dx : 1) * k;
-          const ry = (d ? dy : 0) * k;
-          this.post(r, { forceNode: { id, x: cx + rx, y: cy + ry } });
-          if (strikes > 2) held.set(id, { mod: m.id, inside, dx: rx, dy: ry, x: cx + rx, y: cy + ry });
-          else release.add(id);
-          clamped++;
-        };
-        for (const n of nodes) {
-          if (held.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
-          const dx = n.x - cx;
-          const dy = n.y - cy;
-          const d = Math.hypot(dx, dy);
-          if (d > R) correct(n.id, dx, dy, d, R * 0.85, true);
-        }
-        if (s.moduleSeparate) {
-          for (const n of r.nodes) {
-            if (set.has(n.id) || held.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
-            const dx = n.x - cx;
-            const dy = n.y - cy;
-            const d = Math.hypot(dx, dy);
-            if (d < R * 0.98) correct(n.id, dx, dy, d, R * 1.1, false);
+        for (const w of walls) {
+          if (w.id === own) continue;
+          const dx = n.x - w.x;
+          const dy = n.y - w.y;
+          const d = Math.hypot(dx, dy) || 1e-3;
+          if (d < w.R + pad2) {
+            const k = (w.R + pad2 + 10) / d;
+            fixes.push({ id: n.id, x: w.x + dx * k, y: w.y + dy * k, depth: w.R + pad2 - d });
+            break;
           }
         }
       }
-      if (clamped) this.post(r, { alpha: 0.05, run: true });
+      if (!fixes.length) continue;
+      fixes.sort((a, b) => b.depth - a.depth);
+      const budget = this.nudgeBudget.get(r) ?? 4;
+      const settle = budget <= 0;
+      for (const f of fixes.slice(0, 80)) {
+        this.post(r, { forceNode: { id: f.id, x: f.x, y: f.y } });
+        if (settle) resting.add(f.id);
+        else release.add(f.id);
+      }
+      if (!settle && now - (this.lastNudge.get(r) ?? 0) > 1500) {
+        this.post(r, { alpha: 0.04, run: true });
+        this.lastNudge.set(r, now);
+        this.nudgeBudget.set(r, budget - 1);
+      }
     }
+  }
+  releaseResting(r) {
+    const set = this.resting.get(r);
+    if (!set?.size) return;
+    const layoutPins = this.pinned.get(r);
+    for (const id of set) if (!layoutPins?.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+    set.clear();
   }
   releaseHeld(r) {
     const held = this.held.get(r);
@@ -2222,9 +2274,32 @@ var GraphFx = class {
     let st = layer.modState.get(e.def.id);
     const recompute = !st || e.nodes.length <= 400 || layer.frame % 3 === 0;
     if (recompute) {
-      const pts = e.nodes.map((n) => ({ x: n.x, y: n.y }));
-      const R = this.plugin.modules.radius(e.def.id, pts.length);
-      const outline = moduleOutline(pts, s.moduleShape, 38 * s.moduleSize, s.moduleShape === "circle" ? R : R * 0.55);
+      let pts = e.nodes.map((n) => ({ x: n.x, y: n.y })).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+      const pad2 = 38 * s.moduleSize;
+      const modules = this.plugin.modules;
+      const placed = s.moduleSeparate ? modules.centers.get(e.def.id) : void 0;
+      let cx;
+      let cy;
+      let R;
+      if (placed?.hold) {
+        cx = placed.x;
+        cy = placed.y;
+        R = placed.hold;
+      } else {
+        cx = [...pts.map((p) => p.x)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
+        cy = [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
+        R = modules.barrierRadius(pts.length, pts.map((p) => Math.hypot(p.x - cx, p.y - cy)));
+      }
+      const core = pts.filter((p) => Math.hypot(p.x - cx, p.y - cy) <= R);
+      pts = core.length ? core : [{ x: cx, y: cy }];
+      let outline = moduleOutline(pts, s.moduleShape, pad2, R * 0.45);
+      const maxR = R + pad2;
+      outline = outline.map((p) => {
+        const dx = p.x - cx;
+        const dy = p.y - cy;
+        const d = Math.hypot(dx, dy);
+        return d > maxR ? { x: cx + dx / d * maxR, y: cy + dy / d * maxR } : p;
+      });
       if (outline.length >= 3) {
         const c = centroid(outline);
         const target = polarRadii(outline, c, MOD_RAYS);
@@ -2616,6 +2691,20 @@ var GraphModules = class {
   radius(id, count) {
     return moduleRadius(count, this.plugin.settings.moduleSize) + (this.extra.get(id) ?? 0);
   }
+  /**
+   * Radius of a module's barrier around its centre (graph units). Shared by
+   * the layout (to reserve room) and the overlay (to draw it), so a barrier
+   * never pokes outside its reserved place. Mostly follows how far the notes
+   * really are (80th percentile), within sensible bounds for the note count;
+   * notes dragged far away by links to other modules simply stay outside.
+   */
+  barrierRadius(count, distances) {
+    const base = moduleRadius(count, this.plugin.settings.moduleSize) * 0.7;
+    const d = distances.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+    if (count < 6 || !d.length) return base * 0.8;
+    const measured = d[Math.floor(0.8 * (d.length - 1))] * 1.3 + 25;
+    return Math.min(base * 1.6, Math.max(base * 0.6, measured));
+  }
   /** Lets a barrier grow when the layout keeps pushing notes out of it. */
   widen(id, by) {
     const cur = this.extra.get(id) ?? 0;
@@ -2910,7 +2999,7 @@ var DEFAULT_SETTINGS = {
   moduleShape: "cloud",
   moduleLine: "zigzag",
   moduleLineWidth: 1,
-  moduleHold: true,
+  moduleSolid: true,
   moduleSize: 1,
   moduleFill: true,
   moduleLabels: true,
@@ -3408,9 +3497,11 @@ var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
         await changed();
       })
     );
-    new import_obsidian8.Setting(containerEl).setName("\u0423\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0442\u044C \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438").setDesc("\u0412\u044B\u043B\u0435\u0442\u0435\u0432\u0448\u0443\u044E \u0437\u0430 \u0431\u0430\u0440\u044C\u0435\u0440 \u0437\u0430\u043C\u0435\u0442\u043A\u0443 \u043C\u044F\u0433\u043A\u043E \u0432\u043E\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 \u0432\u043D\u0443\u0442\u0440\u044C; \u0435\u0441\u043B\u0438 \u0435\u0451 \u043F\u043E\u0441\u0442\u043E\u044F\u043D\u043D\u043E \u0432\u044B\u0442\u0430\u043B\u043A\u0438\u0432\u0430\u0435\u0442 \u2014 \u0431\u0430\u0440\u044C\u0435\u0440 \u0440\u0430\u0441\u0448\u0438\u0440\u044F\u0435\u0442\u0441\u044F.").addToggle(
-      (t) => t.setValue(s.moduleHold).onChange(async (v) => {
-        s.moduleHold = v;
+    new import_obsidian8.Setting(containerEl).setName("\u0422\u0432\u0451\u0440\u0434\u044B\u0435 \u0431\u0430\u0440\u044C\u0435\u0440\u044B").setDesc(
+      "\u0417\u0430\u043C\u0435\u0442\u043A\u0438 \u043C\u043E\u0434\u0443\u043B\u044F \u043D\u0435 \u043C\u043E\u0433\u0443\u0442 \u0432\u044B\u0439\u0442\u0438 \u0437\u0430 \u0435\u0433\u043E \u0431\u0430\u0440\u044C\u0435\u0440, \u0430 \u0447\u0443\u0436\u0438\u0435 \u2014 \u0437\u0430\u0439\u0442\u0438 \u0432\u043D\u0443\u0442\u0440\u044C: \u0438\u0445 \u0441\u0442\u0430\u0432\u0438\u0442 \u043D\u0430 \u043A\u0440\u0430\u0439 \u0438 \u043E\u0442\u043F\u0443\u0441\u043A\u0430\u0435\u0442, \u0442\u0430\u043A \u0447\u0442\u043E \u043E\u043D\u0438 \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u044E\u0442 \u043F\u043B\u0430\u0432\u0430\u0442\u044C. \u041C\u043E\u0434\u0443\u043B\u0438 \u0443\u043F\u0438\u0440\u0430\u044E\u0442\u0441\u044F \u0434\u0440\u0443\u0433 \u0432 \u0434\u0440\u0443\u0433\u0430 \u0438 \u043E\u0442\u0442\u0430\u043B\u043A\u0438\u0432\u0430\u044E\u0442\u0441\u044F."
+    ).addToggle(
+      (t) => t.setValue(s.moduleSolid).onChange(async (v) => {
+        s.moduleSolid = v;
         await changed();
       })
     );

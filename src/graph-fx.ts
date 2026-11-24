@@ -425,9 +425,36 @@ export class GraphFx {
 		// Big modules: recompute the target every few frames (blending hides it).
 		const recompute = !st || e.nodes.length <= 400 || layer.frame % 3 === 0;
 		if (recompute) {
-			const pts = e.nodes.map((n) => ({ x: n.x, y: n.y }));
-			const R = this.plugin.modules.radius(e.def.id, pts.length);
-			const outline = moduleOutline(pts, s.moduleShape, 38 * s.moduleSize, s.moduleShape === "circle" ? R : R * 0.55);
+			let pts = e.nodes.map((n) => ({ x: n.x, y: n.y })).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+			const pad = 38 * s.moduleSize;
+			const modules = this.plugin.modules;
+			const placed = s.moduleSeparate ? modules.centers.get(e.def.id) : undefined;
+			let cx: number;
+			let cy: number;
+			let R: number;
+			if (placed?.hold) {
+				// Same centre and radius the layout reserved for this module.
+				cx = placed.x;
+				cy = placed.y;
+				R = placed.hold;
+			} else {
+				cx = [...pts.map((p) => p.x)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
+				cy = [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
+				R = modules.barrierRadius(pts.length, pts.map((p) => Math.hypot(p.x - cx, p.y - cy)));
+			}
+			// Notes dragged far away by links to other modules stay outside the
+			// barrier instead of stretching it into a band.
+			const core = pts.filter((p) => Math.hypot(p.x - cx, p.y - cy) <= R);
+			pts = core.length ? core : [{ x: cx, y: cy }];
+			let outline = moduleOutline(pts, s.moduleShape, pad, R * 0.45);
+			// Never poke outside the reserved place.
+			const maxR = R + pad;
+			outline = outline.map((p) => {
+				const dx = p.x - cx;
+				const dy = p.y - cy;
+				const d = Math.hypot(dx, dy);
+				return d > maxR ? { x: cx + (dx / d) * maxR, y: cy + (dy / d) * maxR } : p;
+			});
 			if (outline.length >= 3) {
 				const c = centroid(outline);
 				const target = polarRadii(outline, c, MOD_RAYS);

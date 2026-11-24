@@ -119,6 +119,21 @@ export class GraphModules {
 		return moduleRadius(count, this.plugin.settings.moduleSize) + (this.extra.get(id) ?? 0);
 	}
 
+	/**
+	 * Radius of a module's barrier around its centre (graph units). Shared by
+	 * the layout (to reserve room) and the overlay (to draw it), so a barrier
+	 * never pokes outside its reserved place. Mostly follows how far the notes
+	 * really are (80th percentile), within sensible bounds for the note count;
+	 * notes dragged far away by links to other modules simply stay outside.
+	 */
+	barrierRadius(count: number, distances: number[]): number {
+		const base = moduleRadius(count, this.plugin.settings.moduleSize) * 0.7;
+		const d = distances.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+		if (count < 6 || !d.length) return base * 0.8;
+		const measured = d[Math.floor(0.8 * (d.length - 1))] * 1.3 + 25;
+		return Math.min(base * 1.6, Math.max(base * 0.6, measured));
+	}
+
 	/** Lets a barrier grow when the layout keeps pushing notes out of it. */
 	widen(id: string, by: number) {
 		const cur = this.extra.get(id) ?? 0;

@@ -88,7 +88,8 @@ export interface FolderHubSettings {
 	moduleShape: ModuleShape;
 	moduleLine: LineStyle;
 	moduleLineWidth: number;
-	moduleHold: boolean;
+	/** Solid barriers: members can't leave their module, other notes can't get in. */
+	moduleSolid: boolean;
 	moduleSize: number;
 	moduleFill: boolean;
 	moduleLabels: boolean;
@@ -178,7 +179,7 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	moduleShape: "cloud",
 	moduleLine: "zigzag",
 	moduleLineWidth: 1,
-	moduleHold: true,
+	moduleSolid: true,
 	moduleSize: 1,
 	moduleFill: true,
 	moduleLabels: true,
@@ -1023,11 +1024,14 @@ export class FolderHubSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Удерживать заметки внутри")
-			.setDesc("Вылетевшую за барьер заметку мягко возвращает внутрь; если её постоянно выталкивает — барьер расширяется.")
+			.setName("Твёрдые барьеры")
+			.setDesc(
+				"Заметки модуля не могут выйти за его барьер, а чужие — зайти внутрь: их ставит на край и отпускает, так что они продолжают плавать. " +
+					"Модули упираются друг в друга и отталкиваются.",
+			)
 			.addToggle((t) =>
-				t.setValue(s.moduleHold).onChange(async (v) => {
-					s.moduleHold = v;
+				t.setValue(s.moduleSolid).onChange(async (v) => {
+					s.moduleSolid = v;
 					await changed();
 				}),
 			);

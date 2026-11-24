@@ -75,6 +75,12 @@ export class GraphTree {
 	private holdStrikesReset = 0;
 	/** Notes kept in place by their module (offset from the module centre), per graph. */
 	private held = new Map<GraphRenderer, Map<string, Held>>();
+	private lastNudge = new Map<GraphRenderer, number>();
+	/** Physics nudges left in this "episode"; when none are left, stubborn notes rest against the wall. */
+	private nudgeBudget = new Map<GraphRenderer, number>();
+	/** Notes resting against a barrier (pinned until the layout changes). */
+	private resting = new Map<GraphRenderer, Set<string>>();
+	private lastNodeCount = new Map<GraphRenderer, number>();
 	/** Target positions last sent to each graph, to skip no-op updates. */
 	private sent = new Map<GraphRenderer, Map<string, Point>>();
 
@@ -102,7 +108,7 @@ export class GraphTree {
 		// leftovers from older versions).
 		void this.syncColorGroups(false, false);
 		// Modules: keep member notes inside their barrier.
-		this.holdTimer = window.setInterval(() => this.holdTick(), 400);
+		this.holdTimer = window.setInterval(() => this.holdTick(), 150);
 		this.plugin.registerInterval(this.holdTimer);
 	}
 
@@ -111,6 +117,7 @@ export class GraphTree {
 		for (const [r, ids] of this.holdRelease) for (const id of ids) this.post(r, { forceNode: { id, x: null, y: null } });
 		this.holdRelease.clear();
 		for (const r of this.held.keys()) this.releaseHeld(r);
+		for (const r of this.resting.keys()) this.releaseResting(r);
 		this.growing.forEach((id) => window.cancelAnimationFrame(id));
 		this.freezeTimers.forEach((t) => window.clearTimeout(t));
 		for (const r of [...this.originals.keys()]) {
@@ -227,7 +234,6 @@ export class GraphTree {
 		let moved = false;
 		for (const [id, p] of target) {
 			if (!this.hasNode(r, id)) continue;
-			this.post(r, { forceNode: { id, x: p.x, y: p.y } });
 			now.add(id);
 			const q = last.get(id);
 			if (!q || Math.abs(q.x - p.x) > 0.5 || Math.abs(q.y - p.y) > 0.5) moved = true;
@@ -239,6 +245,23 @@ export class GraphTree {
 			}
 		}
 		this.pinned.set(r, now);
+		// A new "episode" for solid barriers only when the picture really changed
+		// (not on every autosave while typing).
+		if (moved || this.lastNodeCount.get(r) !== r.nodes.length) {
+			this.lastNodeCount.set(r, r.nodes.length);
+			this.releaseResting(r);
+			this.nudgeBudget.set(r, 4);
+		}
+		// Modules bumping into each other: glide to the new places with a little
+		// springy overshoot instead of teleporting.
+		if (moved && last.size && s.animations && !reduced) {
+			this.animatePins(r, last, target, now);
+			return;
+		}
+		for (const id of now) {
+			const p = target.get(id)!;
+			this.post(r, { forceNode: { id, x: p.x, y: p.y } });
+		}
 		this.sent.set(r, new Map([...now].map((id) => [id, target.get(id)!])));
 		if (moved) {
 			this.reheat(r);
@@ -246,6 +269,29 @@ export class GraphTree {
 		} else if (this.plugin.settings.graphFreeze && !this.frozen.has(r)) {
 			this.scheduleFreeze(r);
 		}
+	}
+
+	/** Moves pinned nodes from their old to their new places over ~0.6 s (ease-out-back). */
+	private animatePins(r: GraphRenderer, from: Map<string, Point>, to: Map<string, Point>, ids: Set<string>) {
+		const list = [...ids].map((id) => ({ id, a: from.get(id) ?? to.get(id)!, b: to.get(id)! }));
+		const DUR = 600;
+		const t0 = performance.now();
+		const back = (k: number) => 1 + 2.70158 * Math.pow(k - 1, 3) + 1.70158 * Math.pow(k - 1, 2);
+		this.reheat(r);
+		const step = (now: number) => {
+			const k = Math.min(1, (now - t0) / DUR);
+			const e = back(k);
+			for (const o of list) this.post(r, { forceNode: { id: o.id, x: o.a.x + (o.b.x - o.a.x) * e, y: o.a.y + (o.b.y - o.a.y) * e } });
+			if (k < 1) {
+				this.growing.set(r, window.requestAnimationFrame(step));
+			} else {
+				this.growing.delete(r);
+				this.sent.set(r, new Map(list.map((o) => [o.id, o.b])));
+				this.scheduleFreeze(r);
+				this.schedule(r); // pick up anything that changed meanwhile
+			}
+		};
+		this.growing.set(r, window.requestAnimationFrame(step));
 	}
 
 	/** Branch by branch, level by level: nodes glide from the centre to their places. */
@@ -408,52 +454,63 @@ export class GraphTree {
 			modules.centers.clear();
 			return base;
 		}
-		const key = [modules.version, modules.sizeKey(), s.moduleSize, s.moduleGap, r.nodes.length, JSON.stringify(s.modules.map((m) => [m.id, m.kind, m.value]))].join("|");
-		if (this.modLayout && this.modLayout.key === key && this.modLayout.base === base) return this.modLayout.target;
-
 		const members = modules.members();
 		const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
 		const pad = 38 * s.moduleSize;
-		const median = (v: number[]) => {
-			v.sort((p, q) => p - q);
-			const mid = v.length >> 1;
-			return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+		const pos = (id: string): Point => {
+			const p = base.get(id) ?? nodeById.get(id)!;
+			// Nodes that haven't been placed by the physics yet count as the centre.
+			return Number.isFinite(p.x) && Number.isFinite(p.y) ? p : { x: 0, y: 0 };
 		};
-		const circles: (Circle & { id: string; ids: string[]; baseC: Point | null })[] = [];
+
+		// Measure each module as it really is: an anchor (its index note) and
+		// how far most of its notes sit from it. Sizes are bucketed in 25 %
+		// steps so the layout is only redone when a cluster really grows/shrinks.
+		const infos: { id: string; ids: string[]; anchor: string; baseC: Point | null; c0: Point; bucket: number }[] = [];
 		for (const m of modules.list) {
 			const ids = [...(members.get(m.id) ?? [])].filter((id) => nodeById.has(id));
 			if (!ids.length) continue;
+			const anchor =
+				ids.find((id) => {
+					const f = this.app.vault.getAbstractFileByPath(id);
+					return f instanceof TFile && this.plugin.isIndexNote(f);
+				}) ?? ids[0];
 			const pinnedIds = ids.filter((id) => base.has(id));
 			const baseC = pinnedIds.length ? centroid(pinnedIds.map((id) => base.get(id)!)) : null;
-			// A skill-tree branch can be wider than "its share" by note count: reserve its real size.
-			let extent = modules.radius(m.id, ids.length);
+			const c0 = baseC ?? pos(anchor);
+			const dists = ids.map((id) => Math.hypot(pos(id).x - c0.x, pos(id).y - c0.y));
+			let extent = modules.barrierRadius(ids.length, dists);
+			// A skill-tree branch is pinned: the barrier must hold all of it.
 			if (baseC) for (const id of pinnedIds) extent = Math.max(extent, Math.hypot(base.get(id)!.x - baseC.x, base.get(id)!.y - baseC.y) + 30);
-			const start =
-				modules.centers.get(m.id) ??
-				baseC ?? { x: median(ids.map((id) => nodeById.get(id)!.x)), y: median(ids.map((id) => nodeById.get(id)!.y)) };
-			circles.push({ x: start.x, y: start.y, r: extent + pad, id: m.id, ids, baseC });
+			infos.push({ id: m.id, ids, anchor, baseC, c0, bucket: Math.ceil(Math.log(Math.max(20, extent)) / Math.log(1.25)) });
 		}
+		const key = [modules.version, s.moduleSize, s.moduleGap, nodeById.size, infos.map((i) => `${i.id}:${i.bucket}:${i.anchor}`).join(",")].join("|");
+		if (this.modLayout && this.modLayout.key === key && this.modLayout.base === base) return this.modLayout.target;
+
+		const circles: (Circle & { info: (typeof infos)[number] })[] = infos.map((info) => {
+			const start = modules.centers.get(info.id) ?? info.c0;
+			return { x: start.x, y: start.y, r: Math.pow(1.25, info.bucket) + pad, info };
+		});
 		separateCircles(circles, s.moduleGap);
 
+		// Only anchors move: one pinned note per module (or the module's skill
+		// branch as a whole). The rest of the module follows through its links
+		// to the index note and keeps floating freely.
 		const target = new Map(base);
 		const alive = new Set<string>();
 		for (const c of circles) {
-			alive.add(c.id);
-			modules.centers.set(c.id, { x: c.x, y: c.y, hold: c.r - pad });
-			if (c.baseC) {
-				const dx = c.x - c.baseC.x;
-				const dy = c.y - c.baseC.y;
-				for (const id of c.ids) {
+			const { info } = c;
+			alive.add(info.id);
+			modules.centers.set(info.id, { x: c.x, y: c.y, hold: c.r - pad });
+			if (info.baseC) {
+				const dx = c.x - info.baseC.x;
+				const dy = c.y - info.baseC.y;
+				for (const id of info.ids) {
 					const p = base.get(id);
 					if (p) target.set(id, { x: p.x + dx, y: p.y + dy });
 				}
 			} else {
-				const anchor =
-					c.ids.find((id) => {
-						const f = this.app.vault.getAbstractFileByPath(id);
-						return f instanceof TFile && this.plugin.isIndexNote(f);
-					}) ?? c.ids[0];
-				target.set(anchor, { x: c.x, y: c.y });
+				target.set(info.anchor, { x: c.x, y: c.y });
 			}
 		}
 		for (const id of [...modules.centers.keys()]) if (!alive.has(id)) modules.centers.delete(id);
@@ -462,19 +519,16 @@ export class GraphTree {
 	}
 
 	/**
-	 * Keeps module members inside their barrier: a note that drifted outside
-	 * is pinned just inside for one tick and released on the next, so the
-	 * physics carries on from there. If a note keeps escaping (the layout
-	 * wants it outside), the barrier grows instead of fighting the physics.
+	 * Solid barriers. About 7 times a second: a member that left its module is
+	 * put back on the inner edge, a note from elsewhere that got inside is put
+	 * on the outer edge — pinned for one tick and released on the next, so it
+	 * keeps floating (nothing stays frozen). The physics is nudged at most every
+	 * 1.5 s and only while something is out of place, so the graph can settle.
 	 */
 	private holdTick() {
 		const s = this.plugin.settings;
 		const modules = this.plugin.modules;
 		const now = performance.now();
-		if (now - this.holdStrikesReset > 30000) {
-			this.holdStrikes.clear();
-			this.holdStrikesReset = now;
-		}
 		const median = (v: number[]) => {
 			v.sort((p, q) => p - q);
 			const mid = v.length >> 1;
@@ -482,92 +536,96 @@ export class GraphTree {
 		};
 		for (const r of this.originals.keys()) {
 			const release = this.holdRelease.get(r) ?? new Set<string>();
-			for (const id of release) this.post(r, { forceNode: { id, x: null, y: null } });
+			const layoutPins = this.pinned.get(r);
+			// Never let go of notes the layout pinned meanwhile (e.g. a module's anchor).
+			for (const id of release) if (!layoutPins?.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
 			release.clear();
 			this.holdRelease.set(r, release);
-			const held = this.held.get(r) ?? new Map<string, Held>();
-			this.held.set(r, held);
-			if (!s.moduleHold || !s.modulesEnabled || !modules.list.length || !r.nodes?.length || this.growing.has(r)) {
-				this.releaseHeld(r);
+			this.releaseHeld(r); // permanent pins from older versions
+			if (!s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
+				this.releaseResting(r);
 				continue;
 			}
+			if (this.growing.has(r)) continue;
 
 			const pinned = this.pinned.get(r);
 			const frozen = this.frozen.get(r);
 			const members = modules.members();
-			const live = new Set(modules.list.map((m) => m.id));
-			let clamped = 0;
+			const owner = new Map<string, string>();
+			for (const [id, set] of members) for (const path of set) owner.set(path, id);
+			const pad = 38 * s.moduleSize;
 
-			// Drop held pins whose module is gone or whose note changed module.
-			for (const [id, h] of [...held]) {
-				const isMember = members.get(h.mod)?.has(id) ?? false;
-				if (!live.has(h.mod) || isMember !== h.inside || pinned?.has(id)) {
-					this.post(r, { forceNode: { id, x: null, y: null } });
-					held.delete(id);
-				}
-			}
-
+			// Each module's barrier: the reserved place, or (without separation) around its notes.
+			const walls: { id: string; x: number; y: number; R: number }[] = [];
 			for (const m of modules.list) {
-				modules.relax(m.id); // give back room from older versions' widening
-				const set = members.get(m.id);
-				if (!set?.size) continue;
-				const nodes = r.nodes.filter((n) => set.has(n.id));
-				if (!nodes.length) continue;
 				const placed = s.moduleSeparate ? modules.centers.get(m.id) : undefined;
-				const cx = placed?.x ?? median(nodes.map((n) => n.x));
-				const cy = placed?.y ?? median(nodes.map((n) => n.y));
-				const R = placed?.hold ?? modules.radius(m.id, nodes.length);
+				if (placed?.hold) {
+					walls.push({ id: m.id, x: placed.x, y: placed.y, R: placed.hold });
+					continue;
+				}
+				const set = members.get(m.id);
+				const nodes = set?.size ? r.nodes.filter((n) => set.has(n.id) && Number.isFinite(n.x)) : [];
+				if (!nodes.length) continue;
+				const x = median(nodes.map((n) => n.x));
+				const y = median(nodes.map((n) => n.y));
+				walls.push({ id: m.id, x, y, R: modules.barrierRadius(nodes.length, nodes.map((n) => Math.hypot(n.x - x, n.y - y))) });
+			}
+			if (!walls.length) continue;
 
-				// Held notes ride along when the module moves.
-				for (const [id, h] of held) {
-					if (h.mod !== m.id) continue;
-					const x = cx + h.dx;
-					const y = cy + h.dy;
-					if (Math.abs(x - h.x) > 0.5 || Math.abs(y - h.y) > 0.5) {
-						this.post(r, { forceNode: { id, x, y } });
-						h.x = x;
-						h.y = y;
-						clamped++;
+			const resting = this.resting.get(r) ?? new Set<string>();
+			this.resting.set(r, resting);
+			const fixes: { id: string; x: number; y: number; depth: number }[] = [];
+			for (const n of r.nodes) {
+				if (pinned?.has(n.id) || frozen?.has(n.id) || resting.has(n.id) || !Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
+				const own = owner.get(n.id);
+				// Own wall first: a member outside its module goes back in.
+				const home = own ? walls.find((w) => w.id === own) : undefined;
+				if (home) {
+					const dx = n.x - home.x;
+					const dy = n.y - home.y;
+					const d = Math.hypot(dx, dy) || 0.001;
+					if (d > home.R) {
+						const k = (home.R * 0.96) / d;
+						fixes.push({ id: n.id, x: home.x + dx * k, y: home.y + dy * k, depth: d - home.R });
+						continue;
 					}
 				}
-
-				/** Soft pull for the first escapes; after that the note is kept in place. */
-				const correct = (id: string, dx: number, dy: number, d: number, radius: number, inside: boolean) => {
-					const key = inside ? id : `${id}|out`;
-					const strikes = (this.holdStrikes.get(key) ?? 0) + 1;
-					this.holdStrikes.set(key, strikes);
-					const k = radius / (d || 1);
-					const rx = (d ? dx : 1) * k;
-					const ry = (d ? dy : 0) * k;
-					this.post(r, { forceNode: { id, x: cx + rx, y: cy + ry } });
-					if (strikes > 2) held.set(id, { mod: m.id, inside, dx: rx, dy: ry, x: cx + rx, y: cy + ry });
-					else release.add(id);
-					clamped++;
-				};
-
-				// Members outside the barrier come back in.
-				for (const n of nodes) {
-					if (held.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
-					const dx = n.x - cx;
-					const dy = n.y - cy;
-					const d = Math.hypot(dx, dy);
-					if (d > R) correct(n.id, dx, dy, d, R * 0.85, true);
-				}
-
-				// Separate places: notes that aren't part of this module stay outside it.
-				if (s.moduleSeparate) {
-					for (const n of r.nodes) {
-						if (set.has(n.id) || held.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
-						const dx = n.x - cx;
-						const dy = n.y - cy;
-						const d = Math.hypot(dx, dy);
-						if (d < R * 0.98) correct(n.id, dx, dy, d, R * 1.1, false);
+				// Then other modules' walls: nobody else gets in.
+				for (const w of walls) {
+					if (w.id === own) continue;
+					const dx = n.x - w.x;
+					const dy = n.y - w.y;
+					const d = Math.hypot(dx, dy) || 0.001;
+					if (d < w.R + pad) {
+						const k = (w.R + pad + 10) / d;
+						fixes.push({ id: n.id, x: w.x + dx * k, y: w.y + dy * k, depth: w.R + pad - d });
+						break;
 					}
 				}
 			}
-			// A gentle nudge so the pins take effect even if the graph had come to rest.
-			if (clamped) this.post(r, { alpha: 0.05, run: true });
+			if (!fixes.length) continue;
+			fixes.sort((a, b) => b.depth - a.depth);
+			const budget = this.nudgeBudget.get(r) ?? 4;
+			const settle = budget <= 0; // out of nudges: stubborn notes rest against the wall
+			for (const f of fixes.slice(0, 80)) {
+				this.post(r, { forceNode: { id: f.id, x: f.x, y: f.y } });
+				if (settle) resting.add(f.id);
+				else release.add(f.id);
+			}
+			if (!settle && now - (this.lastNudge.get(r) ?? 0) > 1500) {
+				this.post(r, { alpha: 0.04, run: true });
+				this.lastNudge.set(r, now);
+				this.nudgeBudget.set(r, budget - 1);
+			}
 		}
+	}
+
+	private releaseResting(r: GraphRenderer) {
+		const set = this.resting.get(r);
+		if (!set?.size) return;
+		const layoutPins = this.pinned.get(r);
+		for (const id of set) if (!layoutPins?.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+		set.clear();
 	}
 
 	private releaseHeld(r: GraphRenderer) {

@@ -286,6 +286,7 @@ export default class FolderHubPlugin extends Plugin {
 		return JSON.stringify([
 			s.skillTreeEnabled, s.skillTreeStyle, s.skillTreeStep, s.skillTreeSpread,
 			s.skillTreePinFiles, s.branchDirections, s.indexName, s.excludedFolders, s.graphFreeze,
+			s.moduleSeparate, s.moduleGap, s.moduleSize, s.modulesEnabled, s.modules.map((m) => [m.id, m.kind, m.value]),
 		]);
 	}
 	private calendarSignature(): string {

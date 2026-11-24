@@ -1,6 +1,7 @@
 import { App, Notice, TFile, TFolder, View, normalizePath } from "obsidian";
 import type FolderHubPlugin from "./main";
 import { DIRECTIONS, LayoutOptions, Point, TreeNode, layoutSkillTree } from "./skilltree";
+import { Circle, centroid, separateCircles } from "./module-shapes";
 
 // ---------------------------------------------------------------------------
 // Undocumented Obsidian internals (graph view). Everything is feature-checked
@@ -54,6 +55,8 @@ export class GraphTree {
 	private freezeTimers = new Map<GraphRenderer, number>();
 	private depthCache: { hubs: Map<string, number>; all: Map<string, number> } | null = null;
 	private posCache: Map<string, Point> | null = null;
+	/** Pin targets including module placement; rebuilt when modules or the base layout change. */
+	private modLayout: { key: string; base: Map<string, Point>; target: Map<string, Point> } | null = null;
 	private holdTimer: number | null = null;
 	/** Per graph: notes clamped on the last tick (released on the next one). */
 	private holdRelease = new Map<GraphRenderer, Set<string>>();
@@ -113,6 +116,7 @@ export class GraphTree {
 	refresh() {
 		this.depthCache = null;
 		this.posCache = null;
+		this.modLayout = null;
 		this.scan();
 		for (const r of this.originals.keys()) this.schedule(r);
 	}
@@ -188,7 +192,8 @@ export class GraphTree {
 		}
 		const s = this.plugin.settings;
 		const prev = this.pinned.get(r) ?? new Set<string>();
-		const target = s.skillTreeEnabled ? this.positions() : new Map<string, Point>();
+		const base = s.skillTreeEnabled ? this.positions() : new Map<string, Point>();
+		const target = this.withModules(r, base);
 
 		// First time this graph shows the tree: let it grow out of the centre.
 		const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
@@ -376,6 +381,71 @@ export class GraphTree {
 	// ------------------------------------------------------------- modules
 
 	/**
+	 * Gives every module its own place: module circles (barrier radius + padding)
+	 * are pushed apart until they don't overlap (touching is fine), starting from
+	 * where they are now so the layout only shifts as much as needed. A module
+	 * whose notes are pinned by the skill tree moves as a whole (the branch keeps
+	 * its shape); otherwise one anchor note (the folder's index note if it is in
+	 * the module) is pinned at the module's place and holding keeps the rest around it.
+	 */
+	private withModules(r: GraphRenderer, base: Map<string, Point>): Map<string, Point> {
+		const s = this.plugin.settings;
+		const modules = this.plugin.modules;
+		if (!s.moduleSeparate || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
+			modules.centers.clear();
+			return base;
+		}
+		const key = [modules.version, modules.sizeKey(), s.moduleSize, s.moduleGap, r.nodes.length, JSON.stringify(s.modules.map((m) => [m.id, m.kind, m.value]))].join("|");
+		if (this.modLayout && this.modLayout.key === key && this.modLayout.base === base) return this.modLayout.target;
+
+		const members = modules.members();
+		const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
+		const pad = 38 * s.moduleSize;
+		const median = (v: number[]) => {
+			v.sort((p, q) => p - q);
+			const mid = v.length >> 1;
+			return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+		};
+		const circles: (Circle & { id: string; ids: string[]; baseC: Point | null })[] = [];
+		for (const m of modules.list) {
+			const ids = [...(members.get(m.id) ?? [])].filter((id) => nodeById.has(id));
+			if (!ids.length) continue;
+			const pinnedIds = ids.filter((id) => base.has(id));
+			const baseC = pinnedIds.length ? centroid(pinnedIds.map((id) => base.get(id)!)) : null;
+			const start =
+				modules.centers.get(m.id) ??
+				baseC ?? { x: median(ids.map((id) => nodeById.get(id)!.x)), y: median(ids.map((id) => nodeById.get(id)!.y)) };
+			circles.push({ x: start.x, y: start.y, r: modules.radius(m.id, ids.length) + pad, id: m.id, ids, baseC });
+		}
+		separateCircles(circles, s.moduleGap);
+
+		const target = new Map(base);
+		const alive = new Set<string>();
+		for (const c of circles) {
+			alive.add(c.id);
+			modules.centers.set(c.id, { x: c.x, y: c.y });
+			if (c.baseC) {
+				const dx = c.x - c.baseC.x;
+				const dy = c.y - c.baseC.y;
+				for (const id of c.ids) {
+					const p = base.get(id);
+					if (p) target.set(id, { x: p.x + dx, y: p.y + dy });
+				}
+			} else {
+				const anchor =
+					c.ids.find((id) => {
+						const f = this.app.vault.getAbstractFileByPath(id);
+						return f instanceof TFile && this.plugin.isIndexNote(f);
+					}) ?? c.ids[0];
+				target.set(anchor, { x: c.x, y: c.y });
+			}
+		}
+		for (const id of [...modules.centers.keys()]) if (!alive.has(id)) modules.centers.delete(id);
+		this.modLayout = { key, base, target };
+		return target;
+	}
+
+	/**
 	 * Keeps module members inside their barrier: a note that drifted outside
 	 * is pinned just inside for one tick and released on the next, so the
 	 * physics carries on from there. If a note keeps escaping (the layout
@@ -400,6 +470,7 @@ export class GraphTree {
 			const frozen = this.frozen.get(r);
 			const members = modules.members();
 			let clamped = 0;
+			const widened = new Set<string>();
 			for (const m of modules.list) {
 				const set = members.get(m.id);
 				if (!set?.size) continue;
@@ -411,9 +482,29 @@ export class GraphTree {
 					const mid = v.length >> 1;
 					return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
 				};
-				const cx = median(nodes.map((n) => n.x));
-				const cy = median(nodes.map((n) => n.y));
+				const placed = s.moduleSeparate ? modules.centers.get(m.id) : undefined;
+				const cx = placed?.x ?? median(nodes.map((n) => n.x));
+				const cy = placed?.y ?? median(nodes.map((n) => n.y));
 				const R = modules.radius(m.id, nodes.length);
+
+				// Separate places: notes that aren't part of this module are kept outside it.
+				if (s.moduleSeparate) {
+					for (const n of r.nodes) {
+						if (set.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
+						const dx = n.x - cx;
+						const dy = n.y - cy;
+						const d = Math.hypot(dx, dy) || 1;
+						if (d >= R * 0.95) continue;
+						const key = `${n.id}|out`;
+						const strikes = (this.holdStrikes.get(key) ?? 0) + 1;
+						this.holdStrikes.set(key, strikes);
+						if (strikes > 6) continue; // the layout insists — let it be
+						const k = (R * 1.1) / d;
+						this.post(r, { forceNode: { id: n.id, x: cx + dx * k, y: cy + dy * k } });
+						release.add(n.id);
+						clamped++;
+					}
+				}
 				for (const n of nodes) {
 					if (pinned?.has(n.id) || frozen?.has(n.id)) continue;
 					const dx = n.x - cx;
@@ -424,6 +515,7 @@ export class GraphTree {
 					this.holdStrikes.set(n.id, strikes);
 					if (strikes > 6) {
 						modules.widen(m.id, d - R + 20);
+						widened.add(m.id);
 						continue;
 					}
 					const k = (R * 0.85) / d;
@@ -432,6 +524,7 @@ export class GraphTree {
 					clamped++;
 				}
 			}
+			for (const m of modules.list) if (!widened.has(m.id)) modules.relax(m.id);
 			// A gentle nudge so the pins take effect even if the graph had come to rest.
 			if (clamped) this.post(r, { alpha: 0.05, run: true });
 		}

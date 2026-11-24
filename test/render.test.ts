@@ -289,3 +289,28 @@ test("polar radii of a square and a circle", () => {
 	assert.equal(elasticOut(1), 1);
 	assert.ok(Math.max(...[0.2, 0.3, 0.4].map(elasticOut)) > 1, "overshoots like a bubble");
 });
+
+import { separateCircles } from "../src/module-shapes";
+
+test("modules are pushed apart: no overlaps, touching allowed, centre of mass kept", () => {
+	const cs = [
+		{ x: 0, y: 0, r: 200 },
+		{ x: 50, y: 30, r: 150 },
+		{ x: -40, y: 80, r: 90 },
+		{ x: 0, y: 0, r: 60 }, // exactly on top of the first one
+	];
+	const mass = (a: typeof cs) => a.reduce((s, c) => [s[0] + c.x * (c.r * c.r + 1), s[1] + c.y * (c.r * c.r + 1)], [0, 0]);
+	const before = mass(cs);
+	separateCircles(cs, 10);
+	for (let i = 0; i < cs.length; i++)
+		for (let j = i + 1; j < cs.length; j++) {
+			const d = Math.hypot(cs[i].x - cs[j].x, cs[i].y - cs[j].y);
+			assert.ok(d >= cs[i].r + cs[j].r + 10 - 0.5, `pair ${i}-${j}: ${d.toFixed(1)}`);
+		}
+	const after = mass(cs);
+	assert.ok(Math.abs(before[0] - after[0]) < 1 && Math.abs(before[1] - after[1]) < 1);
+	// already apart → untouched
+	const far = [{ x: 0, y: 0, r: 10 }, { x: 100, y: 0, r: 10 }];
+	separateCircles(far, 5);
+	assert.deepEqual(far.map((c) => c.x), [0, 100]);
+});

@@ -35,6 +35,8 @@ export class GraphModules {
 	private timer: number | null = null;
 	/** Extra radius a barrier gained because notes kept escaping it (world units). */
 	private extra = new Map<string, number>();
+	/** Where each module sits in the graph after separation (graph units). */
+	centers = new Map<string, { x: number; y: number }>();
 
 	constructor(private plugin: FolderHubPlugin) {}
 
@@ -100,6 +102,14 @@ export class GraphModules {
 			}
 			out.set(m.id, set);
 		}
+		// Each note belongs to one module only — the most specific one — so
+		// modules never sit inside each other: a sub-folder module takes its
+		// notes away from the parent folder's module; a tag module wins over folders.
+		const specificity = (m: ModuleDef) => (m.kind === "tag" ? 1000 : normalizePath(m.value || "/").split("/").length);
+		const order = [...this.list].sort((a, b) => specificity(b) - specificity(a));
+		const owner = new Map<string, string>();
+		for (const m of order) for (const path of out.get(m.id) ?? []) if (!owner.has(path)) owner.set(path, m.id);
+		for (const [id, set] of out) for (const path of [...set]) if (owner.get(path) !== id) set.delete(path);
 		this.cache = out;
 		return out;
 	}
@@ -113,6 +123,20 @@ export class GraphModules {
 	widen(id: string, by: number) {
 		const cur = this.extra.get(id) ?? 0;
 		this.extra.set(id, Math.min(cur + Math.max(0, by), 2000));
+	}
+
+	/** Slowly gives the extra room back once notes stop escaping. */
+	relax(id: string) {
+		const cur = this.extra.get(id);
+		if (!cur) return;
+		const next = cur * 0.97;
+		if (next < 1) this.extra.delete(id);
+		else this.extra.set(id, next);
+	}
+
+	/** Coarse fingerprint of barrier sizes (for layout caches). */
+	sizeKey(): string {
+		return [...this.extra].map(([id, v]) => `${id}:${Math.round(v / 50)}`).join(",");
 	}
 
 	/** Graph search query that matches the module's members (for colour groups). */

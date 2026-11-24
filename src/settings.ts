@@ -92,6 +92,8 @@ export interface FolderHubSettings {
 	moduleLabels: boolean;
 	moduleAnimate: boolean;
 	moduleIntro: "bubble" | "draw" | "none";
+	moduleSeparate: boolean;
+	moduleGap: number;
 }
 
 export const DEFAULT_NOTE_TEMPLATE = `---
@@ -179,6 +181,8 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	moduleLabels: true,
 	moduleAnimate: true,
 	moduleIntro: "bubble",
+	moduleSeparate: true,
+	moduleGap: 20,
 };
 
 export class FolderHubSettingTab extends PluginSettingTab {
@@ -973,6 +977,29 @@ export class FolderHubSettingTab extends PluginSettingTab {
 					.setDynamicTooltip()
 					.onChange(async (v) => {
 						s.moduleSize = v;
+						await changed();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Отдельное место для каждого модуля")
+			.setDesc(
+				"Модули не заходят друг в друга: их раздвигает, пока барьеры не перестанут пересекаться (стоять вплотную можно). " +
+					"Заметка входит только в один модуль — самый конкретный (подпапка важнее папки, тег важнее папки). Чужие заметки выталкиваются за барьер.",
+			)
+			.addToggle((t) =>
+				t.setValue(s.moduleSeparate).onChange(async (v) => {
+					s.moduleSeparate = v;
+					await changed();
+				}),
+			)
+			.addSlider((sl) =>
+				sl
+					.setLimits(0, 200, 5)
+					.setValue(s.moduleGap)
+					.setDynamicTooltip()
+					.onChange(async (v) => {
+						s.moduleGap = v;
 						await changed();
 					}),
 			);

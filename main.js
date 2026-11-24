@@ -951,588 +951,6 @@ function layoutSkillTree(roots, o) {
   return o.style === "up" ? layoutUp(roots, o) : layoutRadial(roots, o);
 }
 
-// src/graph.ts
-var hexToRgb = (hex) => {
-  const h = hex.replace("#", "");
-  const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h.slice(0, 6);
-  return parseInt(full, 16) || 0;
-};
-var GraphTree = class {
-  constructor(plugin) {
-    this.plugin = plugin;
-    this.originals = /* @__PURE__ */ new Map();
-    this.views = /* @__PURE__ */ new Map();
-    this.pinned = /* @__PURE__ */ new Map();
-    this.timers = /* @__PURE__ */ new Map();
-    this.refreshTimer = null;
-    /** Renderers that already played the "grow" animation. */
-    this.grown = /* @__PURE__ */ new WeakSet();
-    this.growing = /* @__PURE__ */ new Map();
-    this.frozen = /* @__PURE__ */ new Map();
-    this.freezeTimers = /* @__PURE__ */ new Map();
-    this.depthCache = null;
-    this.posCache = null;
-    this.holdTimer = null;
-    /** Per graph: notes clamped on the last tick (released on the next one). */
-    this.holdRelease = /* @__PURE__ */ new Map();
-    /** How often each note had to be pulled back; repeat offenders widen the barrier instead. */
-    this.holdStrikes = /* @__PURE__ */ new Map();
-    this.holdStrikesReset = 0;
-    /** Target positions last sent to each graph, to skip no-op updates. */
-    this.sent = /* @__PURE__ */ new Map();
-  }
-  get app() {
-    return this.plugin.app;
-  }
-  start() {
-    const p = this.plugin;
-    p.registerEvent(this.app.workspace.on("layout-change", () => this.scan()));
-    const onTreeChange = (f) => {
-      if (f instanceof import_obsidian5.TFolder || f instanceof import_obsidian5.TFile && f.extension === "md") {
-        this.depthCache = null;
-        this.posCache = null;
-        this.refreshSoon();
-      }
-    };
-    p.registerEvent(this.app.vault.on("create", onTreeChange));
-    p.registerEvent(this.app.vault.on("delete", onTreeChange));
-    p.registerEvent(this.app.vault.on("rename", onTreeChange));
-    this.scan();
-    void this.syncColorGroups(false, false);
-    this.holdTimer = window.setInterval(() => this.holdTick(), 400);
-    this.plugin.registerInterval(this.holdTimer);
-  }
-  stop() {
-    if (this.holdTimer !== null) window.clearInterval(this.holdTimer);
-    for (const [r, ids] of this.holdRelease) for (const id of ids) this.post(r, { forceNode: { id, x: null, y: null } });
-    this.holdRelease.clear();
-    this.growing.forEach((id) => window.cancelAnimationFrame(id));
-    this.freezeTimers.forEach((t) => window.clearTimeout(t));
-    for (const r of [...this.originals.keys()]) {
-      this.unfreeze(r);
-      this.unpinAll(r);
-      const orig = this.originals.get(r);
-      if (orig) r.setData = orig;
-    }
-    this.originals.clear();
-    this.views.clear();
-    this.timers.forEach((t) => window.clearTimeout(t));
-    if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
-  }
-  /** Re-applies the layout to every open global graph. */
-  refresh() {
-    this.depthCache = null;
-    this.posCache = null;
-    this.scan();
-    for (const r of this.originals.keys()) this.schedule(r);
-  }
-  refreshSoon() {
-    if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
-    this.refreshTimer = window.setTimeout(() => {
-      this.refreshTimer = null;
-      this.refresh();
-    }, 1200);
-  }
-  /** Finds open graph views and hooks their renderer. */
-  scan() {
-    const alive = /* @__PURE__ */ new Set();
-    for (const leaf of this.app.workspace.getLeavesOfType("graph")) {
-      const view = leaf.view;
-      const r = view.renderer;
-      if (!r || typeof r.setData !== "function" || !r.worker) continue;
-      alive.add(r);
-      if (!this.originals.has(r)) {
-        const orig = r.setData;
-        this.originals.set(r, orig);
-        this.views.set(r, view);
-        r.setData = (data) => {
-          orig.call(r, data);
-          this.schedule(r);
-        };
-        this.schedule(r);
-      }
-    }
-    for (const r of [...this.originals.keys()]) {
-      if (alive.has(r)) continue;
-      this.originals.delete(r);
-      this.views.delete(r);
-      this.pinned.delete(r);
-      this.sent.delete(r);
-    }
-  }
-  schedule(r, tries = 0, delay = 120) {
-    const t = this.timers.get(r);
-    if (t !== void 0) window.clearTimeout(t);
-    this.timers.set(
-      r,
-      window.setTimeout(() => {
-        this.timers.delete(r);
-        this.apply(r, tries);
-      }, delay)
-    );
-  }
-  post(r, msg) {
-    try {
-      r.worker?.postMessage(msg);
-    } catch (e) {
-      console.warn("ObsOrg: graph worker message failed", e);
-    }
-  }
-  hasNode(r, id) {
-    if (r.nodeLookup) return id in r.nodeLookup;
-    return !!r.nodes?.some((n) => n.id === id);
-  }
-  apply(r, tries) {
-    if (!r.nodes || r.nodes.length === 0) {
-      if (tries < 20) this.schedule(r, tries + 1, 250);
-      return;
-    }
-    const s = this.plugin.settings;
-    const prev = this.pinned.get(r) ?? /* @__PURE__ */ new Set();
-    const target = s.skillTreeEnabled ? this.positions() : /* @__PURE__ */ new Map();
-    const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-    if (target.size && !this.grown.has(r) && s.graphGrow && s.animations && !reduced) {
-      this.grown.add(r);
-      this.animateGrow(r, target);
-      return;
-    }
-    this.grown.add(r);
-    if (this.growing.has(r)) return;
-    const last = this.sent.get(r) ?? /* @__PURE__ */ new Map();
-    const now = /* @__PURE__ */ new Set();
-    let moved = false;
-    for (const [id, p] of target) {
-      if (!this.hasNode(r, id)) continue;
-      this.post(r, { forceNode: { id, x: p.x, y: p.y } });
-      now.add(id);
-      const q = last.get(id);
-      if (!q || Math.abs(q.x - p.x) > 0.5 || Math.abs(q.y - p.y) > 0.5) moved = true;
-    }
-    for (const id of prev) {
-      if (!now.has(id)) {
-        this.post(r, { forceNode: { id, x: null, y: null } });
-        moved = true;
-      }
-    }
-    this.pinned.set(r, now);
-    this.sent.set(r, new Map([...now].map((id) => [id, target.get(id)])));
-    if (moved) {
-      this.reheat(r);
-      this.scheduleFreeze(r);
-    } else if (this.plugin.settings.graphFreeze && !this.frozen.has(r)) {
-      this.scheduleFreeze(r);
-    }
-  }
-  /** Branch by branch, level by level: nodes glide from the centre to their places. */
-  animateGrow(r, target) {
-    const depth = this.depths().all;
-    const ids = [...target.keys()].filter((id) => this.hasNode(r, id));
-    const pinned = new Set(ids);
-    for (const id of this.pinned.get(r) ?? []) {
-      if (!pinned.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
-    }
-    this.pinned.set(r, pinned);
-    const DUR = 650;
-    const STAGGER = 380;
-    const t0 = performance.now();
-    const ease = (k) => 1 - Math.pow(1 - k, 3);
-    const step = (now) => {
-      let done = true;
-      for (const id of ids) {
-        const p = target.get(id);
-        const k = Math.min(1, Math.max(0, (now - t0 - ((depth.get(id) ?? 1) - 1) * STAGGER) / DUR));
-        if (k < 1) done = false;
-        const e = ease(k);
-        this.post(r, { forceNode: { id, x: p.x * e, y: p.y * e } });
-      }
-      if (done) {
-        this.growing.delete(r);
-        this.sent.set(r, new Map(ids.map((id) => [id, target.get(id)])));
-        this.scheduleFreeze(r);
-      } else {
-        this.growing.set(r, window.requestAnimationFrame(step));
-      }
-    };
-    this.reheat(r);
-    this.growing.set(r, window.requestAnimationFrame(step));
-  }
-  /** "Frozen" graph: once nodes have settled, pin every node where it is. */
-  scheduleFreeze(r) {
-    const t = this.freezeTimers.get(r);
-    if (t !== void 0) window.clearTimeout(t);
-    if (!this.plugin.settings.graphFreeze) {
-      this.unfreeze(r);
-      return;
-    }
-    this.freezeTimers.set(
-      r,
-      window.setTimeout(() => {
-        this.freezeTimers.delete(r);
-        const pins = this.pinned.get(r) ?? /* @__PURE__ */ new Set();
-        const set = /* @__PURE__ */ new Set();
-        for (const n of r.nodes ?? []) {
-          if (pins.has(n.id) || typeof n.x !== "number") continue;
-          this.post(r, { forceNode: { id: n.id, x: n.x, y: n.y } });
-          set.add(n.id);
-        }
-        this.frozen.set(r, set);
-      }, 3e3)
-    );
-  }
-  unfreeze(r) {
-    const set = this.frozen.get(r);
-    if (!set?.size) return;
-    for (const id of set) this.post(r, { forceNode: { id, x: null, y: null } });
-    this.frozen.delete(r);
-    this.reheat(r);
-  }
-  unpinAll(r) {
-    const prev = this.pinned.get(r);
-    if (!prev?.size) return;
-    for (const id of prev) this.post(r, { forceNode: { id, x: null, y: null } });
-    this.pinned.set(r, /* @__PURE__ */ new Set());
-    this.reheat(r);
-  }
-  /** Wakes the simulation up so nodes glide to their new places. */
-  reheat(r) {
-    this.post(r, { alpha: 0.3, run: true });
-    try {
-      r.changed?.();
-    } catch {
-    }
-  }
-  // ------------------------------------------------------------- layout
-  /** Folder tree of index notes; folders without an index are skipped through. */
-  buildTree() {
-    const build = (folder) => {
-      const childNodes = folder.children.filter((c) => c instanceof import_obsidian5.TFolder && !this.plugin.isExcluded(c)).flatMap(build);
-      const index = folder.isRoot() ? null : this.plugin.findIndex(folder);
-      if (!index) return childNodes;
-      const files = folder.children.filter((c) => c instanceof import_obsidian5.TFile && c !== index).map((f) => f.path);
-      return [{ id: index.path, name: folder.name, children: childNodes, files }];
-    };
-    return build(this.app.vault.getRoot());
-  }
-  layoutOptions() {
-    const s = this.plugin.settings;
-    const directions = {};
-    for (const [name, key] of Object.entries(s.branchDirections)) {
-      if (DIRECTIONS[key]) directions[name] = DIRECTIONS[key].deg;
-    }
-    return {
-      style: s.skillTreeStyle,
-      step: s.skillTreeStep,
-      spreadDeg: s.skillTreeSpread,
-      pinFiles: s.skillTreePinFiles,
-      directions
-    };
-  }
-  /** Depth of every index note (1 = top-level branch) and of pinned files. */
-  depths() {
-    if (this.depthCache) return this.depthCache;
-    const hubs = /* @__PURE__ */ new Map();
-    const all = /* @__PURE__ */ new Map();
-    const walk = (n, d) => {
-      hubs.set(n.id, d);
-      all.set(n.id, d);
-      for (const f of n.files) all.set(f, d + 0.5);
-      n.children.forEach((c) => walk(c, d + 1));
-    };
-    this.buildTree().forEach((r) => walk(r, 1));
-    this.depthCache = { hubs, all };
-    return this.depthCache;
-  }
-  /** Index notes and their depth in the folder tree (used by graph effects). */
-  hubDepths() {
-    return this.depths().hubs;
-  }
-  positions() {
-    if (!this.posCache) this.posCache = layoutSkillTree(this.buildTree(), this.layoutOptions());
-    return this.posCache;
-  }
-  // ------------------------------------------------------------- modules
-  /**
-   * Keeps module members inside their barrier: a note that drifted outside
-   * is pinned just inside for one tick and released on the next, so the
-   * physics carries on from there. If a note keeps escaping (the layout
-   * wants it outside), the barrier grows instead of fighting the physics.
-   */
-  holdTick() {
-    const s = this.plugin.settings;
-    const modules = this.plugin.modules;
-    const now = performance.now();
-    if (now - this.holdStrikesReset > 3e4) {
-      this.holdStrikes.clear();
-      this.holdStrikesReset = now;
-    }
-    for (const r of this.originals.keys()) {
-      const release = this.holdRelease.get(r) ?? /* @__PURE__ */ new Set();
-      for (const id of release) this.post(r, { forceNode: { id, x: null, y: null } });
-      release.clear();
-      this.holdRelease.set(r, release);
-      if (!s.moduleHold || !modules.list.length || !r.nodes?.length || this.growing.has(r)) continue;
-      const pinned = this.pinned.get(r);
-      const frozen = this.frozen.get(r);
-      const members = modules.members();
-      let clamped = 0;
-      for (const m of modules.list) {
-        const set = members.get(m.id);
-        if (!set?.size) continue;
-        const nodes = r.nodes.filter((n) => set.has(n.id));
-        if (!nodes.length) continue;
-        const median = (v) => {
-          v.sort((p, q) => p - q);
-          const mid = v.length >> 1;
-          return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
-        };
-        const cx = median(nodes.map((n) => n.x));
-        const cy = median(nodes.map((n) => n.y));
-        const R = modules.radius(m.id, nodes.length);
-        for (const n of nodes) {
-          if (pinned?.has(n.id) || frozen?.has(n.id)) continue;
-          const dx = n.x - cx;
-          const dy = n.y - cy;
-          const d = Math.hypot(dx, dy);
-          if (d <= R || d === 0) continue;
-          const strikes = (this.holdStrikes.get(n.id) ?? 0) + 1;
-          this.holdStrikes.set(n.id, strikes);
-          if (strikes > 6) {
-            modules.widen(m.id, d - R + 20);
-            continue;
-          }
-          const k = R * 0.85 / d;
-          this.post(r, { forceNode: { id: n.id, x: cx + dx * k, y: cy + dy * k } });
-          release.add(n.id);
-          clamped++;
-        }
-      }
-      if (clamped) this.post(r, { alpha: 0.05, run: true });
-    }
-  }
-  // ------------------------------------------------------------- colours
-  /**
-   * Keeps graph colour groups in line with the settings: the index-note tag
-   * group (only once the user asked for it) and one group per module that
-   * paints its nodes. Groups the user created are never touched; groups this
-   * plugin wrote earlier but no longer wants are removed.
-   */
-  async syncColorGroups(addIndexGroup, notify) {
-    const s = this.plugin.settings;
-    const tag = s.tag.replace(/^#/, "").trim();
-    if (addIndexGroup && !tag) {
-      if (notify) new import_obsidian5.Notice("ObsOrg: \u0441\u043D\u0430\u0447\u0430\u043B\u0430 \u0443\u043A\u0430\u0436\u0438\u0442\u0435 \u0442\u0435\u0433 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432.");
-      return;
-    }
-    const adapter = this.app.vault.adapter;
-    const path = (0, import_obsidian5.normalizePath)(`${this.app.vault.configDir}/graph.json`);
-    let cfg = {};
-    try {
-      if (await adapter.exists(path)) cfg = JSON.parse(await adapter.read(path));
-    } catch (e) {
-      console.error("ObsOrg: cannot read graph.json", e);
-      if (notify) new import_obsidian5.Notice("ObsOrg: \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u0440\u043E\u0447\u0438\u0442\u0430\u0442\u044C \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438 \u0433\u0440\u0430\u0444\u0430.");
-      return;
-    }
-    const managed = new Set(s.managedGraphQueries);
-    const tagQuery = tag ? `tag:#${tag}` : null;
-    const desired = [];
-    if (tagQuery && (addIndexGroup || managed.has(tagQuery))) {
-      desired.push({ query: tagQuery, color: { a: 1, rgb: hexToRgb(s.highlightColor) } });
-    }
-    for (const g of this.plugin.modules.colorGroups()) {
-      if (!desired.some((d) => d.query === g.query)) desired.push({ query: g.query, color: { a: 1, rgb: hexToRgb(g.color) } });
-    }
-    const desiredQ = new Set(desired.map((g) => g.query));
-    const userGroups = (cfg.colorGroups ?? []).filter((g) => !managed.has(g.query) && !desiredQ.has(g.query));
-    const groups = [...desired, ...userGroups];
-    const nextManaged = desired.map((g) => g.query);
-    if (JSON.stringify(groups) !== JSON.stringify(cfg.colorGroups ?? [])) {
-      cfg.colorGroups = groups;
-      await adapter.write(path, JSON.stringify(cfg, null, 2));
-      try {
-        const graph = this.app.internalPlugins?.getPluginById?.("graph");
-        const opts = graph?.instance?.options;
-        if (opts) opts.colorGroups = groups;
-      } catch {
-      }
-    }
-    if (JSON.stringify(nextManaged) !== JSON.stringify(s.managedGraphQueries)) {
-      s.managedGraphQueries = nextManaged;
-      await this.plugin.saveSettings();
-    }
-    if (notify) {
-      new import_obsidian5.Notice("ObsOrg: \u0446\u0432\u0435\u0442 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u0434\u043E\u0431\u0430\u0432\u043B\u0435\u043D \u0432 \u0433\u0440\u0430\u0444. \u0417\u0430\u043A\u0440\u043E\u0439\u0442\u0435 \u0438 \u0441\u043D\u043E\u0432\u0430 \u043E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0433\u0440\u0430\u0444.", 8e3);
-    }
-  }
-};
-
-// src/graph-fx.ts
-var import_obsidian6 = require("obsidian");
-
-// src/rays.ts
-var RAY_STYLES = {
-  spark: "\u0418\u0441\u043A\u0440\u0430",
-  beam: "\u041B\u0443\u0447",
-  energy: "\u042D\u043D\u0435\u0440\u0433\u0438\u044F",
-  lightning: "\u042D\u043B\u0435\u043A\u0442\u0440\u0438\u0447\u0435\u0441\u0442\u0432\u043E"
-};
-function rng(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a = a + 1831565813 >>> 0;
-    let t = a;
-    t = Math.imul(t ^ t >>> 15, t | 1);
-    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
-    return ((t ^ t >>> 14) >>> 0) / 4294967296;
-  };
-}
-var WHITE = (a) => `rgba(255,255,255,${a < 0 ? 0 : a > 1 ? 1 : a.toFixed(3)})`;
-function drawRay(ctx, a, b, p) {
-  const len = Math.hypot(b.x - a.x, b.y - a.y);
-  if (len < 2 || p.alpha <= 0.01 || p.head <= 0) return;
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  switch (p.style) {
-    case "beam":
-      drawBeam(ctx, a, b, p);
-      break;
-    case "energy":
-      drawEnergy(ctx, a, b, len, p);
-      break;
-    case "lightning":
-      drawLightning(ctx, a, b, len, p);
-      break;
-    default:
-      drawSpark(ctx, a, b, p);
-  }
-}
-function dot(ctx, x, y, r, style) {
-  ctx.fillStyle = style;
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fill();
-}
-function line(ctx, ax, ay, bx, by, width, style) {
-  ctx.strokeStyle = style;
-  ctx.lineWidth = width;
-  ctx.beginPath();
-  ctx.moveTo(ax, ay);
-  ctx.lineTo(bx, by);
-  ctx.stroke();
-}
-function drawSpark(ctx, a, b, p) {
-  const k = p.constant ? (p.t * 0.55 + p.seed * 0.137) % 1 : p.head;
-  const x = a.x + (b.x - a.x) * k;
-  const y = a.y + (b.y - a.y) * k;
-  dot(ctx, x, y, 6 * p.width, p.color(0.25 * p.alpha));
-  dot(ctx, x, y, 2.6 * p.width, p.color(0.95 * p.alpha));
-}
-function drawBeam(ctx, a, b, p) {
-  let alpha = p.alpha;
-  if (p.constant) alpha *= 0.55 + 0.45 * Math.sin(p.t * 3.2 + p.seed);
-  const hk = p.head;
-  const tk = p.constant ? 0 : Math.max(0, hk - 0.5);
-  const hx = a.x + (b.x - a.x) * hk;
-  const hy = a.y + (b.y - a.y) * hk;
-  const tx = a.x + (b.x - a.x) * tk;
-  const ty = a.y + (b.y - a.y) * tk;
-  if ((p.quality ?? 2) === 2) line(ctx, tx, ty, hx, hy, 7 * p.width, p.color(0.12 * alpha));
-  line(ctx, tx, ty, hx, hy, 3.5 * p.width, p.color(0.26 * alpha));
-  const g = ctx.createLinearGradient(tx, ty, hx, hy);
-  g.addColorStop(0, p.color(p.constant ? 0.5 * alpha : 0));
-  g.addColorStop(0.7, p.color(0.9 * alpha));
-  g.addColorStop(1, WHITE(alpha));
-  line(ctx, tx, ty, hx, hy, 1.6 * p.width, g);
-  if (!p.constant && hk < 1) {
-    dot(ctx, hx, hy, 6 * p.width, p.color(0.3 * alpha));
-    dot(ctx, hx, hy, 2.2 * p.width, WHITE(alpha));
-  }
-}
-function drawEnergy(ctx, a, b, len, p) {
-  const q = p.quality ?? 2;
-  const ux = (b.x - a.x) / len;
-  const uy = (b.y - a.y) / len;
-  const amp = 3.6 * p.width;
-  const steps = Math.min(q === 2 ? 36 : q === 1 ? 24 : 14, Math.max(8, Math.round(len * p.head / 9)));
-  const wave = (s, shift) => amp * Math.sin(Math.PI * Math.min(1, s)) * Math.sin(s * len / 9 - p.t * 7 + p.seed + shift);
-  const strand = (shift, width, style) => {
-    ctx.strokeStyle = style;
-    ctx.lineWidth = width;
-    ctx.beginPath();
-    for (let i = 0; i <= steps; i++) {
-      const s = i / steps * p.head;
-      const off = wave(s, shift);
-      const x = a.x + ux * s * len - uy * off;
-      const y = a.y + uy * s * len + ux * off;
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-  };
-  strand(0, (q === 2 ? 6 : 4) * p.width, p.color(0.16 * p.alpha));
-  strand(0, 1.6 * p.width, p.color(0.95 * p.alpha));
-  if (q > 0) strand(Math.PI, 1.1 * p.width, p.color(0.6 * p.alpha));
-  const blobs = q === 0 ? 1 : 3;
-  for (let j = 0; j < blobs; j++) {
-    const s = (p.t * 0.7 + j / 3 + p.seed * 0.171) % 1;
-    if (s > p.head) continue;
-    const off = wave(s, 0);
-    const x = a.x + ux * s * len - uy * off;
-    const y = a.y + uy * s * len + ux * off;
-    dot(ctx, x, y, 5 * p.width, p.color(0.3 * p.alpha));
-    dot(ctx, x, y, 2 * p.width, WHITE(0.9 * p.alpha));
-  }
-}
-function drawLightning(ctx, a, b, len, p) {
-  const q = p.quality ?? 2;
-  const r = rng(Math.floor(p.t * 18) * 9973 + p.seed * 7919);
-  const ex = a.x + (b.x - a.x) * p.head;
-  const ey = a.y + (b.y - a.y) * p.head;
-  const segLen = Math.hypot(ex - a.x, ey - a.y);
-  if (segLen < 2) return;
-  const ux = (ex - a.x) / segLen;
-  const uy = (ey - a.y) / segLen;
-  const n = Math.min(q === 2 ? 18 : q === 1 ? 12 : 7, Math.max(4, Math.round(segLen / 14)));
-  const jitter = Math.min(14, len * 0.08) * (0.7 + 0.3 * p.width);
-  const xs = new Array(n + 1);
-  const ys = new Array(n + 1);
-  for (let i = 0; i <= n; i++) {
-    const s = i / n;
-    const off = i === 0 || i === n ? 0 : (r() * 2 - 1) * jitter * Math.sin(Math.PI * s);
-    xs[i] = a.x + ux * s * segLen - uy * off;
-    ys[i] = a.y + uy * s * segLen + ux * off;
-  }
-  const alpha = p.alpha * (0.55 + r() * 0.45);
-  const path = (px, py, width, style) => {
-    ctx.strokeStyle = style;
-    ctx.lineWidth = width;
-    ctx.beginPath();
-    ctx.moveTo(px[0], py[0]);
-    for (let i = 1; i < px.length; i++) ctx.lineTo(px[i], py[i]);
-    ctx.stroke();
-  };
-  if (q === 2) path(xs, ys, 6 * p.width, p.color(0.16 * alpha));
-  path(xs, ys, 2.6 * p.width, p.color(0.45 * alpha));
-  path(xs, ys, 1.1 * p.width, WHITE(0.95 * alpha));
-  if (q === 0) return;
-  const chance = q === 2 ? 0.2 : 0.1;
-  for (let i = 1; i < n; i++) {
-    if (r() > chance) continue;
-    const dir = Math.atan2(uy, ux) + (r() < 0.5 ? -1 : 1) * (0.4 + r() * 0.6);
-    const bx = [xs[i]];
-    const by = [ys[i]];
-    const parts = 2 + Math.floor(r() * 2);
-    for (let k = 0; k < parts; k++) {
-      const l = 6 + r() * 10;
-      const d = dir + (r() * 2 - 1) * 0.5;
-      bx.push(bx[bx.length - 1] + Math.cos(d) * l);
-      by.push(by[by.length - 1] + Math.sin(d) * l);
-    }
-    path(bx, by, 2.4 * p.width, p.color(0.3 * alpha));
-    path(bx, by, 0.8 * p.width, WHITE(0.8 * alpha));
-  }
-}
-
 // src/module-shapes.ts
 var LINE_STYLES = {
   zigzag: "\u0417\u0438\u0433\u0437\u0430\u0433",
@@ -1786,6 +1204,716 @@ function elasticOut(x) {
   if (x <= 0) return 0;
   if (x >= 1) return 1;
   return Math.pow(2, -10 * x) * Math.sin((x * 10 - 0.75) * (2 * Math.PI / 3)) + 1;
+}
+function separateCircles(circles, gap, iterations = 300) {
+  const n = circles.length;
+  if (n < 2) return circles;
+  const area = (c) => c.r * c.r + 1;
+  const total = circles.reduce((s, c) => s + area(c), 0);
+  const cx0 = circles.reduce((s, c) => s + c.x * area(c), 0) / total;
+  const cy0 = circles.reduce((s, c) => s + c.y * area(c), 0) / total;
+  for (let it = 0; it < iterations; it++) {
+    let moved = false;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const a = circles[i];
+        const b = circles[j];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let d = Math.hypot(dx, dy);
+        const need = a.r + b.r + gap;
+        if (d >= need - 0.01) continue;
+        if (d < 1e-6) {
+          const ang = (i * 7 + j * 13) % 16 * (Math.PI / 8);
+          dx = Math.cos(ang);
+          dy = Math.sin(ang);
+          d = 1;
+        }
+        const push = need - d;
+        const wa = area(b) / (area(a) + area(b));
+        const wb = 1 - wa;
+        a.x -= dx / d * push * wa;
+        a.y -= dy / d * push * wa;
+        b.x += dx / d * push * wb;
+        b.y += dy / d * push * wb;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  const cx1 = circles.reduce((s, c) => s + c.x * area(c), 0) / total;
+  const cy1 = circles.reduce((s, c) => s + c.y * area(c), 0) / total;
+  for (const c of circles) {
+    c.x += cx0 - cx1;
+    c.y += cy0 - cy1;
+  }
+  return circles;
+}
+
+// src/graph.ts
+var hexToRgb = (hex) => {
+  const h = hex.replace("#", "");
+  const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h.slice(0, 6);
+  return parseInt(full, 16) || 0;
+};
+var GraphTree = class {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.originals = /* @__PURE__ */ new Map();
+    this.views = /* @__PURE__ */ new Map();
+    this.pinned = /* @__PURE__ */ new Map();
+    this.timers = /* @__PURE__ */ new Map();
+    this.refreshTimer = null;
+    /** Renderers that already played the "grow" animation. */
+    this.grown = /* @__PURE__ */ new WeakSet();
+    this.growing = /* @__PURE__ */ new Map();
+    this.frozen = /* @__PURE__ */ new Map();
+    this.freezeTimers = /* @__PURE__ */ new Map();
+    this.depthCache = null;
+    this.posCache = null;
+    /** Pin targets including module placement; rebuilt when modules or the base layout change. */
+    this.modLayout = null;
+    this.holdTimer = null;
+    /** Per graph: notes clamped on the last tick (released on the next one). */
+    this.holdRelease = /* @__PURE__ */ new Map();
+    /** How often each note had to be pulled back; repeat offenders widen the barrier instead. */
+    this.holdStrikes = /* @__PURE__ */ new Map();
+    this.holdStrikesReset = 0;
+    /** Target positions last sent to each graph, to skip no-op updates. */
+    this.sent = /* @__PURE__ */ new Map();
+  }
+  get app() {
+    return this.plugin.app;
+  }
+  start() {
+    const p = this.plugin;
+    p.registerEvent(this.app.workspace.on("layout-change", () => this.scan()));
+    const onTreeChange = (f) => {
+      if (f instanceof import_obsidian5.TFolder || f instanceof import_obsidian5.TFile && f.extension === "md") {
+        this.depthCache = null;
+        this.posCache = null;
+        this.refreshSoon();
+      }
+    };
+    p.registerEvent(this.app.vault.on("create", onTreeChange));
+    p.registerEvent(this.app.vault.on("delete", onTreeChange));
+    p.registerEvent(this.app.vault.on("rename", onTreeChange));
+    this.scan();
+    void this.syncColorGroups(false, false);
+    this.holdTimer = window.setInterval(() => this.holdTick(), 400);
+    this.plugin.registerInterval(this.holdTimer);
+  }
+  stop() {
+    if (this.holdTimer !== null) window.clearInterval(this.holdTimer);
+    for (const [r, ids] of this.holdRelease) for (const id of ids) this.post(r, { forceNode: { id, x: null, y: null } });
+    this.holdRelease.clear();
+    this.growing.forEach((id) => window.cancelAnimationFrame(id));
+    this.freezeTimers.forEach((t) => window.clearTimeout(t));
+    for (const r of [...this.originals.keys()]) {
+      this.unfreeze(r);
+      this.unpinAll(r);
+      const orig = this.originals.get(r);
+      if (orig) r.setData = orig;
+    }
+    this.originals.clear();
+    this.views.clear();
+    this.timers.forEach((t) => window.clearTimeout(t));
+    if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
+  }
+  /** Re-applies the layout to every open global graph. */
+  refresh() {
+    this.depthCache = null;
+    this.posCache = null;
+    this.modLayout = null;
+    this.scan();
+    for (const r of this.originals.keys()) this.schedule(r);
+  }
+  refreshSoon() {
+    if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
+    this.refreshTimer = window.setTimeout(() => {
+      this.refreshTimer = null;
+      this.refresh();
+    }, 1200);
+  }
+  /** Finds open graph views and hooks their renderer. */
+  scan() {
+    const alive = /* @__PURE__ */ new Set();
+    for (const leaf of this.app.workspace.getLeavesOfType("graph")) {
+      const view = leaf.view;
+      const r = view.renderer;
+      if (!r || typeof r.setData !== "function" || !r.worker) continue;
+      alive.add(r);
+      if (!this.originals.has(r)) {
+        const orig = r.setData;
+        this.originals.set(r, orig);
+        this.views.set(r, view);
+        r.setData = (data) => {
+          orig.call(r, data);
+          this.schedule(r);
+        };
+        this.schedule(r);
+      }
+    }
+    for (const r of [...this.originals.keys()]) {
+      if (alive.has(r)) continue;
+      this.originals.delete(r);
+      this.views.delete(r);
+      this.pinned.delete(r);
+      this.sent.delete(r);
+    }
+  }
+  schedule(r, tries = 0, delay = 120) {
+    const t = this.timers.get(r);
+    if (t !== void 0) window.clearTimeout(t);
+    this.timers.set(
+      r,
+      window.setTimeout(() => {
+        this.timers.delete(r);
+        this.apply(r, tries);
+      }, delay)
+    );
+  }
+  post(r, msg) {
+    try {
+      r.worker?.postMessage(msg);
+    } catch (e) {
+      console.warn("ObsOrg: graph worker message failed", e);
+    }
+  }
+  hasNode(r, id) {
+    if (r.nodeLookup) return id in r.nodeLookup;
+    return !!r.nodes?.some((n) => n.id === id);
+  }
+  apply(r, tries) {
+    if (!r.nodes || r.nodes.length === 0) {
+      if (tries < 20) this.schedule(r, tries + 1, 250);
+      return;
+    }
+    const s = this.plugin.settings;
+    const prev = this.pinned.get(r) ?? /* @__PURE__ */ new Set();
+    const base = s.skillTreeEnabled ? this.positions() : /* @__PURE__ */ new Map();
+    const target = this.withModules(r, base);
+    const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    if (target.size && !this.grown.has(r) && s.graphGrow && s.animations && !reduced) {
+      this.grown.add(r);
+      this.animateGrow(r, target);
+      return;
+    }
+    this.grown.add(r);
+    if (this.growing.has(r)) return;
+    const last = this.sent.get(r) ?? /* @__PURE__ */ new Map();
+    const now = /* @__PURE__ */ new Set();
+    let moved = false;
+    for (const [id, p] of target) {
+      if (!this.hasNode(r, id)) continue;
+      this.post(r, { forceNode: { id, x: p.x, y: p.y } });
+      now.add(id);
+      const q = last.get(id);
+      if (!q || Math.abs(q.x - p.x) > 0.5 || Math.abs(q.y - p.y) > 0.5) moved = true;
+    }
+    for (const id of prev) {
+      if (!now.has(id)) {
+        this.post(r, { forceNode: { id, x: null, y: null } });
+        moved = true;
+      }
+    }
+    this.pinned.set(r, now);
+    this.sent.set(r, new Map([...now].map((id) => [id, target.get(id)])));
+    if (moved) {
+      this.reheat(r);
+      this.scheduleFreeze(r);
+    } else if (this.plugin.settings.graphFreeze && !this.frozen.has(r)) {
+      this.scheduleFreeze(r);
+    }
+  }
+  /** Branch by branch, level by level: nodes glide from the centre to their places. */
+  animateGrow(r, target) {
+    const depth = this.depths().all;
+    const ids = [...target.keys()].filter((id) => this.hasNode(r, id));
+    const pinned = new Set(ids);
+    for (const id of this.pinned.get(r) ?? []) {
+      if (!pinned.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+    }
+    this.pinned.set(r, pinned);
+    const DUR = 650;
+    const STAGGER = 380;
+    const t0 = performance.now();
+    const ease = (k) => 1 - Math.pow(1 - k, 3);
+    const step = (now) => {
+      let done = true;
+      for (const id of ids) {
+        const p = target.get(id);
+        const k = Math.min(1, Math.max(0, (now - t0 - ((depth.get(id) ?? 1) - 1) * STAGGER) / DUR));
+        if (k < 1) done = false;
+        const e = ease(k);
+        this.post(r, { forceNode: { id, x: p.x * e, y: p.y * e } });
+      }
+      if (done) {
+        this.growing.delete(r);
+        this.sent.set(r, new Map(ids.map((id) => [id, target.get(id)])));
+        this.scheduleFreeze(r);
+      } else {
+        this.growing.set(r, window.requestAnimationFrame(step));
+      }
+    };
+    this.reheat(r);
+    this.growing.set(r, window.requestAnimationFrame(step));
+  }
+  /** "Frozen" graph: once nodes have settled, pin every node where it is. */
+  scheduleFreeze(r) {
+    const t = this.freezeTimers.get(r);
+    if (t !== void 0) window.clearTimeout(t);
+    if (!this.plugin.settings.graphFreeze) {
+      this.unfreeze(r);
+      return;
+    }
+    this.freezeTimers.set(
+      r,
+      window.setTimeout(() => {
+        this.freezeTimers.delete(r);
+        const pins = this.pinned.get(r) ?? /* @__PURE__ */ new Set();
+        const set = /* @__PURE__ */ new Set();
+        for (const n of r.nodes ?? []) {
+          if (pins.has(n.id) || typeof n.x !== "number") continue;
+          this.post(r, { forceNode: { id: n.id, x: n.x, y: n.y } });
+          set.add(n.id);
+        }
+        this.frozen.set(r, set);
+      }, 3e3)
+    );
+  }
+  unfreeze(r) {
+    const set = this.frozen.get(r);
+    if (!set?.size) return;
+    for (const id of set) this.post(r, { forceNode: { id, x: null, y: null } });
+    this.frozen.delete(r);
+    this.reheat(r);
+  }
+  unpinAll(r) {
+    const prev = this.pinned.get(r);
+    if (!prev?.size) return;
+    for (const id of prev) this.post(r, { forceNode: { id, x: null, y: null } });
+    this.pinned.set(r, /* @__PURE__ */ new Set());
+    this.reheat(r);
+  }
+  /** Wakes the simulation up so nodes glide to their new places. */
+  reheat(r) {
+    this.post(r, { alpha: 0.3, run: true });
+    try {
+      r.changed?.();
+    } catch {
+    }
+  }
+  // ------------------------------------------------------------- layout
+  /** Folder tree of index notes; folders without an index are skipped through. */
+  buildTree() {
+    const build = (folder) => {
+      const childNodes = folder.children.filter((c) => c instanceof import_obsidian5.TFolder && !this.plugin.isExcluded(c)).flatMap(build);
+      const index = folder.isRoot() ? null : this.plugin.findIndex(folder);
+      if (!index) return childNodes;
+      const files = folder.children.filter((c) => c instanceof import_obsidian5.TFile && c !== index).map((f) => f.path);
+      return [{ id: index.path, name: folder.name, children: childNodes, files }];
+    };
+    return build(this.app.vault.getRoot());
+  }
+  layoutOptions() {
+    const s = this.plugin.settings;
+    const directions = {};
+    for (const [name, key] of Object.entries(s.branchDirections)) {
+      if (DIRECTIONS[key]) directions[name] = DIRECTIONS[key].deg;
+    }
+    return {
+      style: s.skillTreeStyle,
+      step: s.skillTreeStep,
+      spreadDeg: s.skillTreeSpread,
+      pinFiles: s.skillTreePinFiles,
+      directions
+    };
+  }
+  /** Depth of every index note (1 = top-level branch) and of pinned files. */
+  depths() {
+    if (this.depthCache) return this.depthCache;
+    const hubs = /* @__PURE__ */ new Map();
+    const all = /* @__PURE__ */ new Map();
+    const walk = (n, d) => {
+      hubs.set(n.id, d);
+      all.set(n.id, d);
+      for (const f of n.files) all.set(f, d + 0.5);
+      n.children.forEach((c) => walk(c, d + 1));
+    };
+    this.buildTree().forEach((r) => walk(r, 1));
+    this.depthCache = { hubs, all };
+    return this.depthCache;
+  }
+  /** Index notes and their depth in the folder tree (used by graph effects). */
+  hubDepths() {
+    return this.depths().hubs;
+  }
+  positions() {
+    if (!this.posCache) this.posCache = layoutSkillTree(this.buildTree(), this.layoutOptions());
+    return this.posCache;
+  }
+  // ------------------------------------------------------------- modules
+  /**
+   * Gives every module its own place: module circles (barrier radius + padding)
+   * are pushed apart until they don't overlap (touching is fine), starting from
+   * where they are now so the layout only shifts as much as needed. A module
+   * whose notes are pinned by the skill tree moves as a whole (the branch keeps
+   * its shape); otherwise one anchor note (the folder's index note if it is in
+   * the module) is pinned at the module's place and holding keeps the rest around it.
+   */
+  withModules(r, base) {
+    const s = this.plugin.settings;
+    const modules = this.plugin.modules;
+    if (!s.moduleSeparate || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
+      modules.centers.clear();
+      return base;
+    }
+    const key = [modules.version, modules.sizeKey(), s.moduleSize, s.moduleGap, r.nodes.length, JSON.stringify(s.modules.map((m) => [m.id, m.kind, m.value]))].join("|");
+    if (this.modLayout && this.modLayout.key === key && this.modLayout.base === base) return this.modLayout.target;
+    const members = modules.members();
+    const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
+    const pad2 = 38 * s.moduleSize;
+    const median = (v) => {
+      v.sort((p, q) => p - q);
+      const mid = v.length >> 1;
+      return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+    };
+    const circles = [];
+    for (const m of modules.list) {
+      const ids = [...members.get(m.id) ?? []].filter((id) => nodeById.has(id));
+      if (!ids.length) continue;
+      const pinnedIds = ids.filter((id) => base.has(id));
+      const baseC = pinnedIds.length ? centroid(pinnedIds.map((id) => base.get(id))) : null;
+      const start = modules.centers.get(m.id) ?? baseC ?? { x: median(ids.map((id) => nodeById.get(id).x)), y: median(ids.map((id) => nodeById.get(id).y)) };
+      circles.push({ x: start.x, y: start.y, r: modules.radius(m.id, ids.length) + pad2, id: m.id, ids, baseC });
+    }
+    separateCircles(circles, s.moduleGap);
+    const target = new Map(base);
+    const alive = /* @__PURE__ */ new Set();
+    for (const c of circles) {
+      alive.add(c.id);
+      modules.centers.set(c.id, { x: c.x, y: c.y });
+      if (c.baseC) {
+        const dx = c.x - c.baseC.x;
+        const dy = c.y - c.baseC.y;
+        for (const id of c.ids) {
+          const p = base.get(id);
+          if (p) target.set(id, { x: p.x + dx, y: p.y + dy });
+        }
+      } else {
+        const anchor = c.ids.find((id) => {
+          const f = this.app.vault.getAbstractFileByPath(id);
+          return f instanceof import_obsidian5.TFile && this.plugin.isIndexNote(f);
+        }) ?? c.ids[0];
+        target.set(anchor, { x: c.x, y: c.y });
+      }
+    }
+    for (const id of [...modules.centers.keys()]) if (!alive.has(id)) modules.centers.delete(id);
+    this.modLayout = { key, base, target };
+    return target;
+  }
+  /**
+   * Keeps module members inside their barrier: a note that drifted outside
+   * is pinned just inside for one tick and released on the next, so the
+   * physics carries on from there. If a note keeps escaping (the layout
+   * wants it outside), the barrier grows instead of fighting the physics.
+   */
+  holdTick() {
+    const s = this.plugin.settings;
+    const modules = this.plugin.modules;
+    const now = performance.now();
+    if (now - this.holdStrikesReset > 3e4) {
+      this.holdStrikes.clear();
+      this.holdStrikesReset = now;
+    }
+    for (const r of this.originals.keys()) {
+      const release = this.holdRelease.get(r) ?? /* @__PURE__ */ new Set();
+      for (const id of release) this.post(r, { forceNode: { id, x: null, y: null } });
+      release.clear();
+      this.holdRelease.set(r, release);
+      if (!s.moduleHold || !modules.list.length || !r.nodes?.length || this.growing.has(r)) continue;
+      const pinned = this.pinned.get(r);
+      const frozen = this.frozen.get(r);
+      const members = modules.members();
+      let clamped = 0;
+      const widened = /* @__PURE__ */ new Set();
+      for (const m of modules.list) {
+        const set = members.get(m.id);
+        if (!set?.size) continue;
+        const nodes = r.nodes.filter((n) => set.has(n.id));
+        if (!nodes.length) continue;
+        const median = (v) => {
+          v.sort((p, q) => p - q);
+          const mid = v.length >> 1;
+          return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+        };
+        const placed = s.moduleSeparate ? modules.centers.get(m.id) : void 0;
+        const cx = placed?.x ?? median(nodes.map((n) => n.x));
+        const cy = placed?.y ?? median(nodes.map((n) => n.y));
+        const R = modules.radius(m.id, nodes.length);
+        if (s.moduleSeparate) {
+          for (const n of r.nodes) {
+            if (set.has(n.id) || pinned?.has(n.id) || frozen?.has(n.id)) continue;
+            const dx = n.x - cx;
+            const dy = n.y - cy;
+            const d = Math.hypot(dx, dy) || 1;
+            if (d >= R * 0.95) continue;
+            const key = `${n.id}|out`;
+            const strikes = (this.holdStrikes.get(key) ?? 0) + 1;
+            this.holdStrikes.set(key, strikes);
+            if (strikes > 6) continue;
+            const k = R * 1.1 / d;
+            this.post(r, { forceNode: { id: n.id, x: cx + dx * k, y: cy + dy * k } });
+            release.add(n.id);
+            clamped++;
+          }
+        }
+        for (const n of nodes) {
+          if (pinned?.has(n.id) || frozen?.has(n.id)) continue;
+          const dx = n.x - cx;
+          const dy = n.y - cy;
+          const d = Math.hypot(dx, dy);
+          if (d <= R || d === 0) continue;
+          const strikes = (this.holdStrikes.get(n.id) ?? 0) + 1;
+          this.holdStrikes.set(n.id, strikes);
+          if (strikes > 6) {
+            modules.widen(m.id, d - R + 20);
+            widened.add(m.id);
+            continue;
+          }
+          const k = R * 0.85 / d;
+          this.post(r, { forceNode: { id: n.id, x: cx + dx * k, y: cy + dy * k } });
+          release.add(n.id);
+          clamped++;
+        }
+      }
+      for (const m of modules.list) if (!widened.has(m.id)) modules.relax(m.id);
+      if (clamped) this.post(r, { alpha: 0.05, run: true });
+    }
+  }
+  // ------------------------------------------------------------- colours
+  /**
+   * Keeps graph colour groups in line with the settings: the index-note tag
+   * group (only once the user asked for it) and one group per module that
+   * paints its nodes. Groups the user created are never touched; groups this
+   * plugin wrote earlier but no longer wants are removed.
+   */
+  async syncColorGroups(addIndexGroup, notify) {
+    const s = this.plugin.settings;
+    const tag = s.tag.replace(/^#/, "").trim();
+    if (addIndexGroup && !tag) {
+      if (notify) new import_obsidian5.Notice("ObsOrg: \u0441\u043D\u0430\u0447\u0430\u043B\u0430 \u0443\u043A\u0430\u0436\u0438\u0442\u0435 \u0442\u0435\u0433 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432.");
+      return;
+    }
+    const adapter = this.app.vault.adapter;
+    const path = (0, import_obsidian5.normalizePath)(`${this.app.vault.configDir}/graph.json`);
+    let cfg = {};
+    try {
+      if (await adapter.exists(path)) cfg = JSON.parse(await adapter.read(path));
+    } catch (e) {
+      console.error("ObsOrg: cannot read graph.json", e);
+      if (notify) new import_obsidian5.Notice("ObsOrg: \u043D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u043F\u0440\u043E\u0447\u0438\u0442\u0430\u0442\u044C \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438 \u0433\u0440\u0430\u0444\u0430.");
+      return;
+    }
+    const managed = new Set(s.managedGraphQueries);
+    const tagQuery = tag ? `tag:#${tag}` : null;
+    const desired = [];
+    if (tagQuery && (addIndexGroup || managed.has(tagQuery))) {
+      desired.push({ query: tagQuery, color: { a: 1, rgb: hexToRgb(s.highlightColor) } });
+    }
+    for (const g of this.plugin.modules.colorGroups()) {
+      if (!desired.some((d) => d.query === g.query)) desired.push({ query: g.query, color: { a: 1, rgb: hexToRgb(g.color) } });
+    }
+    const desiredQ = new Set(desired.map((g) => g.query));
+    const userGroups = (cfg.colorGroups ?? []).filter((g) => !managed.has(g.query) && !desiredQ.has(g.query));
+    const groups = [...desired, ...userGroups];
+    const nextManaged = desired.map((g) => g.query);
+    if (JSON.stringify(groups) !== JSON.stringify(cfg.colorGroups ?? [])) {
+      cfg.colorGroups = groups;
+      await adapter.write(path, JSON.stringify(cfg, null, 2));
+      try {
+        const graph = this.app.internalPlugins?.getPluginById?.("graph");
+        const opts = graph?.instance?.options;
+        if (opts) opts.colorGroups = groups;
+      } catch {
+      }
+    }
+    if (JSON.stringify(nextManaged) !== JSON.stringify(s.managedGraphQueries)) {
+      s.managedGraphQueries = nextManaged;
+      await this.plugin.saveSettings();
+    }
+    if (notify) {
+      new import_obsidian5.Notice("ObsOrg: \u0446\u0432\u0435\u0442 \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u0434\u043E\u0431\u0430\u0432\u043B\u0435\u043D \u0432 \u0433\u0440\u0430\u0444. \u0417\u0430\u043A\u0440\u043E\u0439\u0442\u0435 \u0438 \u0441\u043D\u043E\u0432\u0430 \u043E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0433\u0440\u0430\u0444.", 8e3);
+    }
+  }
+};
+
+// src/graph-fx.ts
+var import_obsidian6 = require("obsidian");
+
+// src/rays.ts
+var RAY_STYLES = {
+  spark: "\u0418\u0441\u043A\u0440\u0430",
+  beam: "\u041B\u0443\u0447",
+  energy: "\u042D\u043D\u0435\u0440\u0433\u0438\u044F",
+  lightning: "\u042D\u043B\u0435\u043A\u0442\u0440\u0438\u0447\u0435\u0441\u0442\u0432\u043E"
+};
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = a + 1831565813 >>> 0;
+    let t = a;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var WHITE = (a) => `rgba(255,255,255,${a < 0 ? 0 : a > 1 ? 1 : a.toFixed(3)})`;
+function drawRay(ctx, a, b, p) {
+  const len = Math.hypot(b.x - a.x, b.y - a.y);
+  if (len < 2 || p.alpha <= 0.01 || p.head <= 0) return;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  switch (p.style) {
+    case "beam":
+      drawBeam(ctx, a, b, p);
+      break;
+    case "energy":
+      drawEnergy(ctx, a, b, len, p);
+      break;
+    case "lightning":
+      drawLightning(ctx, a, b, len, p);
+      break;
+    default:
+      drawSpark(ctx, a, b, p);
+  }
+}
+function dot(ctx, x, y, r, style) {
+  ctx.fillStyle = style;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+}
+function line(ctx, ax, ay, bx, by, width, style) {
+  ctx.strokeStyle = style;
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  ctx.moveTo(ax, ay);
+  ctx.lineTo(bx, by);
+  ctx.stroke();
+}
+function drawSpark(ctx, a, b, p) {
+  const k = p.constant ? (p.t * 0.55 + p.seed * 0.137) % 1 : p.head;
+  const x = a.x + (b.x - a.x) * k;
+  const y = a.y + (b.y - a.y) * k;
+  dot(ctx, x, y, 6 * p.width, p.color(0.25 * p.alpha));
+  dot(ctx, x, y, 2.6 * p.width, p.color(0.95 * p.alpha));
+}
+function drawBeam(ctx, a, b, p) {
+  let alpha = p.alpha;
+  if (p.constant) alpha *= 0.55 + 0.45 * Math.sin(p.t * 3.2 + p.seed);
+  const hk = p.head;
+  const tk = p.constant ? 0 : Math.max(0, hk - 0.5);
+  const hx = a.x + (b.x - a.x) * hk;
+  const hy = a.y + (b.y - a.y) * hk;
+  const tx = a.x + (b.x - a.x) * tk;
+  const ty = a.y + (b.y - a.y) * tk;
+  if ((p.quality ?? 2) === 2) line(ctx, tx, ty, hx, hy, 7 * p.width, p.color(0.12 * alpha));
+  line(ctx, tx, ty, hx, hy, 3.5 * p.width, p.color(0.26 * alpha));
+  const g = ctx.createLinearGradient(tx, ty, hx, hy);
+  g.addColorStop(0, p.color(p.constant ? 0.5 * alpha : 0));
+  g.addColorStop(0.7, p.color(0.9 * alpha));
+  g.addColorStop(1, WHITE(alpha));
+  line(ctx, tx, ty, hx, hy, 1.6 * p.width, g);
+  if (!p.constant && hk < 1) {
+    dot(ctx, hx, hy, 6 * p.width, p.color(0.3 * alpha));
+    dot(ctx, hx, hy, 2.2 * p.width, WHITE(alpha));
+  }
+}
+function drawEnergy(ctx, a, b, len, p) {
+  const q = p.quality ?? 2;
+  const ux = (b.x - a.x) / len;
+  const uy = (b.y - a.y) / len;
+  const amp = 3.6 * p.width;
+  const steps = Math.min(q === 2 ? 36 : q === 1 ? 24 : 14, Math.max(8, Math.round(len * p.head / 9)));
+  const wave = (s, shift) => amp * Math.sin(Math.PI * Math.min(1, s)) * Math.sin(s * len / 9 - p.t * 7 + p.seed + shift);
+  const strand = (shift, width, style) => {
+    ctx.strokeStyle = style;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    for (let i = 0; i <= steps; i++) {
+      const s = i / steps * p.head;
+      const off = wave(s, shift);
+      const x = a.x + ux * s * len - uy * off;
+      const y = a.y + uy * s * len + ux * off;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  };
+  strand(0, (q === 2 ? 6 : 4) * p.width, p.color(0.16 * p.alpha));
+  strand(0, 1.6 * p.width, p.color(0.95 * p.alpha));
+  if (q > 0) strand(Math.PI, 1.1 * p.width, p.color(0.6 * p.alpha));
+  const blobs = q === 0 ? 1 : 3;
+  for (let j = 0; j < blobs; j++) {
+    const s = (p.t * 0.7 + j / 3 + p.seed * 0.171) % 1;
+    if (s > p.head) continue;
+    const off = wave(s, 0);
+    const x = a.x + ux * s * len - uy * off;
+    const y = a.y + uy * s * len + ux * off;
+    dot(ctx, x, y, 5 * p.width, p.color(0.3 * p.alpha));
+    dot(ctx, x, y, 2 * p.width, WHITE(0.9 * p.alpha));
+  }
+}
+function drawLightning(ctx, a, b, len, p) {
+  const q = p.quality ?? 2;
+  const r = rng(Math.floor(p.t * 18) * 9973 + p.seed * 7919);
+  const ex = a.x + (b.x - a.x) * p.head;
+  const ey = a.y + (b.y - a.y) * p.head;
+  const segLen = Math.hypot(ex - a.x, ey - a.y);
+  if (segLen < 2) return;
+  const ux = (ex - a.x) / segLen;
+  const uy = (ey - a.y) / segLen;
+  const n = Math.min(q === 2 ? 18 : q === 1 ? 12 : 7, Math.max(4, Math.round(segLen / 14)));
+  const jitter = Math.min(14, len * 0.08) * (0.7 + 0.3 * p.width);
+  const xs = new Array(n + 1);
+  const ys = new Array(n + 1);
+  for (let i = 0; i <= n; i++) {
+    const s = i / n;
+    const off = i === 0 || i === n ? 0 : (r() * 2 - 1) * jitter * Math.sin(Math.PI * s);
+    xs[i] = a.x + ux * s * segLen - uy * off;
+    ys[i] = a.y + uy * s * segLen + ux * off;
+  }
+  const alpha = p.alpha * (0.55 + r() * 0.45);
+  const path = (px, py, width, style) => {
+    ctx.strokeStyle = style;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    ctx.moveTo(px[0], py[0]);
+    for (let i = 1; i < px.length; i++) ctx.lineTo(px[i], py[i]);
+    ctx.stroke();
+  };
+  if (q === 2) path(xs, ys, 6 * p.width, p.color(0.16 * alpha));
+  path(xs, ys, 2.6 * p.width, p.color(0.45 * alpha));
+  path(xs, ys, 1.1 * p.width, WHITE(0.95 * alpha));
+  if (q === 0) return;
+  const chance = q === 2 ? 0.2 : 0.1;
+  for (let i = 1; i < n; i++) {
+    if (r() > chance) continue;
+    const dir = Math.atan2(uy, ux) + (r() < 0.5 ? -1 : 1) * (0.4 + r() * 0.6);
+    const bx = [xs[i]];
+    const by = [ys[i]];
+    const parts = 2 + Math.floor(r() * 2);
+    for (let k = 0; k < parts; k++) {
+      const l = 6 + r() * 10;
+      const d = dir + (r() * 2 - 1) * 0.5;
+      bx.push(bx[bx.length - 1] + Math.cos(d) * l);
+      by.push(by[by.length - 1] + Math.sin(d) * l);
+    }
+    path(bx, by, 2.4 * p.width, p.color(0.3 * alpha));
+    path(bx, by, 0.8 * p.width, WHITE(0.8 * alpha));
+  }
 }
 
 // src/graph-fx.ts
@@ -2343,6 +2471,8 @@ var GraphModules = class {
     this.timer = null;
     /** Extra radius a barrier gained because notes kept escaping it (world units). */
     this.extra = /* @__PURE__ */ new Map();
+    /** Where each module sits in the graph after separation (graph units). */
+    this.centers = /* @__PURE__ */ new Map();
   }
   start() {
     const p = this.plugin;
@@ -2400,6 +2530,11 @@ var GraphModules = class {
       }
       out.set(m.id, set);
     }
+    const specificity = (m) => m.kind === "tag" ? 1e3 : (0, import_obsidian7.normalizePath)(m.value || "/").split("/").length;
+    const order = [...this.list].sort((a, b) => specificity(b) - specificity(a));
+    const owner = /* @__PURE__ */ new Map();
+    for (const m of order) for (const path of out.get(m.id) ?? []) if (!owner.has(path)) owner.set(path, m.id);
+    for (const [id, set] of out) for (const path of [...set]) if (owner.get(path) !== id) set.delete(path);
     this.cache = out;
     return out;
   }
@@ -2411,6 +2546,18 @@ var GraphModules = class {
   widen(id, by) {
     const cur = this.extra.get(id) ?? 0;
     this.extra.set(id, Math.min(cur + Math.max(0, by), 2e3));
+  }
+  /** Slowly gives the extra room back once notes stop escaping. */
+  relax(id) {
+    const cur = this.extra.get(id);
+    if (!cur) return;
+    const next = cur * 0.97;
+    if (next < 1) this.extra.delete(id);
+    else this.extra.set(id, next);
+  }
+  /** Coarse fingerprint of barrier sizes (for layout caches). */
+  sizeKey() {
+    return [...this.extra].map(([id, v]) => `${id}:${Math.round(v / 50)}`).join(",");
   }
   /** Graph search query that matches the module's members (for colour groups). */
   query(m) {
@@ -2693,7 +2840,9 @@ var DEFAULT_SETTINGS = {
   moduleFill: true,
   moduleLabels: true,
   moduleAnimate: true,
-  moduleIntro: "bubble"
+  moduleIntro: "bubble",
+  moduleSeparate: true,
+  moduleGap: 20
 };
 var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
   constructor(app, plugin) {
@@ -3162,6 +3311,19 @@ var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
         await changed();
       })
     );
+    new import_obsidian8.Setting(containerEl).setName("\u041E\u0442\u0434\u0435\u043B\u044C\u043D\u043E\u0435 \u043C\u0435\u0441\u0442\u043E \u0434\u043B\u044F \u043A\u0430\u0436\u0434\u043E\u0433\u043E \u043C\u043E\u0434\u0443\u043B\u044F").setDesc(
+      "\u041C\u043E\u0434\u0443\u043B\u0438 \u043D\u0435 \u0437\u0430\u0445\u043E\u0434\u044F\u0442 \u0434\u0440\u0443\u0433 \u0432 \u0434\u0440\u0443\u0433\u0430: \u0438\u0445 \u0440\u0430\u0437\u0434\u0432\u0438\u0433\u0430\u0435\u0442, \u043F\u043E\u043A\u0430 \u0431\u0430\u0440\u044C\u0435\u0440\u044B \u043D\u0435 \u043F\u0435\u0440\u0435\u0441\u0442\u0430\u043D\u0443\u0442 \u043F\u0435\u0440\u0435\u0441\u0435\u043A\u0430\u0442\u044C\u0441\u044F (\u0441\u0442\u043E\u044F\u0442\u044C \u0432\u043F\u043B\u043E\u0442\u043D\u0443\u044E \u043C\u043E\u0436\u043D\u043E). \u0417\u0430\u043C\u0435\u0442\u043A\u0430 \u0432\u0445\u043E\u0434\u0438\u0442 \u0442\u043E\u043B\u044C\u043A\u043E \u0432 \u043E\u0434\u0438\u043D \u043C\u043E\u0434\u0443\u043B\u044C \u2014 \u0441\u0430\u043C\u044B\u0439 \u043A\u043E\u043D\u043A\u0440\u0435\u0442\u043D\u044B\u0439 (\u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0430 \u0432\u0430\u0436\u043D\u0435\u0435 \u043F\u0430\u043F\u043A\u0438, \u0442\u0435\u0433 \u0432\u0430\u0436\u043D\u0435\u0435 \u043F\u0430\u043F\u043A\u0438). \u0427\u0443\u0436\u0438\u0435 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0432\u044B\u0442\u0430\u043B\u043A\u0438\u0432\u0430\u044E\u0442\u0441\u044F \u0437\u0430 \u0431\u0430\u0440\u044C\u0435\u0440."
+    ).addToggle(
+      (t) => t.setValue(s.moduleSeparate).onChange(async (v) => {
+        s.moduleSeparate = v;
+        await changed();
+      })
+    ).addSlider(
+      (sl) => sl.setLimits(0, 200, 5).setValue(s.moduleGap).setDynamicTooltip().onChange(async (v) => {
+        s.moduleGap = v;
+        await changed();
+      })
+    );
     new import_obsidian8.Setting(containerEl).setName("\u0423\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0442\u044C \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0432\u043D\u0443\u0442\u0440\u0438").setDesc("\u0412\u044B\u043B\u0435\u0442\u0435\u0432\u0448\u0443\u044E \u0437\u0430 \u0431\u0430\u0440\u044C\u0435\u0440 \u0437\u0430\u043C\u0435\u0442\u043A\u0443 \u043C\u044F\u0433\u043A\u043E \u0432\u043E\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 \u0432\u043D\u0443\u0442\u0440\u044C; \u0435\u0441\u043B\u0438 \u0435\u0451 \u043F\u043E\u0441\u0442\u043E\u044F\u043D\u043D\u043E \u0432\u044B\u0442\u0430\u043B\u043A\u0438\u0432\u0430\u0435\u0442 \u2014 \u0431\u0430\u0440\u044C\u0435\u0440 \u0440\u0430\u0441\u0448\u0438\u0440\u044F\u0435\u0442\u0441\u044F.").addToggle(
       (t) => t.setValue(s.moduleHold).onChange(async (v) => {
         s.moduleHold = v;
@@ -3488,7 +3650,12 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
       s.branchDirections,
       s.indexName,
       s.excludedFolders,
-      s.graphFreeze
+      s.graphFreeze,
+      s.moduleSeparate,
+      s.moduleGap,
+      s.moduleSize,
+      s.modulesEnabled,
+      s.modules.map((m) => [m.id, m.kind, m.value])
     ]);
   }
   calendarSignature() {

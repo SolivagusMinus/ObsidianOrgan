@@ -329,3 +329,61 @@ export function elasticOut(x: number): number {
 	if (x >= 1) return 1;
 	return Math.pow(2, -10 * x) * Math.sin((x * 10 - 0.75) * ((2 * Math.PI) / 3)) + 1;
 }
+
+export interface Circle {
+	x: number;
+	y: number;
+	r: number;
+}
+
+/**
+ * Pushes circles apart until none overlap (they may touch, `gap` apart).
+ * Small circles move more than big ones; the group's centre of mass stays
+ * where it was, so the graph doesn't drift. Mutates and returns `circles`.
+ */
+export function separateCircles(circles: Circle[], gap: number, iterations = 300): Circle[] {
+	const n = circles.length;
+	if (n < 2) return circles;
+	const area = (c: Circle) => c.r * c.r + 1;
+	const total = circles.reduce((s, c) => s + area(c), 0);
+	const cx0 = circles.reduce((s, c) => s + c.x * area(c), 0) / total;
+	const cy0 = circles.reduce((s, c) => s + c.y * area(c), 0) / total;
+	for (let it = 0; it < iterations; it++) {
+		let moved = false;
+		for (let i = 0; i < n; i++) {
+			for (let j = i + 1; j < n; j++) {
+				const a = circles[i];
+				const b = circles[j];
+				let dx = b.x - a.x;
+				let dy = b.y - a.y;
+				let d = Math.hypot(dx, dy);
+				const need = a.r + b.r + gap;
+				if (d >= need - 0.01) continue;
+				if (d < 1e-6) {
+					// Same centre: split along a fixed direction per pair.
+					const ang = ((i * 7 + j * 13) % 16) * (Math.PI / 8);
+					dx = Math.cos(ang);
+					dy = Math.sin(ang);
+					d = 1;
+				}
+				const push = need - d;
+				const wa = area(b) / (area(a) + area(b)); // the bigger the other, the more I move
+				const wb = 1 - wa;
+				a.x -= (dx / d) * push * wa;
+				a.y -= (dy / d) * push * wa;
+				b.x += (dx / d) * push * wb;
+				b.y += (dy / d) * push * wb;
+				moved = true;
+			}
+		}
+		if (!moved) break;
+	}
+	// Keep the centre of mass in place.
+	const cx1 = circles.reduce((s, c) => s + c.x * area(c), 0) / total;
+	const cy1 = circles.reduce((s, c) => s + c.y * area(c), 0) / total;
+	for (const c of circles) {
+		c.x += cx0 - cx1;
+		c.y += cy0 - cy1;
+	}
+	return circles;
+}

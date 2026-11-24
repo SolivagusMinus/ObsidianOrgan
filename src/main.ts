@@ -114,7 +114,11 @@ export default class FolderHubPlugin extends Plugin {
 		this.addCommand({
 			id: "diagnose-graph-effects",
 			name: "Граф: проверить, почему не видно эффектов",
-			callback: () => new Notice(this.graphFx.diagnose().join("\n"), 20000),
+			callback: () => {
+				const report = [...this.graphFx.diagnose(), "", ...this.graphTree.diagnose()].join("\n");
+				void navigator.clipboard?.writeText(report).catch(() => undefined);
+				new Notice(report + "\n\n(Отчёт скопирован — можно вставить в сообщение.)", 30000);
+			},
 		});
 		this.addCommand({
 			id: "toggle-skill-tree",

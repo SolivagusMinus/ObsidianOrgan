@@ -1289,6 +1289,8 @@ var GraphTree = class {
     this.lastNodeCount = /* @__PURE__ */ new Map();
     /** Target positions last sent to each graph, to skip no-op updates. */
     this.sent = /* @__PURE__ */ new Map();
+    this.messagesSent = 0;
+    this.lastApply = { at: 0, note: "\u0435\u0449\u0451 \u043D\u0435 \u0431\u044B\u043B\u043E" };
   }
   get app() {
     return this.plugin.app;
@@ -1385,6 +1387,7 @@ var GraphTree = class {
   }
   post(r, msg) {
     try {
+      this.messagesSent++;
       r.worker?.postMessage(msg);
     } catch (e) {
       console.warn("ObsOrg: graph worker message failed", e);
@@ -1396,6 +1399,7 @@ var GraphTree = class {
   }
   apply(r, tries) {
     if (!r.nodes || r.nodes.length === 0) {
+      this.lastApply = { at: performance.now(), note: "\u0433\u0440\u0430\u0444 \u0435\u0449\u0451 \u0437\u0430\u0433\u0440\u0443\u0436\u0430\u0435\u0442 \u0434\u0430\u043D\u043D\u044B\u0435" };
       if (tries < 20) this.schedule(r, tries + 1, 250);
       return;
     }
@@ -1427,6 +1431,7 @@ var GraphTree = class {
       }
     }
     this.pinned.set(r, now);
+    this.lastApply = { at: performance.now(), note: `\u0437\u0430\u043A\u0440\u0435\u043F\u043B\u0435\u043D\u043E ${now.size}, ${moved ? "\u0440\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0430 \u0438\u0437\u043C\u0435\u043D\u0438\u043B\u0430\u0441\u044C" : "\u0431\u0435\u0437 \u0438\u0437\u043C\u0435\u043D\u0435\u043D\u0438\u0439"}` };
     if (moved || this.lastNodeCount.get(r) !== r.nodes.length) {
       this.lastNodeCount.set(r, r.nodes.length);
       this.releaseResting(r);
@@ -1597,6 +1602,29 @@ var GraphTree = class {
     if (!this.posCache) this.posCache = layoutSkillTree(this.buildTree(), this.layoutOptions());
     return this.posCache;
   }
+  /** Report for the diagnostics command: is the layout connected to the graph engine? */
+  diagnose() {
+    const s = this.plugin.settings;
+    const leaves = this.app.workspace.getLeavesOfType("graph");
+    const out = ["ObsOrg \u2014 \u0440\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0430 \u0433\u0440\u0430\u0444\u0430 (\u0434\u0435\u0440\u0435\u0432\u043E, \u043C\u043E\u0434\u0443\u043B\u0438):"];
+    out.push(`\u2022 \u0414\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438: ${s.skillTreeEnabled ? "\u0432\u043A\u043B" : "\u0432\u044B\u043A\u043B"}; \u043C\u043E\u0434\u0443\u043B\u0438: ${s.modulesEnabled ? "\u043F\u043E\u043A\u0430\u0437" : "\u0441\u043A\u0440\u044B\u0442\u044B"}, \u043E\u0442\u0434\u0435\u043B\u044C\u043D\u043E\u0435 \u043C\u0435\u0441\u0442\u043E: ${s.moduleSeparate ? "\u0434\u0430" : "\u043D\u0435\u0442"}, \u0442\u0432\u0451\u0440\u0434\u044B\u0435 \u0431\u0430\u0440\u044C\u0435\u0440\u044B: ${s.moduleSolid ? "\u0434\u0430" : "\u043D\u0435\u0442"}`);
+    out.push(`\u2022 \u0413\u043B\u043E\u0431\u0430\u043B\u044C\u043D\u044B\u0445 \u0433\u0440\u0430\u0444\u043E\u0432 \u043E\u0442\u043A\u0440\u044B\u0442\u043E: ${leaves.length}, \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E \u043A \u0434\u0432\u0438\u0436\u043A\u0443: ${this.originals.size}`);
+    for (const leaf of leaves) {
+      const r = leaf.view.renderer;
+      if (!r) out.push("  \u2717 \u0443 \u0433\u0440\u0430\u0444\u0430 \u043D\u0435\u0442 renderer");
+      else if (typeof r.setData !== "function") out.push("  \u2717 \u0443 renderer \u043D\u0435\u0442 setData");
+      else if (!r.worker) out.push("  \u2717 \u0443 renderer \u043D\u0435\u0442 worker (\u0434\u0432\u0438\u0436\u043E\u043A \u0444\u0438\u0437\u0438\u043A\u0438 \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D)");
+      else out.push(`  \u2713 \u0443\u0437\u043B\u043E\u0432: ${r.nodes?.length ?? 0}, \u0437\u0430\u043A\u0440\u0435\u043F\u043B\u0435\u043D\u043E \u0440\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u043E\u0439: ${this.pinned.get(r)?.size ?? 0}, \u043F\u0440\u0438\u0436\u0430\u0442\u043E \u043A \u0441\u0442\u0435\u043D\u043A\u0430\u043C: ${this.resting.get(r)?.size ?? 0}`);
+    }
+    const members = this.plugin.modules.members();
+    const placed = this.plugin.settings.modules.map((m) => {
+      const c = this.plugin.modules.centers.get(m.id);
+      return `${m.name}: ${members.get(m.id)?.size ?? 0} \u0437\u0430\u043C\u0435\u0442\u043E\u043A, ${c ? `\u043C\u0435\u0441\u0442\u043E \u2713 (\u0440\u0430\u0434\u0438\u0443\u0441 ${Math.round(c.hold ?? 0)})` : "\u043C\u0435\u0441\u0442\u043E \u043D\u0435 \u043D\u0430\u0437\u043D\u0430\u0447\u0435\u043D\u043E"}`;
+    });
+    if (placed.length) out.push(`\u2022 \u041C\u043E\u0434\u0443\u043B\u0438: ${placed.join("; ")}`);
+    out.push(`\u2022 \u041A\u043E\u043C\u0430\u043D\u0434 \u0434\u0432\u0438\u0436\u043A\u0443: ${this.messagesSent}; \u043F\u043E\u0441\u043B\u0435\u0434\u043D\u044F\u044F \u0440\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0430: ${this.lastApply.at ? `${Math.round((performance.now() - this.lastApply.at) / 1e3)} \u0441 \u043D\u0430\u0437\u0430\u0434 \u2014 ${this.lastApply.note}` : this.lastApply.note}`);
+    return out;
+  }
   // ------------------------------------------------------------- modules
   /**
    * Gives every module its own place: module circles (barrier radius + padding)
@@ -1615,7 +1643,19 @@ var GraphTree = class {
     }
     const members = modules.members();
     const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
-    const pad2 = 38 * s.moduleSize;
+    const pad2 = this.plugin.modules.unit * 0.6 * s.moduleSize;
+    const lens = [];
+    const links = r.links ?? [];
+    for (let i = 0; i < links.length && lens.length < 400; i += Math.max(1, Math.floor(links.length / 400))) {
+      const l = links[i];
+      const d = Math.hypot(l.source.x - l.target.x, l.source.y - l.target.y);
+      if (Number.isFinite(d) && d > 0) lens.push(d);
+    }
+    if (lens.length >= 5) {
+      lens.sort((a, b) => a - b);
+      const u = lens[lens.length >> 1];
+      if (Math.abs(u - modules.unit) / modules.unit > 0.2) modules.unit = Math.max(10, u);
+    }
     const pos = (id) => {
       const p = base.get(id) ?? nodeById.get(id);
       return Number.isFinite(p.x) && Number.isFinite(p.y) ? p : { x: 0, y: 0 };
@@ -1697,7 +1737,7 @@ var GraphTree = class {
       const members = modules.members();
       const owner = /* @__PURE__ */ new Map();
       for (const [id, set] of members) for (const path of set) owner.set(path, id);
-      const pad2 = 38 * s.moduleSize;
+      const pad2 = this.plugin.modules.unit * 0.6 * s.moduleSize;
       const walls = [];
       for (const m of modules.list) {
         const placed = s.moduleSeparate ? modules.centers.get(m.id) : void 0;
@@ -2275,7 +2315,7 @@ var GraphFx = class {
     const recompute = !st || e.nodes.length <= 400 || layer.frame % 3 === 0;
     if (recompute) {
       let pts = e.nodes.map((n) => ({ x: n.x, y: n.y })).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
-      const pad2 = 38 * s.moduleSize;
+      const pad2 = this.plugin.modules.unit * 0.6 * s.moduleSize;
       const modules = this.plugin.modules;
       const placed = s.moduleSeparate ? modules.centers.get(e.def.id) : void 0;
       let cx;
@@ -2622,6 +2662,8 @@ var GraphModules = class {
     this.extra = /* @__PURE__ */ new Map();
     /** Where each module sits in the graph after separation (graph units). */
     this.centers = /* @__PURE__ */ new Map();
+    /** Typical link length of the current graph (graph units); measured by the layout. */
+    this.unit = 60;
   }
   start() {
     const p = this.plugin;
@@ -2699,11 +2741,14 @@ var GraphModules = class {
    * notes dragged far away by links to other modules simply stay outside.
    */
   barrierRadius(count, distances) {
-    const base = moduleRadius(count, this.plugin.settings.moduleSize) * 0.7;
+    const u = this.unit * this.plugin.settings.moduleSize;
+    const n = Math.max(1, count);
+    const floor = u * (1.3 + 0.45 * Math.sqrt(n));
+    const cap = u * (2.5 + 1.2 * Math.sqrt(n));
     const d = distances.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
-    if (count < 6 || !d.length) return base * 0.8;
-    const measured = d[Math.floor(0.8 * (d.length - 1))] * 1.3 + 25;
-    return Math.min(base * 1.6, Math.max(base * 0.6, measured));
+    if (n < 6 || !d.length) return floor;
+    const measured = d[Math.floor(0.8 * (d.length - 1))] * 1.3 + u * 0.5;
+    return Math.min(cap, Math.max(floor, measured));
   }
   /** Lets a barrier grow when the layout keeps pushing notes out of it. */
   widen(id, by) {
@@ -3677,7 +3722,11 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
     this.addCommand({
       id: "diagnose-graph-effects",
       name: "\u0413\u0440\u0430\u0444: \u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C, \u043F\u043E\u0447\u0435\u043C\u0443 \u043D\u0435 \u0432\u0438\u0434\u043D\u043E \u044D\u0444\u0444\u0435\u043A\u0442\u043E\u0432",
-      callback: () => new import_obsidian10.Notice(this.graphFx.diagnose().join("\n"), 2e4)
+      callback: () => {
+        const report = [...this.graphFx.diagnose(), "", ...this.graphTree.diagnose()].join("\n");
+        void navigator.clipboard?.writeText(report).catch(() => void 0);
+        new import_obsidian10.Notice(report + "\n\n(\u041E\u0442\u0447\u0451\u0442 \u0441\u043A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u043D \u2014 \u043C\u043E\u0436\u043D\u043E \u0432\u0441\u0442\u0430\u0432\u0438\u0442\u044C \u0432 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435.)", 3e4);
+      }
     });
     this.addCommand({
       id: "toggle-skill-tree",

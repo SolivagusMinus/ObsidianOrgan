@@ -426,7 +426,7 @@ export class GraphFx {
 		const recompute = !st || e.nodes.length <= 400 || layer.frame % 3 === 0;
 		if (recompute) {
 			let pts = e.nodes.map((n) => ({ x: n.x, y: n.y })).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
-			const pad = 38 * s.moduleSize;
+			const pad = this.plugin.modules.unit * 0.6 * s.moduleSize;
 			const modules = this.plugin.modules;
 			const placed = s.moduleSeparate ? modules.centers.get(e.def.id) : undefined;
 			let cx: number;

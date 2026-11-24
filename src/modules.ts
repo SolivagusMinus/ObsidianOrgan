@@ -127,12 +127,21 @@ export class GraphModules {
 	 * notes dragged far away by links to other modules simply stay outside.
 	 */
 	barrierRadius(count: number, distances: number[]): number {
-		const base = moduleRadius(count, this.plugin.settings.moduleSize) * 0.7;
+		// Sizes are in "graph units" (a typical link length of this graph), so they
+		// fit whatever link distance / repel force the graph is set to.
+		const u = this.unit * this.plugin.settings.moduleSize;
+		const n = Math.max(1, count);
+		const floor = u * (1.3 + 0.45 * Math.sqrt(n));
+		const cap = u * (2.5 + 1.2 * Math.sqrt(n));
 		const d = distances.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
-		if (count < 6 || !d.length) return base * 0.8;
-		const measured = d[Math.floor(0.8 * (d.length - 1))] * 1.3 + 25;
-		return Math.min(base * 1.6, Math.max(base * 0.6, measured));
+		// Small modules: their notes are easily dragged away by links, so size by count only.
+		if (n < 6 || !d.length) return floor;
+		const measured = d[Math.floor(0.8 * (d.length - 1))] * 1.3 + u * 0.5;
+		return Math.min(cap, Math.max(floor, measured));
 	}
+
+	/** Typical link length of the current graph (graph units); measured by the layout. */
+	unit = 60;
 
 	/** Lets a barrier grow when the layout keeps pushing notes out of it. */
 	widen(id: string, by: number) {

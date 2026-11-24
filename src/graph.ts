@@ -12,6 +12,7 @@ import { Circle, centroid, separateCircles } from "./module-shapes";
 
 interface GraphRenderer {
 	nodes?: { id: string; x: number; y: number }[];
+	links?: { source: { x: number; y: number }; target: { x: number; y: number } }[];
 	nodeLookup?: Record<string, unknown>;
 	worker?: Worker;
 	setData?: (data: unknown) => void;
@@ -191,8 +192,12 @@ export class GraphTree {
 		);
 	}
 
+	private messagesSent = 0;
+	private lastApply = { at: 0, note: "ещё не было" };
+
 	private post(r: GraphRenderer, msg: unknown) {
 		try {
+			this.messagesSent++;
 			r.worker?.postMessage(msg);
 		} catch (e) {
 			console.warn("ObsOrg: graph worker message failed", e);
@@ -207,6 +212,7 @@ export class GraphTree {
 	private apply(r: GraphRenderer, tries: number) {
 		if (!r.nodes || r.nodes.length === 0) {
 			// The graph is still loading its data.
+			this.lastApply = { at: performance.now(), note: "граф ещё загружает данные" };
 			if (tries < 20) this.schedule(r, tries + 1, 250);
 			return;
 		}
@@ -245,6 +251,7 @@ export class GraphTree {
 			}
 		}
 		this.pinned.set(r, now);
+		this.lastApply = { at: performance.now(), note: `закреплено ${now.size}, ${moved ? "раскладка изменилась" : "без изменений"}` };
 		// A new "episode" for solid barriers only when the picture really changed
 		// (not on every autosave while typing).
 		if (moved || this.lastNodeCount.get(r) !== r.nodes.length) {
@@ -437,6 +444,30 @@ export class GraphTree {
 		return this.posCache;
 	}
 
+	/** Report for the diagnostics command: is the layout connected to the graph engine? */
+	diagnose(): string[] {
+		const s = this.plugin.settings;
+		const leaves = this.app.workspace.getLeavesOfType("graph");
+		const out = ["ObsOrg — раскладка графа (дерево, модули):"];
+		out.push(`• Дерево прокачки: ${s.skillTreeEnabled ? "вкл" : "выкл"}; модули: ${s.modulesEnabled ? "показ" : "скрыты"}, отдельное место: ${s.moduleSeparate ? "да" : "нет"}, твёрдые барьеры: ${s.moduleSolid ? "да" : "нет"}`);
+		out.push(`• Глобальных графов открыто: ${leaves.length}, подключено к движку: ${this.originals.size}`);
+		for (const leaf of leaves) {
+			const r = (leaf.view as GraphLeafView).renderer;
+			if (!r) out.push("  ✗ у графа нет renderer");
+			else if (typeof r.setData !== "function") out.push("  ✗ у renderer нет setData");
+			else if (!r.worker) out.push("  ✗ у renderer нет worker (движок физики недоступен)");
+			else out.push(`  ✓ узлов: ${r.nodes?.length ?? 0}, закреплено раскладкой: ${this.pinned.get(r)?.size ?? 0}, прижато к стенкам: ${this.resting.get(r)?.size ?? 0}`);
+		}
+		const members = this.plugin.modules.members();
+		const placed = this.plugin.settings.modules.map((m) => {
+			const c = this.plugin.modules.centers.get(m.id);
+			return `${m.name}: ${members.get(m.id)?.size ?? 0} заметок, ${c ? `место ✓ (радиус ${Math.round(c.hold ?? 0)})` : "место не назначено"}`;
+		});
+		if (placed.length) out.push(`• Модули: ${placed.join("; ")}`);
+		out.push(`• Команд движку: ${this.messagesSent}; последняя раскладка: ${this.lastApply.at ? `${Math.round((performance.now() - this.lastApply.at) / 1000)} с назад — ${this.lastApply.note}` : this.lastApply.note}`);
+		return out;
+	}
+
 	// ------------------------------------------------------------- modules
 
 	/**
@@ -456,7 +487,21 @@ export class GraphTree {
 		}
 		const members = modules.members();
 		const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
-		const pad = 38 * s.moduleSize;
+		const pad = this.plugin.modules.unit * 0.6 * s.moduleSize;
+		// Graph scale: median link length (a sample is enough).
+		const lens: number[] = [];
+		const links = r.links ?? [];
+		for (let i = 0; i < links.length && lens.length < 400; i += Math.max(1, Math.floor(links.length / 400))) {
+			const l = links[i];
+			const d = Math.hypot(l.source.x - l.target.x, l.source.y - l.target.y);
+			if (Number.isFinite(d) && d > 0) lens.push(d);
+		}
+		if (lens.length >= 5) {
+			lens.sort((a, b) => a - b);
+			const u = lens[lens.length >> 1];
+			// Follow slowly and only on real change, so the layout doesn't wobble.
+			if (Math.abs(u - modules.unit) / modules.unit > 0.2) modules.unit = Math.max(10, u);
+		}
 		const pos = (id: string): Point => {
 			const p = base.get(id) ?? nodeById.get(id)!;
 			// Nodes that haven't been placed by the physics yet count as the centre.
@@ -553,7 +598,7 @@ export class GraphTree {
 			const members = modules.members();
 			const owner = new Map<string, string>();
 			for (const [id, set] of members) for (const path of set) owner.set(path, id);
-			const pad = 38 * s.moduleSize;
+			const pad = this.plugin.modules.unit * 0.6 * s.moduleSize;
 
 			// Each module's barrier: the reserved place, or (without separation) around its notes.
 			const walls: { id: string; x: number; y: number; R: number }[] = [];

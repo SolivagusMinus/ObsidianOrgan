@@ -50,6 +50,8 @@ export interface FolderHubSettings {
 	dailyTemplate: string;
 
 	// Graph: skill tree
+	/** "button": sort on demand, then release; "always": keep the layout pinned. */
+	layoutMode: "button" | "always";
 	skillTreeEnabled: boolean;
 	skillTreeStyle: TreeStyle;
 	skillTreeStep: number;
@@ -147,6 +149,7 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	dailyFormat: "",
 	dailyTemplate: "",
 
+	layoutMode: "button",
 	skillTreeEnabled: true,
 	skillTreeStyle: "radial",
 	skillTreeStep: 300,
@@ -606,6 +609,23 @@ export class FolderHubSettingTab extends PluginSettingTab {
 				"как узлы навыков, файлы висят на них листьями. Использует внутренние механизмы графа Obsidian: " +
 				"после обновления Obsidian может перестать работать — тогда просто выключите.",
 		});
+
+		new Setting(containerEl)
+			.setName("Когда упорядочивать граф")
+			.setDesc(
+				"«По кнопке»: граф живёт своей физикой; кнопка ✨ «Упорядочить граф» в заголовке графа (или команда) " +
+					"плавно раскладывает ветки и модули, держит порядок пару секунд и отпускает заметки — они снова плавают. " +
+					"«Всегда»: порядок держится постоянно (заметки закреплены).",
+			)
+			.addDropdown((d) =>
+				d
+					.addOptions({ button: "По кнопке — рассортировать и отпустить", always: "Всегда держать порядок" })
+					.setValue(s.layoutMode)
+					.onChange(async (v) => {
+						s.layoutMode = v as FolderHubSettings["layoutMode"];
+						await save();
+					}),
+			);
 
 		new Setting(containerEl)
 			.setName("Раскладывать граф ветками")

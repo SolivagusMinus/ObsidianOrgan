@@ -1299,6 +1299,10 @@ var GraphTree = class {
     this.lastNodeCount = /* @__PURE__ */ new Map();
     /** Target positions last sent to each graph, to skip no-op updates. */
     this.sent = /* @__PURE__ */ new Map();
+    /** Graphs currently being sorted (button mode): pins and walls are active only then. */
+    this.sorting = /* @__PURE__ */ new Map();
+    /** "Sort graph" buttons added to graph view headers. */
+    this.actions = /* @__PURE__ */ new Map();
     this.messagesSent = 0;
     this.lastApply = { at: 0, note: "\u0435\u0449\u0451 \u043D\u0435 \u0431\u044B\u043B\u043E" };
   }
@@ -1339,6 +1343,10 @@ var GraphTree = class {
     }
     this.originals.clear();
     this.views.clear();
+    this.actions.forEach((el) => el.remove());
+    this.actions.clear();
+    this.sorting.forEach((t) => window.clearTimeout(t));
+    this.sorting.clear();
     this.timers.forEach((t) => window.clearTimeout(t));
     if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
   }
@@ -1373,11 +1381,25 @@ var GraphTree = class {
           orig.call(r, data);
           this.schedule(r);
         };
+        try {
+          const btn = view.addAction?.(
+            "sparkles",
+            "\u0423\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0438\u0442\u044C \u0433\u0440\u0430\u0444 (ObsOrg)",
+            () => this.sortGraph()
+          );
+          if (btn) this.actions.set(r, btn);
+        } catch {
+        }
         this.schedule(r);
       }
     }
     for (const r of [...this.originals.keys()]) {
       if (alive.has(r)) continue;
+      this.actions.get(r)?.remove();
+      this.actions.delete(r);
+      const t = this.sorting.get(r);
+      if (t !== void 0) window.clearTimeout(t);
+      this.sorting.delete(r);
       this.originals.delete(r);
       this.views.delete(r);
       this.pinned.delete(r);
@@ -1439,10 +1461,12 @@ var GraphTree = class {
     }
     const s = this.plugin.settings;
     const prev = this.pinned.get(r) ?? /* @__PURE__ */ new Set();
-    const base = s.skillTreeEnabled ? this.positions() : /* @__PURE__ */ new Map();
-    const target = this.withModules(r, base);
+    const buttonMode = s.layoutMode === "button";
+    const active = !buttonMode || this.sorting.has(r);
+    const base = active && s.skillTreeEnabled ? this.positions() : /* @__PURE__ */ new Map();
+    const target = active ? this.withModules(r, base) : base;
     const reduced = this.plugin.motionReduced();
-    if (target.size && !this.grown.has(r) && s.graphGrow && s.animations && !reduced) {
+    if (!buttonMode && target.size && !this.grown.has(r) && s.graphGrow && s.animations && !reduced) {
       this.grown.add(r);
       this.animateGrow(r, target);
       return;
@@ -1589,6 +1613,84 @@ var GraphTree = class {
       r.changed?.();
     } catch {
     }
+  }
+  // ------------------------------------------------------------- sorting
+  /**
+   * "Sort graph" button: notes glide to their places (skill-tree branches,
+   * separated modules, members into their barrier, others out of it), the
+   * order is held for a few seconds while everything settles, then every note
+   * is let go and floats freely again (in "by button" mode).
+   */
+  sortGraph() {
+    this.scan();
+    const s = this.plugin.settings;
+    if (!this.originals.size) {
+      new import_obsidian5.Notice("ObsOrg: \u043E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0433\u0440\u0430\u0444, \u0447\u0442\u043E\u0431\u044B \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0438\u0442\u044C \u0435\u0433\u043E.");
+      return;
+    }
+    if (!s.skillTreeEnabled && !(s.modulesEnabled && s.moduleSeparate && this.plugin.modules.list.length)) {
+      new import_obsidian5.Notice("ObsOrg: \u043D\u0435\u0447\u0435\u0433\u043E \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0438\u0432\u0430\u0442\u044C \u2014 \u0432\u043A\u043B\u044E\u0447\u0438\u0442\u0435 \u0434\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438 \u0438\u043B\u0438 \u0441\u043E\u0437\u0434\u0430\u0439\u0442\u0435 \u043C\u043E\u0434\u0443\u043B\u0438.");
+      return;
+    }
+    for (const r of this.originals.keys()) this.sortOne(r);
+  }
+  sortOne(r) {
+    if (!r.nodes?.length) return;
+    const s = this.plugin.settings;
+    const prevTimer = this.sorting.get(r);
+    if (prevTimer !== void 0) window.clearTimeout(prevTimer);
+    this.posCache = null;
+    this.modLayout = null;
+    this.plugin.modules.centers.clear();
+    this.sorting.set(r, -1);
+    const base = s.skillTreeEnabled ? this.positions() : /* @__PURE__ */ new Map();
+    const target = this.withModules(r, base);
+    const ids = new Set([...target.keys()].filter((id) => this.hasNode(r, id)));
+    const from = /* @__PURE__ */ new Map();
+    for (const n of r.nodes) if (ids.has(n.id) && Number.isFinite(n.x)) from.set(n.id, { x: n.x, y: n.y });
+    this.pinned.set(r, ids);
+    this.releaseResting(r);
+    this.nudgeBudget.set(r, 4);
+    this.lastNodeCount.set(r, r.nodes.length);
+    if (s.animations && !this.plugin.motionReduced()) {
+      this.animatePins(r, from, target, ids);
+    } else {
+      for (const id of ids) {
+        const p = target.get(id);
+        this.pin(r, id, p.x, p.y, 0.3);
+      }
+      this.sent.set(r, new Map([...ids].map((id) => [id, target.get(id)])));
+    }
+    if (s.layoutMode === "button") {
+      this.sorting.set(r, window.setTimeout(() => this.finishSort(r), 600 + 3200));
+    } else {
+      this.sorting.delete(r);
+    }
+  }
+  finishSort(r) {
+    this.sorting.delete(r);
+    if (this.growing.has(r)) {
+      window.cancelAnimationFrame(this.growing.get(r));
+      this.growing.delete(r);
+    }
+    const pinned = this.pinned.get(r) ?? /* @__PURE__ */ new Set();
+    for (const id of pinned) this.unpin(r, id);
+    this.pinned.set(r, /* @__PURE__ */ new Set());
+    this.sent.delete(r);
+    this.releaseResting(r);
+    const release = this.holdRelease.get(r);
+    if (release) {
+      for (const id of release) this.unpin(r, id);
+      release.clear();
+    }
+    this.plugin.modules.centers.clear();
+    this.modLayout = null;
+    this.post(r, { alpha: 0.1, alphaTarget: 0, run: true });
+    try {
+      r.changed?.();
+    } catch {
+    }
+    new import_obsidian5.Notice("ObsOrg: \u0433\u0440\u0430\u0444 \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0435\u043D \u2014 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0441\u043D\u043E\u0432\u0430 \u0441\u0432\u043E\u0431\u043E\u0434\u043D\u044B.");
   }
   // ------------------------------------------------------------- layout
   /** Folder tree of index notes; folders without an index are skipped through. */
@@ -1764,7 +1866,8 @@ var GraphTree = class {
       release.clear();
       this.holdRelease.set(r, release);
       this.releaseHeld(r);
-      if (!s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
+      const wallsOn = s.layoutMode !== "button" || this.sorting.has(r);
+      if (!wallsOn || !s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
         this.releaseResting(r);
         continue;
       }
@@ -3060,6 +3163,7 @@ var DEFAULT_SETTINGS = {
   dailyFolder: "",
   dailyFormat: "",
   dailyTemplate: "",
+  layoutMode: "button",
   skillTreeEnabled: true,
   skillTreeStyle: "radial",
   skillTreeStep: 300,
@@ -3353,6 +3457,14 @@ var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
       cls: "setting-item-description",
       text: "\u041A\u0430\u0436\u0434\u0430\u044F \u043F\u0430\u043F\u043A\u0430 \u0432\u0435\u0440\u0445\u043D\u0435\u0433\u043E \u0443\u0440\u043E\u0432\u043D\u044F \u2014 \u0432\u0435\u0442\u043A\u0430, \u043A\u043E\u0442\u043E\u0440\u0430\u044F \u0440\u0430\u0441\u0442\u0451\u0442 \u0432 \u0441\u0432\u043E\u044E \u0441\u0442\u043E\u0440\u043E\u043D\u0443. \u0413\u043B\u0430\u0432\u043D\u044B\u0435 \u0444\u0430\u0439\u043B\u044B \u043F\u0430\u043F\u043E\u043A \u0437\u0430\u043A\u0440\u0435\u043F\u043B\u044F\u044E\u0442\u0441\u044F \u043A\u0430\u043A \u0443\u0437\u043B\u044B \u043D\u0430\u0432\u044B\u043A\u043E\u0432, \u0444\u0430\u0439\u043B\u044B \u0432\u0438\u0441\u044F\u0442 \u043D\u0430 \u043D\u0438\u0445 \u043B\u0438\u0441\u0442\u044C\u044F\u043C\u0438. \u0418\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u0442 \u0432\u043D\u0443\u0442\u0440\u0435\u043D\u043D\u0438\u0435 \u043C\u0435\u0445\u0430\u043D\u0438\u0437\u043C\u044B \u0433\u0440\u0430\u0444\u0430 Obsidian: \u043F\u043E\u0441\u043B\u0435 \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u044F Obsidian \u043C\u043E\u0436\u0435\u0442 \u043F\u0435\u0440\u0435\u0441\u0442\u0430\u0442\u044C \u0440\u0430\u0431\u043E\u0442\u0430\u0442\u044C \u2014 \u0442\u043E\u0433\u0434\u0430 \u043F\u0440\u043E\u0441\u0442\u043E \u0432\u044B\u043A\u043B\u044E\u0447\u0438\u0442\u0435."
     });
+    new import_obsidian8.Setting(containerEl).setName("\u041A\u043E\u0433\u0434\u0430 \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0438\u0432\u0430\u0442\u044C \u0433\u0440\u0430\u0444").setDesc(
+      "\xAB\u041F\u043E \u043A\u043D\u043E\u043F\u043A\u0435\xBB: \u0433\u0440\u0430\u0444 \u0436\u0438\u0432\u0451\u0442 \u0441\u0432\u043E\u0435\u0439 \u0444\u0438\u0437\u0438\u043A\u043E\u0439; \u043A\u043D\u043E\u043F\u043A\u0430 \u2728 \xAB\u0423\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0438\u0442\u044C \u0433\u0440\u0430\u0444\xBB \u0432 \u0437\u0430\u0433\u043E\u043B\u043E\u0432\u043A\u0435 \u0433\u0440\u0430\u0444\u0430 (\u0438\u043B\u0438 \u043A\u043E\u043C\u0430\u043D\u0434\u0430) \u043F\u043B\u0430\u0432\u043D\u043E \u0440\u0430\u0441\u043A\u043B\u0430\u0434\u044B\u0432\u0430\u0435\u0442 \u0432\u0435\u0442\u043A\u0438 \u0438 \u043C\u043E\u0434\u0443\u043B\u0438, \u0434\u0435\u0440\u0436\u0438\u0442 \u043F\u043E\u0440\u044F\u0434\u043E\u043A \u043F\u0430\u0440\u0443 \u0441\u0435\u043A\u0443\u043D\u0434 \u0438 \u043E\u0442\u043F\u0443\u0441\u043A\u0430\u0435\u0442 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u2014 \u043E\u043D\u0438 \u0441\u043D\u043E\u0432\u0430 \u043F\u043B\u0430\u0432\u0430\u044E\u0442. \xAB\u0412\u0441\u0435\u0433\u0434\u0430\xBB: \u043F\u043E\u0440\u044F\u0434\u043E\u043A \u0434\u0435\u0440\u0436\u0438\u0442\u0441\u044F \u043F\u043E\u0441\u0442\u043E\u044F\u043D\u043D\u043E (\u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0437\u0430\u043A\u0440\u0435\u043F\u043B\u0435\u043D\u044B)."
+    ).addDropdown(
+      (d) => d.addOptions({ button: "\u041F\u043E \u043A\u043D\u043E\u043F\u043A\u0435 \u2014 \u0440\u0430\u0441\u0441\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0438 \u043E\u0442\u043F\u0443\u0441\u0442\u0438\u0442\u044C", always: "\u0412\u0441\u0435\u0433\u0434\u0430 \u0434\u0435\u0440\u0436\u0430\u0442\u044C \u043F\u043E\u0440\u044F\u0434\u043E\u043A" }).setValue(s.layoutMode).onChange(async (v) => {
+        s.layoutMode = v;
+        await save();
+      })
+    );
     new import_obsidian8.Setting(containerEl).setName("\u0420\u0430\u0441\u043A\u043B\u0430\u0434\u044B\u0432\u0430\u0442\u044C \u0433\u0440\u0430\u0444 \u0432\u0435\u0442\u043A\u0430\u043C\u0438").addToggle(
       (t) => t.setValue(s.skillTreeEnabled).onChange(async (v) => {
         s.skillTreeEnabled = v;
@@ -3774,6 +3886,11 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
       }
     });
     this.addCommand({
+      id: "sort-graph",
+      name: "\u0413\u0440\u0430\u0444: \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0438\u0442\u044C (\u0440\u0430\u0441\u0441\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0438 \u043E\u0442\u043F\u0443\u0441\u0442\u0438\u0442\u044C)",
+      callback: () => this.graphTree.sortGraph()
+    });
+    this.addCommand({
       id: "toggle-skill-tree",
       name: "\u0413\u0440\u0430\u0444: \u0432\u043A\u043B\u044E\u0447\u0438\u0442\u044C/\u0432\u044B\u043A\u043B\u044E\u0447\u0438\u0442\u044C \u0434\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438",
       callback: async () => {
@@ -3936,7 +4053,8 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
       s.moduleGap,
       s.moduleSize,
       s.modulesEnabled,
-      s.modules.map((m) => [m.id, m.kind, m.value])
+      s.modules.map((m) => [m.id, m.kind, m.value]),
+      s.layoutMode
     ]);
   }
   calendarSignature() {

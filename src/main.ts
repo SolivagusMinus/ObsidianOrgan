@@ -121,6 +121,11 @@ export default class FolderHubPlugin extends Plugin {
 			},
 		});
 		this.addCommand({
+			id: "sort-graph",
+			name: "Граф: упорядочить (рассортировать и отпустить)",
+			callback: () => this.graphTree.sortGraph(),
+		});
+		this.addCommand({
 			id: "toggle-skill-tree",
 			name: "Граф: включить/выключить дерево прокачки",
 			callback: async () => {
@@ -304,6 +309,7 @@ export default class FolderHubPlugin extends Plugin {
 			s.skillTreeEnabled, s.skillTreeStyle, s.skillTreeStep, s.skillTreeSpread,
 			s.skillTreePinFiles, s.branchDirections, s.indexName, s.excludedFolders, s.graphFreeze,
 			s.moduleSeparate, s.moduleGap, s.moduleSize, s.modulesEnabled, s.modules.map((m) => [m.id, m.kind, m.value]),
+			s.layoutMode,
 		]);
 	}
 	private calendarSignature(): string {

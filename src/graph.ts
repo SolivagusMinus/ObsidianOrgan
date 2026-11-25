@@ -84,6 +84,10 @@ export class GraphTree {
 	private lastNodeCount = new Map<GraphRenderer, number>();
 	/** Target positions last sent to each graph, to skip no-op updates. */
 	private sent = new Map<GraphRenderer, Map<string, Point>>();
+	/** Graphs currently being sorted (button mode): pins and walls are active only then. */
+	private sorting = new Map<GraphRenderer, number>();
+	/** "Sort graph" buttons added to graph view headers. */
+	private actions = new Map<GraphRenderer, HTMLElement>();
 
 	constructor(private plugin: FolderHubPlugin) {}
 
@@ -129,6 +133,10 @@ export class GraphTree {
 		}
 		this.originals.clear();
 		this.views.clear();
+		this.actions.forEach((el) => el.remove());
+		this.actions.clear();
+		this.sorting.forEach((t) => window.clearTimeout(t));
+		this.sorting.clear();
 		this.timers.forEach((t) => window.clearTimeout(t));
 		if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
 	}
@@ -167,12 +175,28 @@ export class GraphTree {
 					orig.call(r, data);
 					this.schedule(r);
 				};
+				// A "sort" button in the graph's header (on phones: the tab's ⋮ menu).
+				try {
+					const btn = (view as unknown as { addAction?: (icon: string, title: string, cb: () => void) => HTMLElement }).addAction?.(
+						"sparkles",
+						"Упорядочить граф (ObsOrg)",
+						() => this.sortGraph(),
+					);
+					if (btn) this.actions.set(r, btn);
+				} catch {
+					/* ignore */
+				}
 				this.schedule(r);
 			}
 		}
 		// Forget renderers of closed graph tabs.
 		for (const r of [...this.originals.keys()]) {
 			if (alive.has(r)) continue;
+			this.actions.get(r)?.remove();
+			this.actions.delete(r);
+			const t = this.sorting.get(r);
+			if (t !== undefined) window.clearTimeout(t);
+			this.sorting.delete(r);
 			this.originals.delete(r);
 			this.views.delete(r);
 			this.pinned.delete(r);
@@ -244,12 +268,16 @@ export class GraphTree {
 		}
 		const s = this.plugin.settings;
 		const prev = this.pinned.get(r) ?? new Set<string>();
-		const base = s.skillTreeEnabled ? this.positions() : new Map<string, Point>();
-		const target = this.withModules(r, base);
+		// "By button" mode: the graph floats freely; the layout is applied only
+		// while a sort (started by the button) is running.
+		const buttonMode = s.layoutMode === "button";
+		const active = !buttonMode || this.sorting.has(r);
+		const base = active && s.skillTreeEnabled ? this.positions() : new Map<string, Point>();
+		const target = active ? this.withModules(r, base) : base;
 
 		// First time this graph shows the tree: let it grow out of the centre.
 		const reduced = this.plugin.motionReduced();
-		if (target.size && !this.grown.has(r) && s.graphGrow && s.animations && !reduced) {
+		if (!buttonMode && target.size && !this.grown.has(r) && s.graphGrow && s.animations && !reduced) {
 			this.grown.add(r);
 			this.animateGrow(r, target);
 			return;
@@ -413,6 +441,92 @@ export class GraphTree {
 		} catch {
 			/* ignore */
 		}
+	}
+
+	// ------------------------------------------------------------- sorting
+
+	/**
+	 * "Sort graph" button: notes glide to their places (skill-tree branches,
+	 * separated modules, members into their barrier, others out of it), the
+	 * order is held for a few seconds while everything settles, then every note
+	 * is let go and floats freely again (in "by button" mode).
+	 */
+	sortGraph() {
+		this.scan();
+		const s = this.plugin.settings;
+		if (!this.originals.size) {
+			new Notice("ObsOrg: откройте граф, чтобы упорядочить его.");
+			return;
+		}
+		if (!s.skillTreeEnabled && !(s.modulesEnabled && s.moduleSeparate && this.plugin.modules.list.length)) {
+			new Notice("ObsOrg: нечего упорядочивать — включите дерево прокачки или создайте модули.");
+			return;
+		}
+		for (const r of this.originals.keys()) this.sortOne(r);
+	}
+
+	private sortOne(r: GraphRenderer) {
+		if (!r.nodes?.length) return;
+		const s = this.plugin.settings;
+		const prevTimer = this.sorting.get(r);
+		if (prevTimer !== undefined) window.clearTimeout(prevTimer);
+		// Fresh layout from where the notes are right now.
+		this.posCache = null;
+		this.modLayout = null;
+		this.plugin.modules.centers.clear();
+		this.sorting.set(r, -1);
+		const base = s.skillTreeEnabled ? this.positions() : new Map<string, Point>();
+		const target = this.withModules(r, base);
+		const ids = new Set([...target.keys()].filter((id) => this.hasNode(r, id)));
+		const from = new Map<string, Point>();
+		for (const n of r.nodes) if (ids.has(n.id) && Number.isFinite(n.x)) from.set(n.id, { x: n.x, y: n.y });
+		this.pinned.set(r, ids);
+		this.releaseResting(r);
+		this.nudgeBudget.set(r, 4);
+		this.lastNodeCount.set(r, r.nodes.length);
+		if (s.animations && !this.plugin.motionReduced()) {
+			this.animatePins(r, from, target, ids);
+		} else {
+			for (const id of ids) {
+				const p = target.get(id)!;
+				this.pin(r, id, p.x, p.y, 0.3);
+			}
+			this.sent.set(r, new Map([...ids].map((id) => [id, target.get(id)!])));
+		}
+		// Hold the order while it settles, then let go (button mode).
+		if (s.layoutMode === "button") {
+			this.sorting.set(r, window.setTimeout(() => this.finishSort(r), 600 + 3200));
+		} else {
+			this.sorting.delete(r);
+		}
+	}
+
+	private finishSort(r: GraphRenderer) {
+		this.sorting.delete(r);
+		if (this.growing.has(r)) {
+			window.cancelAnimationFrame(this.growing.get(r)!);
+			this.growing.delete(r);
+		}
+		const pinned = this.pinned.get(r) ?? new Set<string>();
+		for (const id of pinned) this.unpin(r, id);
+		this.pinned.set(r, new Set());
+		this.sent.delete(r);
+		this.releaseResting(r);
+		const release = this.holdRelease.get(r);
+		if (release) {
+			for (const id of release) this.unpin(r, id);
+			release.clear();
+		}
+		// Barriers now follow their notes wherever the physics takes them.
+		this.plugin.modules.centers.clear();
+		this.modLayout = null;
+		this.post(r, { alpha: 0.1, alphaTarget: 0, run: true });
+		try {
+			r.changed?.();
+		} catch {
+			/* ignore */
+		}
+		new Notice("ObsOrg: граф упорядочен — заметки снова свободны.");
 	}
 
 	// ------------------------------------------------------------- layout
@@ -617,7 +731,8 @@ export class GraphTree {
 			release.clear();
 			this.holdRelease.set(r, release);
 			this.releaseHeld(r); // permanent pins from older versions
-			if (!s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
+			const wallsOn = s.layoutMode !== "button" || this.sorting.has(r);
+			if (!wallsOn || !s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
 				this.releaseResting(r);
 				continue;
 			}

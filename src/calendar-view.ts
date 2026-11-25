@@ -66,7 +66,18 @@ export class CalendarView extends ItemView {
 			}, 60_000),
 		);
 		// Daily notes / new notes change the dots on the calendar.
-		const refreshMonth = () => this.renderMonth("none");
+		// Debounced: syncing hundreds of files must not redraw the month hundreds of times.
+		let monthTimer: number | null = null;
+		const refreshMonth = () => {
+			if (monthTimer !== null) window.clearTimeout(monthTimer);
+			monthTimer = window.setTimeout(() => {
+				monthTimer = null;
+				this.renderMonth("none");
+			}, 500);
+		};
+		this.register(() => {
+			if (monthTimer !== null) window.clearTimeout(monthTimer);
+		});
 		this.registerEvent(this.app.vault.on("create", refreshMonth));
 		this.registerEvent(this.app.vault.on("delete", refreshMonth));
 		this.registerEvent(this.app.vault.on("rename", refreshMonth));

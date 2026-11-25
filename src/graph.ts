@@ -115,7 +115,7 @@ export class GraphTree {
 
 	stop() {
 		if (this.holdTimer !== null) window.clearInterval(this.holdTimer);
-		for (const [r, ids] of this.holdRelease) for (const id of ids) this.post(r, { forceNode: { id, x: null, y: null } });
+		for (const [r, ids] of this.holdRelease) for (const id of ids) this.unpin(r, id);
 		this.holdRelease.clear();
 		for (const r of this.held.keys()) this.releaseHeld(r);
 		for (const r of this.resting.keys()) this.releaseResting(r);
@@ -204,6 +204,32 @@ export class GraphTree {
 		}
 	}
 
+	/**
+	 * Pins a node (x/y = null unpins). Same message shape the graph uses while
+	 * dragging and that working plugins use: the wake-up (alpha/alphaTarget/run)
+	 * travels in the SAME message as forceNode — a pin sent on its own may not
+	 * take effect on a graph that has already come to rest. fx/fy are also set
+	 * on the UI-side node object.
+	 */
+	private pin(r: GraphRenderer, id: string, x: number | null, y: number | null, wake = 0) {
+		const msg: Record<string, unknown> = { forceNode: { id, x, y } };
+		if (wake > 0) {
+			msg.alpha = wake;
+			msg.alphaTarget = 0;
+			msg.run = true;
+		}
+		this.post(r, msg);
+		const n = (r.nodeLookup?.[id] ?? r.nodes?.find((m) => m.id === id)) as { fx?: number | null; fy?: number | null } | undefined;
+		if (n && typeof n === "object") {
+			n.fx = x;
+			n.fy = y;
+		}
+	}
+
+	private unpin(r: GraphRenderer, id: string, wake = 0) {
+		this.pin(r, id, null, null, wake);
+	}
+
 	private hasNode(r: GraphRenderer, id: string): boolean {
 		if (r.nodeLookup) return id in r.nodeLookup;
 		return !!r.nodes?.some((n) => n.id === id);
@@ -246,7 +272,7 @@ export class GraphTree {
 		}
 		for (const id of prev) {
 			if (!now.has(id)) {
-				this.post(r, { forceNode: { id, x: null, y: null } });
+				this.unpin(r, id, 0.3);
 				moved = true;
 			}
 		}
@@ -267,7 +293,10 @@ export class GraphTree {
 		}
 		for (const id of now) {
 			const p = target.get(id)!;
-			this.post(r, { forceNode: { id, x: p.x, y: p.y } });
+			const q = last.get(id);
+			const changed = !q || Math.abs(q.x - p.x) > 0.5 || Math.abs(q.y - p.y) > 0.5;
+			// Re-sent pins that didn't change don't wake the physics (no jiggling while typing).
+			this.pin(r, id, p.x, p.y, changed ? 0.3 : 0);
 		}
 		this.sent.set(r, new Map([...now].map((id) => [id, target.get(id)!])));
 		if (moved) {
@@ -288,7 +317,7 @@ export class GraphTree {
 		const step = (now: number) => {
 			const k = Math.min(1, (now - t0) / DUR);
 			const e = back(k);
-			for (const o of list) this.post(r, { forceNode: { id: o.id, x: o.a.x + (o.b.x - o.a.x) * e, y: o.a.y + (o.b.y - o.a.y) * e } });
+			for (const o of list) this.pin(r, o.id, o.a.x + (o.b.x - o.a.x) * e, o.a.y + (o.b.y - o.a.y) * e, 0.3);
 			if (k < 1) {
 				this.growing.set(r, window.requestAnimationFrame(step));
 			} else {
@@ -307,7 +336,7 @@ export class GraphTree {
 		const ids = [...target.keys()].filter((id) => this.hasNode(r, id));
 		const pinned = new Set(ids);
 		for (const id of this.pinned.get(r) ?? []) {
-			if (!pinned.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+			if (!pinned.has(id)) this.unpin(r, id, 0.3);
 		}
 		this.pinned.set(r, pinned);
 		const DUR = 650;
@@ -321,12 +350,13 @@ export class GraphTree {
 				const k = Math.min(1, Math.max(0, (now - t0 - ((depth.get(id) ?? 1) - 1) * STAGGER) / DUR));
 				if (k < 1) done = false;
 				const e = ease(k);
-				this.post(r, { forceNode: { id, x: p.x * e, y: p.y * e } });
+				this.pin(r, id, p.x * e, p.y * e, 0.3);
 			}
 			if (done) {
 				this.growing.delete(r);
 				this.sent.set(r, new Map(ids.map((id) => [id, target.get(id)!])));
 				this.scheduleFreeze(r);
+				this.schedule(r); // pick up anything that changed meanwhile
 			} else {
 				this.growing.set(r, window.requestAnimationFrame(step));
 			}
@@ -351,7 +381,7 @@ export class GraphTree {
 				const set = new Set<string>();
 				for (const n of r.nodes ?? []) {
 					if (pins.has(n.id) || typeof n.x !== "number") continue;
-					this.post(r, { forceNode: { id: n.id, x: n.x, y: n.y } });
+					this.pin(r, n.id, n.x, n.y);
 					set.add(n.id);
 				}
 				this.frozen.set(r, set);
@@ -362,7 +392,7 @@ export class GraphTree {
 	private unfreeze(r: GraphRenderer) {
 		const set = this.frozen.get(r);
 		if (!set?.size) return;
-		for (const id of set) this.post(r, { forceNode: { id, x: null, y: null } });
+		for (const id of set) this.unpin(r, id);
 		this.frozen.delete(r);
 		this.reheat(r);
 	}
@@ -370,14 +400,14 @@ export class GraphTree {
 	private unpinAll(r: GraphRenderer) {
 		const prev = this.pinned.get(r);
 		if (!prev?.size) return;
-		for (const id of prev) this.post(r, { forceNode: { id, x: null, y: null } });
+		for (const id of prev) this.unpin(r, id);
 		this.pinned.set(r, new Set());
 		this.reheat(r);
 	}
 
 	/** Wakes the simulation up so nodes glide to their new places. */
 	private reheat(r: GraphRenderer) {
-		this.post(r, { alpha: 0.3, run: true });
+		this.post(r, { alpha: 0.3, alphaTarget: 0, run: true });
 		try {
 			r.changed?.();
 		} catch {
@@ -583,7 +613,7 @@ export class GraphTree {
 			const release = this.holdRelease.get(r) ?? new Set<string>();
 			const layoutPins = this.pinned.get(r);
 			// Never let go of notes the layout pinned meanwhile (e.g. a module's anchor).
-			for (const id of release) if (!layoutPins?.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+			for (const id of release) if (!layoutPins?.has(id)) this.unpin(r, id);
 			release.clear();
 			this.holdRelease.set(r, release);
 			this.releaseHeld(r); // permanent pins from older versions
@@ -652,13 +682,15 @@ export class GraphTree {
 			fixes.sort((a, b) => b.depth - a.depth);
 			const budget = this.nudgeBudget.get(r) ?? 4;
 			const settle = budget <= 0; // out of nudges: stubborn notes rest against the wall
+			const nudge = !settle && now - (this.lastNudge.get(r) ?? 0) > 1500;
+			// The wake-up rides in the same messages: a resting graph applies the fixes too.
+			const wake = nudge ? 0.04 : settle ? 0.02 : 0;
 			for (const f of fixes.slice(0, 80)) {
-				this.post(r, { forceNode: { id: f.id, x: f.x, y: f.y } });
+				this.pin(r, f.id, f.x, f.y, wake);
 				if (settle) resting.add(f.id);
 				else release.add(f.id);
 			}
-			if (!settle && now - (this.lastNudge.get(r) ?? 0) > 1500) {
-				this.post(r, { alpha: 0.04, run: true });
+			if (nudge) {
 				this.lastNudge.set(r, now);
 				this.nudgeBudget.set(r, budget - 1);
 			}
@@ -669,14 +701,14 @@ export class GraphTree {
 		const set = this.resting.get(r);
 		if (!set?.size) return;
 		const layoutPins = this.pinned.get(r);
-		for (const id of set) if (!layoutPins?.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+		for (const id of set) if (!layoutPins?.has(id)) this.unpin(r, id);
 		set.clear();
 	}
 
 	private releaseHeld(r: GraphRenderer) {
 		const held = this.held.get(r);
 		if (!held?.size) return;
-		for (const id of held.keys()) this.post(r, { forceNode: { id, x: null, y: null } });
+		for (const id of held.keys()) this.unpin(r, id);
 		held.clear();
 	}
 

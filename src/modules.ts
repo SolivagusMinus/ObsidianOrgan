@@ -75,9 +75,12 @@ export class GraphModules {
 		for (const m of this.list) {
 			const set = new Set<string>();
 			if (m.kind === "folder") {
-				const folder = normalizePath(m.value || "/");
-				const prefix = folder === "/" ? "" : folder + "/";
-				for (const f of files) if (f.path.startsWith(prefix)) set.add(f.path);
+				// No folder chosen yet (a module just added in settings) → no members, not the whole vault.
+				const folder = m.value.trim() ? normalizePath(m.value) : "";
+				if (folder && folder !== "/") {
+					const prefix = folder + "/";
+					for (const f of files) if (f.path.startsWith(prefix)) set.add(f.path);
+				}
 			} else {
 				const tag = "#" + m.value.replace(/^#/, "").trim().toLowerCase();
 				if (tag.length > 1) {
@@ -166,7 +169,7 @@ export class GraphModules {
 	/** Graph search query that matches the module's members (for colour groups). */
 	query(m: ModuleDef): string | null {
 		if (m.kind === "folder") {
-			const folder = normalizePath(m.value || "");
+			const folder = m.value.trim() ? normalizePath(m.value) : "";
 			if (!folder || folder === "/") return null;
 			return `path:/^${escapeRegex(folder)}\\//`;
 		}

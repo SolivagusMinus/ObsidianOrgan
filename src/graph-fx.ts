@@ -429,18 +429,25 @@ export class GraphFx {
 			const pad = this.plugin.modules.unit * 0.6 * s.moduleSize;
 			const modules = this.plugin.modules;
 			const placed = s.moduleSeparate ? modules.centers.get(e.def.id) : undefined;
-			let cx: number;
-			let cy: number;
-			let R: number;
-			if (placed?.hold) {
-				// Same centre and radius the layout reserved for this module.
-				cx = placed.x;
-				cy = placed.y;
-				R = placed.hold;
-			} else {
+			let cx = 0;
+			let cy = 0;
+			let R = 0;
+			const aroundNotes = () => {
 				cx = [...pts.map((p) => p.x)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
 				cy = [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
 				R = modules.barrierRadius(pts.length, pts.map((p) => Math.hypot(p.x - cx, p.y - cy)));
+			};
+			if (placed?.hold) {
+				// Same centre and radius the layout reserved for this module…
+				cx = placed.x;
+				cy = placed.y;
+				R = placed.hold;
+				// …unless its notes aren't there (yet): never draw an empty barrier
+				// away from the notes — follow them until the layout has moved them.
+				const inPlace = pts.filter((p) => Math.hypot(p.x - cx, p.y - cy) <= R).length;
+				if (pts.length && inPlace < Math.max(1, Math.ceil(pts.length * 0.3))) aroundNotes();
+			} else {
+				aroundNotes();
 			}
 			// Notes dragged far away by links to other modules stay outside the
 			// barrier instead of stretching it into a band.

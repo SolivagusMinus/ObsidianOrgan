@@ -483,7 +483,7 @@ export default class FolderHubPlugin extends Plugin {
 	private enqueue(task: () => Promise<unknown>): Promise<void> {
 		this.queue = this.queue.then(task).then(
 			() => undefined,
-			(e) => console.error("Folder Hub:", e),
+			(e) => console.error("ObsOrg:", e),
 		);
 		return this.queue;
 	}

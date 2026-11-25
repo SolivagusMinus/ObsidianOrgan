@@ -264,7 +264,17 @@ var CalendarView = class extends import_obsidian3.ItemView {
         }
       }, 6e4)
     );
-    const refreshMonth = () => this.renderMonth("none");
+    let monthTimer = null;
+    const refreshMonth = () => {
+      if (monthTimer !== null) window.clearTimeout(monthTimer);
+      monthTimer = window.setTimeout(() => {
+        monthTimer = null;
+        this.renderMonth("none");
+      }, 500);
+    };
+    this.register(() => {
+      if (monthTimer !== null) window.clearTimeout(monthTimer);
+    });
     this.registerEvent(this.app.vault.on("create", refreshMonth));
     this.registerEvent(this.app.vault.on("delete", refreshMonth));
     this.registerEvent(this.app.vault.on("rename", refreshMonth));
@@ -1315,7 +1325,7 @@ var GraphTree = class {
   }
   stop() {
     if (this.holdTimer !== null) window.clearInterval(this.holdTimer);
-    for (const [r, ids] of this.holdRelease) for (const id of ids) this.post(r, { forceNode: { id, x: null, y: null } });
+    for (const [r, ids] of this.holdRelease) for (const id of ids) this.unpin(r, id);
     this.holdRelease.clear();
     for (const r of this.held.keys()) this.releaseHeld(r);
     for (const r of this.resting.keys()) this.releaseResting(r);
@@ -1393,6 +1403,30 @@ var GraphTree = class {
       console.warn("ObsOrg: graph worker message failed", e);
     }
   }
+  /**
+   * Pins a node (x/y = null unpins). Same message shape the graph uses while
+   * dragging and that working plugins use: the wake-up (alpha/alphaTarget/run)
+   * travels in the SAME message as forceNode — a pin sent on its own may not
+   * take effect on a graph that has already come to rest. fx/fy are also set
+   * on the UI-side node object.
+   */
+  pin(r, id, x, y, wake = 0) {
+    const msg = { forceNode: { id, x, y } };
+    if (wake > 0) {
+      msg.alpha = wake;
+      msg.alphaTarget = 0;
+      msg.run = true;
+    }
+    this.post(r, msg);
+    const n = r.nodeLookup?.[id] ?? r.nodes?.find((m) => m.id === id);
+    if (n && typeof n === "object") {
+      n.fx = x;
+      n.fy = y;
+    }
+  }
+  unpin(r, id, wake = 0) {
+    this.pin(r, id, null, null, wake);
+  }
   hasNode(r, id) {
     if (r.nodeLookup) return id in r.nodeLookup;
     return !!r.nodes?.some((n) => n.id === id);
@@ -1426,7 +1460,7 @@ var GraphTree = class {
     }
     for (const id of prev) {
       if (!now.has(id)) {
-        this.post(r, { forceNode: { id, x: null, y: null } });
+        this.unpin(r, id, 0.3);
         moved = true;
       }
     }
@@ -1443,7 +1477,9 @@ var GraphTree = class {
     }
     for (const id of now) {
       const p = target.get(id);
-      this.post(r, { forceNode: { id, x: p.x, y: p.y } });
+      const q = last.get(id);
+      const changed = !q || Math.abs(q.x - p.x) > 0.5 || Math.abs(q.y - p.y) > 0.5;
+      this.pin(r, id, p.x, p.y, changed ? 0.3 : 0);
     }
     this.sent.set(r, new Map([...now].map((id) => [id, target.get(id)])));
     if (moved) {
@@ -1463,7 +1499,7 @@ var GraphTree = class {
     const step = (now) => {
       const k = Math.min(1, (now - t0) / DUR);
       const e = back(k);
-      for (const o of list) this.post(r, { forceNode: { id: o.id, x: o.a.x + (o.b.x - o.a.x) * e, y: o.a.y + (o.b.y - o.a.y) * e } });
+      for (const o of list) this.pin(r, o.id, o.a.x + (o.b.x - o.a.x) * e, o.a.y + (o.b.y - o.a.y) * e, 0.3);
       if (k < 1) {
         this.growing.set(r, window.requestAnimationFrame(step));
       } else {
@@ -1481,7 +1517,7 @@ var GraphTree = class {
     const ids = [...target.keys()].filter((id) => this.hasNode(r, id));
     const pinned = new Set(ids);
     for (const id of this.pinned.get(r) ?? []) {
-      if (!pinned.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+      if (!pinned.has(id)) this.unpin(r, id, 0.3);
     }
     this.pinned.set(r, pinned);
     const DUR = 650;
@@ -1495,12 +1531,13 @@ var GraphTree = class {
         const k = Math.min(1, Math.max(0, (now - t0 - ((depth.get(id) ?? 1) - 1) * STAGGER) / DUR));
         if (k < 1) done = false;
         const e = ease(k);
-        this.post(r, { forceNode: { id, x: p.x * e, y: p.y * e } });
+        this.pin(r, id, p.x * e, p.y * e, 0.3);
       }
       if (done) {
         this.growing.delete(r);
         this.sent.set(r, new Map(ids.map((id) => [id, target.get(id)])));
         this.scheduleFreeze(r);
+        this.schedule(r);
       } else {
         this.growing.set(r, window.requestAnimationFrame(step));
       }
@@ -1524,7 +1561,7 @@ var GraphTree = class {
         const set = /* @__PURE__ */ new Set();
         for (const n of r.nodes ?? []) {
           if (pins.has(n.id) || typeof n.x !== "number") continue;
-          this.post(r, { forceNode: { id: n.id, x: n.x, y: n.y } });
+          this.pin(r, n.id, n.x, n.y);
           set.add(n.id);
         }
         this.frozen.set(r, set);
@@ -1534,20 +1571,20 @@ var GraphTree = class {
   unfreeze(r) {
     const set = this.frozen.get(r);
     if (!set?.size) return;
-    for (const id of set) this.post(r, { forceNode: { id, x: null, y: null } });
+    for (const id of set) this.unpin(r, id);
     this.frozen.delete(r);
     this.reheat(r);
   }
   unpinAll(r) {
     const prev = this.pinned.get(r);
     if (!prev?.size) return;
-    for (const id of prev) this.post(r, { forceNode: { id, x: null, y: null } });
+    for (const id of prev) this.unpin(r, id);
     this.pinned.set(r, /* @__PURE__ */ new Set());
     this.reheat(r);
   }
   /** Wakes the simulation up so nodes glide to their new places. */
   reheat(r) {
-    this.post(r, { alpha: 0.3, run: true });
+    this.post(r, { alpha: 0.3, alphaTarget: 0, run: true });
     try {
       r.changed?.();
     } catch {
@@ -1723,7 +1760,7 @@ var GraphTree = class {
     for (const r of this.originals.keys()) {
       const release = this.holdRelease.get(r) ?? /* @__PURE__ */ new Set();
       const layoutPins = this.pinned.get(r);
-      for (const id of release) if (!layoutPins?.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+      for (const id of release) if (!layoutPins?.has(id)) this.unpin(r, id);
       release.clear();
       this.holdRelease.set(r, release);
       this.releaseHeld(r);
@@ -1786,13 +1823,14 @@ var GraphTree = class {
       fixes.sort((a, b) => b.depth - a.depth);
       const budget = this.nudgeBudget.get(r) ?? 4;
       const settle = budget <= 0;
+      const nudge = !settle && now - (this.lastNudge.get(r) ?? 0) > 1500;
+      const wake = nudge ? 0.04 : settle ? 0.02 : 0;
       for (const f of fixes.slice(0, 80)) {
-        this.post(r, { forceNode: { id: f.id, x: f.x, y: f.y } });
+        this.pin(r, f.id, f.x, f.y, wake);
         if (settle) resting.add(f.id);
         else release.add(f.id);
       }
-      if (!settle && now - (this.lastNudge.get(r) ?? 0) > 1500) {
-        this.post(r, { alpha: 0.04, run: true });
+      if (nudge) {
         this.lastNudge.set(r, now);
         this.nudgeBudget.set(r, budget - 1);
       }
@@ -1802,13 +1840,13 @@ var GraphTree = class {
     const set = this.resting.get(r);
     if (!set?.size) return;
     const layoutPins = this.pinned.get(r);
-    for (const id of set) if (!layoutPins?.has(id)) this.post(r, { forceNode: { id, x: null, y: null } });
+    for (const id of set) if (!layoutPins?.has(id)) this.unpin(r, id);
     set.clear();
   }
   releaseHeld(r) {
     const held = this.held.get(r);
     if (!held?.size) return;
-    for (const id of held.keys()) this.post(r, { forceNode: { id, x: null, y: null } });
+    for (const id of held.keys()) this.unpin(r, id);
     held.clear();
   }
   // ------------------------------------------------------------- colours
@@ -2318,17 +2356,22 @@ var GraphFx = class {
       const pad2 = this.plugin.modules.unit * 0.6 * s.moduleSize;
       const modules = this.plugin.modules;
       const placed = s.moduleSeparate ? modules.centers.get(e.def.id) : void 0;
-      let cx;
-      let cy;
-      let R;
+      let cx = 0;
+      let cy = 0;
+      let R = 0;
+      const aroundNotes = () => {
+        cx = [...pts.map((p) => p.x)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
+        cy = [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
+        R = modules.barrierRadius(pts.length, pts.map((p) => Math.hypot(p.x - cx, p.y - cy)));
+      };
       if (placed?.hold) {
         cx = placed.x;
         cy = placed.y;
         R = placed.hold;
+        const inPlace = pts.filter((p) => Math.hypot(p.x - cx, p.y - cy) <= R).length;
+        if (pts.length && inPlace < Math.max(1, Math.ceil(pts.length * 0.3))) aroundNotes();
       } else {
-        cx = [...pts.map((p) => p.x)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
-        cy = [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
-        R = modules.barrierRadius(pts.length, pts.map((p) => Math.hypot(p.x - cx, p.y - cy)));
+        aroundNotes();
       }
       const core = pts.filter((p) => Math.hypot(p.x - cx, p.y - cy) <= R);
       pts = core.length ? core : [{ x: cx, y: cy }];
@@ -2696,9 +2739,11 @@ var GraphModules = class {
     for (const m of this.list) {
       const set = /* @__PURE__ */ new Set();
       if (m.kind === "folder") {
-        const folder = (0, import_obsidian7.normalizePath)(m.value || "/");
-        const prefix = folder === "/" ? "" : folder + "/";
-        for (const f of files) if (f.path.startsWith(prefix)) set.add(f.path);
+        const folder = m.value.trim() ? (0, import_obsidian7.normalizePath)(m.value) : "";
+        if (folder && folder !== "/") {
+          const prefix = folder + "/";
+          for (const f of files) if (f.path.startsWith(prefix)) set.add(f.path);
+        }
       } else {
         const tag = "#" + m.value.replace(/^#/, "").trim().toLowerCase();
         if (tag.length > 1) {
@@ -2770,7 +2815,7 @@ var GraphModules = class {
   /** Graph search query that matches the module's members (for colour groups). */
   query(m) {
     if (m.kind === "folder") {
-      const folder = (0, import_obsidian7.normalizePath)(m.value || "");
+      const folder = m.value.trim() ? (0, import_obsidian7.normalizePath)(m.value) : "";
       if (!folder || folder === "/") return null;
       return `path:/^${escapeRegex(folder)}\\//`;
     }
@@ -4043,7 +4088,7 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
   enqueue(task) {
     this.queue = this.queue.then(task).then(
       () => void 0,
-      (e) => console.error("Folder Hub:", e)
+      (e) => console.error("ObsOrg:", e)
     );
     return this.queue;
   }

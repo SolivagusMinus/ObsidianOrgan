@@ -12,7 +12,7 @@ import { Circle, centroid, separateCircles } from "./module-shapes";
 
 interface GraphRenderer {
 	nodes?: { id: string; x: number; y: number }[];
-	links?: { source: { x: number; y: number }; target: { x: number; y: number } }[];
+	links?: { source: { id?: string; x: number; y: number }; target: { id?: string; x: number; y: number } }[];
 	nodeLookup?: Record<string, unknown>;
 	worker?: Worker;
 	setData?: (data: unknown) => void;
@@ -766,9 +766,13 @@ export class GraphTree {
 			// Walls: always in "always" mode; in "by button" mode during a sort, and
 			// afterwards only for notes of OTHER modules (members float freely).
 			const anchors = buttonMode ? this.kept.get(r) : this.sent.get(r);
-			const wallsOn = !buttonMode || sorting || !!anchors?.size;
+			// Notes of other modules are kept out once modules have their places;
+			// members are held in during a sort (or always, in "always" mode); notes
+			// with no links at all are always held in — nothing else ties them to
+			// their module, so the graph's repulsion would fling them away.
+			const outsidersRule = !buttonMode || sorting || !!anchors?.size;
 			const membersRule = !buttonMode || sorting;
-			if (!wallsOn || !s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
+			if (!s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
 				this.releaseResting(r);
 				continue;
 			}
@@ -803,22 +807,31 @@ export class GraphTree {
 
 			const resting = this.resting.get(r) ?? new Set<string>();
 			this.resting.set(r, resting);
+			// Which notes have at least one link in the graph.
+			const linked = new Set<string>();
+			for (const l of r.links ?? []) {
+				if (l.source.id) linked.add(l.source.id);
+				if (l.target.id) linked.add(l.target.id);
+			}
 			const fixes: { id: string; x: number; y: number; depth: number }[] = [];
 			for (const n of r.nodes) {
 				if (pinned?.has(n.id) || frozen?.has(n.id) || resting.has(n.id) || !Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
 				const own = owner.get(n.id);
 				// Own wall first: a member outside its module goes back in.
-				const home = own && membersRule ? walls.find((w) => w.id === own) : undefined;
+				const orphan = !linked.has(n.id);
+				const home = own && (membersRule || orphan) ? walls.find((w) => w.id === own) : undefined;
 				if (home) {
 					const dx = n.x - home.x;
 					const dy = n.y - home.y;
 					const d = Math.hypot(dx, dy) || 0.001;
 					if (d > home.R) {
-						const k = (home.R * 0.96) / d;
+						// Unlinked notes go well inside (not onto the wall they'd keep hitting).
+						const k = (home.R * (orphan ? 0.55 : 0.96)) / d;
 						fixes.push({ id: n.id, x: home.x + dx * k, y: home.y + dy * k, depth: d - home.R });
 						continue;
 					}
 				}
+				if (!outsidersRule) continue;
 				// Then other modules' walls: nobody else gets in.
 				for (const w of walls) {
 					if (w.id === own) continue;

@@ -1910,9 +1910,9 @@ var GraphTree = class {
       const sorting = this.sorting.has(r);
       if (++this.slimeFrame % 2 === 0) this.slimeTick(r);
       const anchors = buttonMode ? this.kept.get(r) : this.sent.get(r);
-      const wallsOn = !buttonMode || sorting || !!anchors?.size;
+      const outsidersRule = !buttonMode || sorting || !!anchors?.size;
       const membersRule = !buttonMode || sorting;
-      if (!wallsOn || !s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
+      if (!s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
         this.releaseResting(r);
         continue;
       }
@@ -1942,21 +1942,28 @@ var GraphTree = class {
       if (!walls.length) continue;
       const resting = this.resting.get(r) ?? /* @__PURE__ */ new Set();
       this.resting.set(r, resting);
+      const linked = /* @__PURE__ */ new Set();
+      for (const l of r.links ?? []) {
+        if (l.source.id) linked.add(l.source.id);
+        if (l.target.id) linked.add(l.target.id);
+      }
       const fixes = [];
       for (const n of r.nodes) {
         if (pinned?.has(n.id) || frozen?.has(n.id) || resting.has(n.id) || !Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
         const own = owner.get(n.id);
-        const home = own && membersRule ? walls.find((w) => w.id === own) : void 0;
+        const orphan = !linked.has(n.id);
+        const home = own && (membersRule || orphan) ? walls.find((w) => w.id === own) : void 0;
         if (home) {
           const dx = n.x - home.x;
           const dy = n.y - home.y;
           const d = Math.hypot(dx, dy) || 1e-3;
           if (d > home.R) {
-            const k = home.R * 0.96 / d;
+            const k = home.R * (orphan ? 0.55 : 0.96) / d;
             fixes.push({ id: n.id, x: home.x + dx * k, y: home.y + dy * k, depth: d - home.R });
             continue;
           }
         }
+        if (!outsidersRule) continue;
         for (const w of walls) {
           if (w.id === own) continue;
           const dx = n.x - w.x;

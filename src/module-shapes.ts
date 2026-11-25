@@ -387,3 +387,27 @@ export function separateCircles(circles: Circle[], gap: number, iterations = 300
 	}
 	return circles;
 }
+
+/**
+ * "Slime" contact: limits one ray of a barrier (centre c, overall radius R,
+ * ray angle a, ray length r) so it stops at the radical line it shares with
+ * each overlapping neighbour. Two barriers that meet then press into a flat
+ * common edge instead of overlapping; the bigger one gets more of the space.
+ */
+export function slimeClamp(c: Pt, R: number, a: number, r: number, neighbours: { x: number; y: number; R: number }[], gap: number): number {
+	const ux = Math.cos(a);
+	const uy = Math.sin(a);
+	let out = r;
+	for (const n of neighbours) {
+		const dx = n.x - c.x;
+		const dy = n.y - c.y;
+		const d2 = dx * dx + dy * dy;
+		const sum = R + n.R;
+		if (d2 >= sum * sum) continue; // not touching
+		const ud = ux * dx + uy * dy;
+		if (ud <= 1e-9) continue; // ray points away from this neighbour
+		const t = (d2 + R * R - n.R * n.R) / (2 * ud) - gap / 2;
+		if (t < out) out = Math.max(0, t);
+	}
+	return out;
+}

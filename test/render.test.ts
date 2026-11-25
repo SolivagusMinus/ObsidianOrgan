@@ -314,3 +314,21 @@ test("modules are pushed apart: no overlaps, touching allowed, centre of mass ke
 	separateCircles(far, 5);
 	assert.deepEqual(far.map((c) => c.x), [0, 100]);
 });
+
+import { slimeClamp } from "../src/module-shapes";
+
+test("slime contact: touching barriers meet at a flat shared edge", () => {
+	// two equal circles of radius 100, centres 150 apart → they overlap by 50
+	const a = { x: 0, y: 0 }, b = { x: 150, y: 0, R: 100 };
+	// the ray towards the neighbour stops half-way (75), minus half the gap
+	assert.ok(Math.abs(slimeClamp(a, 100, 0, 100, [b], 4) - 73) < 1e-9);
+	// a ray at 30° stops on the same vertical line x = 75 (flat edge), shorter rays are untouched
+	const r30 = slimeClamp(a, 100, Math.PI / 6, 100, [b], 0);
+	assert.ok(Math.abs(r30 * Math.cos(Math.PI / 6) - 75) < 1e-6);
+	assert.equal(slimeClamp(a, 100, Math.PI / 3, 100, [b], 0), 100); // 100·cos60° = 50 < 75
+	// rays pointing away are untouched; far neighbours are ignored
+	assert.equal(slimeClamp(a, 100, Math.PI, 100, [b], 4), 100);
+	assert.equal(slimeClamp(a, 100, 0, 100, [{ x: 500, y: 0, R: 100 }], 4), 100);
+	// the bigger module gets more room: the edge moves towards the smaller one
+	assert.ok(slimeClamp(a, 140, 0, 140, [{ x: 150, y: 0, R: 60 }], 0) > 75);
+});

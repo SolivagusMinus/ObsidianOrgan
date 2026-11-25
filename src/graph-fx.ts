@@ -1,7 +1,7 @@
 import { Platform, View } from "obsidian";
 import type FolderHubPlugin from "./main";
 import { Quality, drawRay } from "./rays";
-import { centroid, drawBoundary, elasticOut, fillOutline, moduleOutline, polarRadii } from "./module-shapes";
+import { centroid, drawBoundary, elasticOut, fillOutline, moduleOutline, polarRadii, slimeClamp } from "./module-shapes";
 import type { ModuleDef } from "./modules";
 
 // ---------------------------------------------------------------------------
@@ -609,9 +609,17 @@ export class GraphFx {
 			const animate = s.moduleAnimate && s.animations;
 			const intro = s.animations ? s.moduleIntro : "none";
 			const labelBoxes: { x: number; y: number; w: number; h: number }[] = [];
+			// All barriers first, so each can press against its neighbours ("slime").
+			const states = mods.entries.map((e) => this.stepModule(layer, e, now));
+			const maxRad = states.map((st) => (st ? Math.max(...st.radii) : 0));
+			const slime = s.moduleSeparate;
+			const gapWorld = 3 / Math.max(S, 1e-6);
 			mods.entries.forEach((e, idx) => {
-				const st = this.stepModule(layer, e, now);
+				const st = states[idx];
 				if (!st) return;
+				const neighbours = slime
+					? states.flatMap((o, j) => (o && j !== idx ? [{ x: o.cx, y: o.cy, R: maxRad[j] }] : []))
+					: [];
 				const age = (now - st.born) / 1000;
 
 				// Entrance: "bubble" inflates with a springy overshoot and a wobble that
@@ -629,7 +637,10 @@ export class GraphFx {
 				for (let i = 0; i < MOD_RAYS; i++) {
 					const a = -Math.PI / 2 + (i / MOD_RAYS) * Math.PI * 2;
 					const wob = wobble ? 1 + wobble * (Math.sin(3 * a + t * 1.4 + idx) + 0.6 * Math.sin(5 * a - t * 1.1)) : 1;
-					const rr = st.radii[i] * scale * wob * S;
+					let rw = st.radii[i] * scale * wob;
+					// Where it meets another barrier, flatten against it instead of overlapping.
+					if (neighbours.length) rw = slimeClamp({ x: st.cx, y: st.cy }, maxRad[idx], a, rw, neighbours, gapWorld);
+					const rr = rw * S;
 					if (rr > maxR) maxR = rr;
 					screen[i] = { x: cxs + Math.cos(a) * rr, y: cys + Math.sin(a) * rr };
 				}

@@ -1259,6 +1259,23 @@ function separateCircles(circles, gap, iterations = 300) {
   }
   return circles;
 }
+function slimeClamp(c, R, a, r, neighbours, gap) {
+  const ux = Math.cos(a);
+  const uy = Math.sin(a);
+  let out = r;
+  for (const n of neighbours) {
+    const dx = n.x - c.x;
+    const dy = n.y - c.y;
+    const d2 = dx * dx + dy * dy;
+    const sum = R + n.R;
+    if (d2 >= sum * sum) continue;
+    const ud = ux * dx + uy * dy;
+    if (ud <= 1e-9) continue;
+    const t = (d2 + R * R - n.R * n.R) / (2 * ud) - gap / 2;
+    if (t < out) out = Math.max(0, t);
+  }
+  return out;
+}
 
 // src/graph.ts
 var hexToRgb = (hex) => {
@@ -1309,6 +1326,7 @@ var GraphTree = class {
     this.actions = /* @__PURE__ */ new Map();
     this.messagesSent = 0;
     this.lastApply = { at: 0, note: "\u0435\u0449\u0451 \u043D\u0435 \u0431\u044B\u043B\u043E" };
+    this.slimeFrame = 0;
   }
   get app() {
     return this.plugin.app;
@@ -1888,7 +1906,12 @@ var GraphTree = class {
       release.clear();
       this.holdRelease.set(r, release);
       this.releaseHeld(r);
-      const wallsOn = s.layoutMode !== "button" || this.sorting.has(r);
+      const buttonMode = s.layoutMode === "button";
+      const sorting = this.sorting.has(r);
+      if (++this.slimeFrame % 2 === 0) this.slimeTick(r);
+      const anchors = buttonMode ? this.kept.get(r) : this.sent.get(r);
+      const wallsOn = !buttonMode || sorting || !!anchors?.size;
+      const membersRule = !buttonMode || sorting;
       if (!wallsOn || !s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
         this.releaseResting(r);
         continue;
@@ -1910,8 +1933,10 @@ var GraphTree = class {
         const set = members.get(m.id);
         const nodes = set?.size ? r.nodes.filter((n) => set.has(n.id) && Number.isFinite(n.x)) : [];
         if (!nodes.length) continue;
-        const x = median(nodes.map((n) => n.x));
-        const y = median(nodes.map((n) => n.y));
+        const anchorId = this.moduleAnchors.get(m.id);
+        const ap = anchorId ? anchors?.get(anchorId) : void 0;
+        const x = ap?.x ?? median(nodes.map((n) => n.x));
+        const y = ap?.y ?? median(nodes.map((n) => n.y));
         walls.push({ id: m.id, x, y, R: modules.barrierRadius(nodes.length, nodes.map((n) => Math.hypot(n.x - x, n.y - y))) });
       }
       if (!walls.length) continue;
@@ -1921,7 +1946,7 @@ var GraphTree = class {
       for (const n of r.nodes) {
         if (pinned?.has(n.id) || frozen?.has(n.id) || resting.has(n.id) || !Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
         const own = owner.get(n.id);
-        const home = own ? walls.find((w) => w.id === own) : void 0;
+        const home = own && membersRule ? walls.find((w) => w.id === own) : void 0;
         if (home) {
           const dx = n.x - home.x;
           const dy = n.y - home.y;
@@ -1960,6 +1985,71 @@ var GraphTree = class {
         this.nudgeBudget.set(r, budget - 1);
       }
     }
+  }
+  /**
+   * Modules as soft bodies: when two modules (measured around their anchors
+   * from where their notes really are) overlap, their anchors are pushed apart
+   * a bit each tick — a springy shove rather than a jump. Notes follow their
+   * anchor through their links. Small overlaps (<3 %) are ignored so the graph
+   * can come to rest.
+   */
+  slimeTick(r) {
+    const s = this.plugin.settings;
+    const modules = this.plugin.modules;
+    if (!s.modulesEnabled || !s.moduleSeparate || modules.list.length < 2 || !r.nodes?.length || this.growing.has(r)) return;
+    const buttonMode = s.layoutMode === "button";
+    const anchors = buttonMode ? this.kept.get(r) : this.sent.get(r);
+    if (!anchors?.size) return;
+    const members = modules.members();
+    const pad2 = modules.unit * 0.6 * s.moduleSize;
+    const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
+    const circles = [];
+    for (const [mid, aid] of this.moduleAnchors) {
+      const p = anchors.get(aid);
+      const set = members.get(mid);
+      if (!p || !set) continue;
+      const dists = [];
+      for (const id of set) {
+        const n = nodeById.get(id);
+        if (n && Number.isFinite(n.x) && Number.isFinite(n.y)) dists.push(Math.hypot(n.x - p.x, n.y - p.y));
+      }
+      if (!dists.length) continue;
+      circles.push({ x: p.x, y: p.y, r: modules.barrierRadius(dists.length, dists) + pad2, aid, mid, ox: p.x, oy: p.y });
+    }
+    let overlap = false;
+    for (let i = 0; i < circles.length && !overlap; i++) {
+      for (let j = i + 1; j < circles.length; j++) {
+        const a = circles[i];
+        const b = circles[j];
+        if (Math.hypot(a.x - b.x, a.y - b.y) < (a.r + b.r + s.moduleGap) * 0.97) {
+          overlap = true;
+          break;
+        }
+      }
+    }
+    if (!overlap) return;
+    separateCircles(circles, s.moduleGap, 40);
+    let moved = false;
+    for (const c of circles) {
+      const dx = c.x - c.ox;
+      const dy = c.y - c.oy;
+      if (Math.hypot(dx, dy) < 1) continue;
+      const sx = dx * 0.35;
+      const sy = dy * 0.35;
+      const ids = !buttonMode && s.skillTreeEnabled ? [...members.get(c.mid) ?? []].filter((id) => anchors.has(id)) : [c.aid];
+      for (const id of ids) {
+        const old = anchors.get(id);
+        const p = { x: old.x + sx, y: old.y + sy };
+        this.pin(r, id, p.x, p.y, 0.05);
+        anchors.set(id, p);
+        if (buttonMode) this.sent.get(r)?.set(id, p);
+        if (this.modLayout?.target.has(id)) this.modLayout.target.set(id, p);
+      }
+      const placed = modules.centers.get(c.mid);
+      if (placed) modules.centers.set(c.mid, { ...placed, x: placed.x + sx, y: placed.y + sy });
+      moved = true;
+    }
+    if (moved) this.nudgeBudget.set(r, Math.max(this.nudgeBudget.get(r) ?? 0, 2));
   }
   releaseResting(r) {
     const set = this.resting.get(r);
@@ -2631,9 +2721,14 @@ var GraphFx = class {
       const animate = s.moduleAnimate && s.animations;
       const intro = s.animations ? s.moduleIntro : "none";
       const labelBoxes = [];
+      const states = mods.entries.map((e) => this.stepModule(layer, e, now));
+      const maxRad = states.map((st) => st ? Math.max(...st.radii) : 0);
+      const slime = s.moduleSeparate;
+      const gapWorld = 3 / Math.max(S, 1e-6);
       mods.entries.forEach((e, idx) => {
-        const st = this.stepModule(layer, e, now);
+        const st = states[idx];
         if (!st) return;
+        const neighbours = slime ? states.flatMap((o, j) => o && j !== idx ? [{ x: o.cx, y: o.cy, R: maxRad[j] }] : []) : [];
         const age = (now - st.born) / 1e3;
         const scale = intro === "bubble" ? elasticOut(Math.min(1, age / 1.1)) : 1;
         let wobble = animate ? 0.012 : 0;
@@ -2647,7 +2742,9 @@ var GraphFx = class {
         for (let i = 0; i < MOD_RAYS; i++) {
           const a = -Math.PI / 2 + i / MOD_RAYS * Math.PI * 2;
           const wob = wobble ? 1 + wobble * (Math.sin(3 * a + t * 1.4 + idx) + 0.6 * Math.sin(5 * a - t * 1.1)) : 1;
-          const rr = st.radii[i] * scale * wob * S;
+          let rw = st.radii[i] * scale * wob;
+          if (neighbours.length) rw = slimeClamp({ x: st.cx, y: st.cy }, maxRad[idx], a, rw, neighbours, gapWorld);
+          const rr = rw * S;
           if (rr > maxR) maxR = rr;
           screen[i] = { x: cxs + Math.cos(a) * rr, y: cys + Math.sin(a) * rr };
         }

@@ -759,7 +759,15 @@ export class GraphTree {
 			release.clear();
 			this.holdRelease.set(r, release);
 			this.releaseHeld(r); // permanent pins from older versions
-			const wallsOn = s.layoutMode !== "button" || this.sorting.has(r);
+			const buttonMode = s.layoutMode === "button";
+			const sorting = this.sorting.has(r);
+			// Modules keep pushing each other apart (slime), also after a sort.
+			if (++this.slimeFrame % 2 === 0) this.slimeTick(r);
+			// Walls: always in "always" mode; in "by button" mode during a sort, and
+			// afterwards only for notes of OTHER modules (members float freely).
+			const anchors = buttonMode ? this.kept.get(r) : this.sent.get(r);
+			const wallsOn = !buttonMode || sorting || !!anchors?.size;
+			const membersRule = !buttonMode || sorting;
 			if (!wallsOn || !s.moduleSolid || !s.modulesEnabled || !modules.list.length || !r.nodes?.length) {
 				this.releaseResting(r);
 				continue;
@@ -784,8 +792,11 @@ export class GraphTree {
 				const set = members.get(m.id);
 				const nodes = set?.size ? r.nodes.filter((n) => set.has(n.id) && Number.isFinite(n.x)) : [];
 				if (!nodes.length) continue;
-				const x = median(nodes.map((n) => n.x));
-				const y = median(nodes.map((n) => n.y));
+				// After a sort the module's anchor (its pinned main file) is its centre.
+				const anchorId = this.moduleAnchors.get(m.id);
+				const ap = anchorId ? anchors?.get(anchorId) : undefined;
+				const x = ap?.x ?? median(nodes.map((n) => n.x));
+				const y = ap?.y ?? median(nodes.map((n) => n.y));
 				walls.push({ id: m.id, x, y, R: modules.barrierRadius(nodes.length, nodes.map((n) => Math.hypot(n.x - x, n.y - y))) });
 			}
 			if (!walls.length) continue;
@@ -797,7 +808,7 @@ export class GraphTree {
 				if (pinned?.has(n.id) || frozen?.has(n.id) || resting.has(n.id) || !Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
 				const own = owner.get(n.id);
 				// Own wall first: a member outside its module goes back in.
-				const home = own ? walls.find((w) => w.id === own) : undefined;
+				const home = own && membersRule ? walls.find((w) => w.id === own) : undefined;
 				if (home) {
 					const dx = n.x - home.x;
 					const dy = n.y - home.y;
@@ -838,6 +849,77 @@ export class GraphTree {
 				this.nudgeBudget.set(r, budget - 1);
 			}
 		}
+	}
+
+	private slimeFrame = 0;
+
+	/**
+	 * Modules as soft bodies: when two modules (measured around their anchors
+	 * from where their notes really are) overlap, their anchors are pushed apart
+	 * a bit each tick — a springy shove rather than a jump. Notes follow their
+	 * anchor through their links. Small overlaps (<3 %) are ignored so the graph
+	 * can come to rest.
+	 */
+	private slimeTick(r: GraphRenderer) {
+		const s = this.plugin.settings;
+		const modules = this.plugin.modules;
+		if (!s.modulesEnabled || !s.moduleSeparate || modules.list.length < 2 || !r.nodes?.length || this.growing.has(r)) return;
+		const buttonMode = s.layoutMode === "button";
+		const anchors = buttonMode ? this.kept.get(r) : this.sent.get(r);
+		if (!anchors?.size) return;
+		const members = modules.members();
+		const pad = modules.unit * 0.6 * s.moduleSize;
+		const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
+		const circles: (Circle & { aid: string; mid: string; ox: number; oy: number })[] = [];
+		for (const [mid, aid] of this.moduleAnchors) {
+			const p = anchors.get(aid);
+			const set = members.get(mid);
+			if (!p || !set) continue;
+			const dists: number[] = [];
+			for (const id of set) {
+				const n = nodeById.get(id);
+				if (n && Number.isFinite(n.x) && Number.isFinite(n.y)) dists.push(Math.hypot(n.x - p.x, n.y - p.y));
+			}
+			if (!dists.length) continue;
+			circles.push({ x: p.x, y: p.y, r: modules.barrierRadius(dists.length, dists) + pad, aid, mid, ox: p.x, oy: p.y });
+		}
+		let overlap = false;
+		for (let i = 0; i < circles.length && !overlap; i++) {
+			for (let j = i + 1; j < circles.length; j++) {
+				const a = circles[i];
+				const b = circles[j];
+				if (Math.hypot(a.x - b.x, a.y - b.y) < (a.r + b.r + s.moduleGap) * 0.97) {
+					overlap = true;
+					break;
+				}
+			}
+		}
+		if (!overlap) return;
+		separateCircles(circles, s.moduleGap, 40);
+		let moved = false;
+		for (const c of circles) {
+			const dx = c.x - c.ox;
+			const dy = c.y - c.oy;
+			if (Math.hypot(dx, dy) < 1) continue;
+			// Springy: cover a third of the way each tick. With the skill tree kept
+			// pinned ("always"), the module's whole branch moves, keeping its shape.
+			const sx = dx * 0.35;
+			const sy = dy * 0.35;
+			const ids = !buttonMode && s.skillTreeEnabled ? [...(members.get(c.mid) ?? [])].filter((id) => anchors.has(id)) : [c.aid];
+			for (const id of ids) {
+				const old = anchors.get(id)!;
+				const p = { x: old.x + sx, y: old.y + sy };
+				this.pin(r, id, p.x, p.y, 0.05);
+				anchors.set(id, p);
+				if (buttonMode) this.sent.get(r)?.set(id, p);
+				if (this.modLayout?.target.has(id)) this.modLayout.target.set(id, p);
+			}
+			const placed = modules.centers.get(c.mid);
+			if (placed) modules.centers.set(c.mid, { ...placed, x: placed.x + sx, y: placed.y + sy });
+			moved = true;
+		}
+		// Notes knocked around by the shove get a fresh chance at the walls.
+		if (moved) this.nudgeBudget.set(r, Math.max(this.nudgeBudget.get(r) ?? 0, 2));
 	}
 
 	private releaseResting(r: GraphRenderer) {

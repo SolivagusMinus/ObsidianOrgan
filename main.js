@@ -1301,6 +1301,10 @@ var GraphTree = class {
     this.sent = /* @__PURE__ */ new Map();
     /** Graphs currently being sorted (button mode): pins and walls are active only then. */
     this.sorting = /* @__PURE__ */ new Map();
+    /** Anchors kept pinned after a sort (one per module), so modules don't drift back together. */
+    this.kept = /* @__PURE__ */ new Map();
+    /** Anchor of each module from the last layout (module id → node id). */
+    this.moduleAnchors = /* @__PURE__ */ new Map();
     /** "Sort graph" buttons added to graph view headers. */
     this.actions = /* @__PURE__ */ new Map();
     this.messagesSent = 0;
@@ -1355,6 +1359,7 @@ var GraphTree = class {
     this.depthCache = null;
     this.posCache = null;
     this.modLayout = null;
+    this.kept.clear();
     this.scan();
     for (const r of this.originals.keys()) this.schedule(r);
   }
@@ -1464,7 +1469,7 @@ var GraphTree = class {
     const buttonMode = s.layoutMode === "button";
     const active = !buttonMode || this.sorting.has(r);
     const base = active && s.skillTreeEnabled ? this.positions() : /* @__PURE__ */ new Map();
-    const target = active ? this.withModules(r, base) : base;
+    const target = active ? this.withModules(r, base) : new Map(this.kept.get(r) ?? []);
     const reduced = this.plugin.motionReduced();
     if (!buttonMode && target.size && !this.grown.has(r) && s.graphGrow && s.animations && !reduced) {
       this.grown.add(r);
@@ -1673,10 +1678,23 @@ var GraphTree = class {
       window.cancelAnimationFrame(this.growing.get(r));
       this.growing.delete(r);
     }
+    const keep = /* @__PURE__ */ new Map();
+    if (this.plugin.settings.afterSort === "anchors") {
+      const sent = this.sent.get(r) ?? /* @__PURE__ */ new Map();
+      const ids = new Set(this.moduleAnchors.values());
+      if (!ids.size && this.plugin.settings.skillTreeEnabled) {
+        for (const [id, d] of this.hubDepths()) if (d === 1) ids.add(id);
+      }
+      for (const id of ids) {
+        const p = sent.get(id);
+        if (p) keep.set(id, p);
+      }
+    }
     const pinned = this.pinned.get(r) ?? /* @__PURE__ */ new Set();
-    for (const id of pinned) this.unpin(r, id);
-    this.pinned.set(r, /* @__PURE__ */ new Set());
-    this.sent.delete(r);
+    for (const id of pinned) if (!keep.has(id)) this.unpin(r, id);
+    this.pinned.set(r, new Set(keep.keys()));
+    this.kept.set(r, keep);
+    this.sent.set(r, new Map(keep));
     this.releaseResting(r);
     const release = this.holdRelease.get(r);
     if (release) {
@@ -1690,7 +1708,9 @@ var GraphTree = class {
       r.changed?.();
     } catch {
     }
-    new import_obsidian5.Notice("ObsOrg: \u0433\u0440\u0430\u0444 \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0435\u043D \u2014 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0441\u043D\u043E\u0432\u0430 \u0441\u0432\u043E\u0431\u043E\u0434\u043D\u044B.");
+    new import_obsidian5.Notice(
+      keep.size ? `ObsOrg: \u0433\u0440\u0430\u0444 \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0435\u043D \u2014 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0441\u0432\u043E\u0431\u043E\u0434\u043D\u044B, \u043D\u0430 \u043C\u0435\u0441\u0442\u0435 \u0434\u0435\u0440\u0436\u0430\u0442\u0441\u044F \u0442\u043E\u043B\u044C\u043A\u043E ${keep.size} \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u043C\u043E\u0434\u0443\u043B\u0435\u0439.` : "ObsOrg: \u0433\u0440\u0430\u0444 \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0435\u043D \u2014 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0441\u043D\u043E\u0432\u0430 \u0441\u0432\u043E\u0431\u043E\u0434\u043D\u044B."
+    );
   }
   // ------------------------------------------------------------- layout
   /** Folder tree of index notes; folders without an index are skipped through. */
@@ -1824,9 +1844,11 @@ var GraphTree = class {
     separateCircles(circles, s.moduleGap);
     const target = new Map(base);
     const alive = /* @__PURE__ */ new Set();
+    this.moduleAnchors.clear();
     for (const c of circles) {
       const { info } = c;
       alive.add(info.id);
+      this.moduleAnchors.set(info.id, info.anchor);
       modules.centers.set(info.id, { x: c.x, y: c.y, hold: c.r - pad2 });
       if (info.baseC) {
         const dx = c.x - info.baseC.x;
@@ -2465,7 +2487,9 @@ var GraphFx = class {
       const aroundNotes = () => {
         cx = [...pts.map((p) => p.x)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
         cy = [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
-        R = modules.barrierRadius(pts.length, pts.map((p) => Math.hypot(p.x - cx, p.y - cy)));
+        const dists = pts.map((p) => Math.hypot(p.x - cx, p.y - cy));
+        R = modules.barrierRadius(pts.length, dists);
+        if (pts.length < 6) R = Math.max(R, ...dists);
       };
       if (placed?.hold) {
         cx = placed.x;
@@ -3164,6 +3188,7 @@ var DEFAULT_SETTINGS = {
   dailyFormat: "",
   dailyTemplate: "",
   layoutMode: "button",
+  afterSort: "anchors",
   skillTreeEnabled: true,
   skillTreeStyle: "radial",
   skillTreeStep: 300,
@@ -3463,8 +3488,19 @@ var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
       (d) => d.addOptions({ button: "\u041F\u043E \u043A\u043D\u043E\u043F\u043A\u0435 \u2014 \u0440\u0430\u0441\u0441\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0438 \u043E\u0442\u043F\u0443\u0441\u0442\u0438\u0442\u044C", always: "\u0412\u0441\u0435\u0433\u0434\u0430 \u0434\u0435\u0440\u0436\u0430\u0442\u044C \u043F\u043E\u0440\u044F\u0434\u043E\u043A" }).setValue(s.layoutMode).onChange(async (v) => {
         s.layoutMode = v;
         await save();
+        this.display();
       })
     );
+    if (s.layoutMode === "button") {
+      new import_obsidian8.Setting(containerEl).setName("\u041F\u043E\u0441\u043B\u0435 \u0441\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u043A\u0438").setDesc(
+        "\u0424\u0438\u0437\u0438\u043A\u0430 Obsidian \u0442\u044F\u043D\u0435\u0442 \u0432\u0441\u0451 \u043A \u0446\u0435\u043D\u0442\u0440\u0443, \u043F\u043E\u044D\u0442\u043E\u043C\u0443 \u043F\u043E\u043B\u043D\u043E\u0441\u0442\u044C\u044E \u043E\u0442\u043F\u0443\u0449\u0435\u043D\u043D\u044B\u0435 \u043C\u043E\u0434\u0443\u043B\u0438 \u0447\u0435\u0440\u0435\u0437 \u043F\u0430\u0440\u0443 \u0441\u0435\u043A\u0443\u043D\u0434 \u0441\u043D\u043E\u0432\u0430 \u0441\u0431\u0438\u0432\u0430\u044E\u0442\u0441\u044F \u0432 \u043A\u0443\u0447\u0443. \xAB\u0414\u0435\u0440\u0436\u0430\u0442\u044C \u044F\u043A\u043E\u0440\u044F\xBB: \u043D\u0430 \u043C\u0435\u0441\u0442\u0435 \u043E\u0441\u0442\u0430\u0451\u0442\u0441\u044F \u0442\u043E\u043B\u044C\u043A\u043E \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043A\u0430\u0436\u0434\u043E\u0433\u043E \u043C\u043E\u0434\u0443\u043B\u044F, \u043E\u0441\u0442\u0430\u043B\u044C\u043D\u044B\u0435 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u043F\u043B\u0430\u0432\u0430\u044E\u0442 \u0432\u043E\u043A\u0440\u0443\u0433 \u043D\u0435\u0433\u043E."
+      ).addDropdown(
+        (d) => d.addOptions({ anchors: "\u0414\u0435\u0440\u0436\u0430\u0442\u044C \u044F\u043A\u043E\u0440\u044F \u043C\u043E\u0434\u0443\u043B\u0435\u0439, \u043E\u0441\u0442\u0430\u043B\u044C\u043D\u043E\u0435 \u043E\u0442\u043F\u0443\u0441\u0442\u0438\u0442\u044C", all: "\u041E\u0442\u043F\u0443\u0441\u0442\u0438\u0442\u044C \u0432\u0441\u0451" }).setValue(s.afterSort).onChange(async (v) => {
+          s.afterSort = v;
+          await save();
+        })
+      );
+    }
     new import_obsidian8.Setting(containerEl).setName("\u0420\u0430\u0441\u043A\u043B\u0430\u0434\u044B\u0432\u0430\u0442\u044C \u0433\u0440\u0430\u0444 \u0432\u0435\u0442\u043A\u0430\u043C\u0438").addToggle(
       (t) => t.setValue(s.skillTreeEnabled).onChange(async (v) => {
         s.skillTreeEnabled = v;

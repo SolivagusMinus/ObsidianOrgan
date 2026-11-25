@@ -86,6 +86,10 @@ export class GraphTree {
 	private sent = new Map<GraphRenderer, Map<string, Point>>();
 	/** Graphs currently being sorted (button mode): pins and walls are active only then. */
 	private sorting = new Map<GraphRenderer, number>();
+	/** Anchors kept pinned after a sort (one per module), so modules don't drift back together. */
+	private kept = new Map<GraphRenderer, Map<string, Point>>();
+	/** Anchor of each module from the last layout (module id → node id). */
+	private moduleAnchors = new Map<string, string>();
 	/** "Sort graph" buttons added to graph view headers. */
 	private actions = new Map<GraphRenderer, HTMLElement>();
 
@@ -146,6 +150,8 @@ export class GraphTree {
 		this.depthCache = null;
 		this.posCache = null;
 		this.modLayout = null;
+		// Settings or modules changed: anchors from the last sort may be stale.
+		this.kept.clear();
 		this.scan();
 		for (const r of this.originals.keys()) this.schedule(r);
 	}
@@ -273,7 +279,7 @@ export class GraphTree {
 		const buttonMode = s.layoutMode === "button";
 		const active = !buttonMode || this.sorting.has(r);
 		const base = active && s.skillTreeEnabled ? this.positions() : new Map<string, Point>();
-		const target = active ? this.withModules(r, base) : base;
+		const target = active ? this.withModules(r, base) : new Map(this.kept.get(r) ?? []);
 
 		// First time this graph shows the tree: let it grow out of the centre.
 		const reduced = this.plugin.motionReduced();
@@ -507,10 +513,26 @@ export class GraphTree {
 			window.cancelAnimationFrame(this.growing.get(r)!);
 			this.growing.delete(r);
 		}
+		// Keep one anchor per module (its main file) so the physics can't pull the
+		// modules back into one heap; everything else floats. Without modules, the
+		// skill tree's top-level branch hubs keep the branches in their directions.
+		const keep = new Map<string, Point>();
+		if (this.plugin.settings.afterSort === "anchors") {
+			const sent = this.sent.get(r) ?? new Map<string, Point>();
+			const ids = new Set<string>(this.moduleAnchors.values());
+			if (!ids.size && this.plugin.settings.skillTreeEnabled) {
+				for (const [id, d] of this.hubDepths()) if (d === 1) ids.add(id);
+			}
+			for (const id of ids) {
+				const p = sent.get(id);
+				if (p) keep.set(id, p);
+			}
+		}
 		const pinned = this.pinned.get(r) ?? new Set<string>();
-		for (const id of pinned) this.unpin(r, id);
-		this.pinned.set(r, new Set());
-		this.sent.delete(r);
+		for (const id of pinned) if (!keep.has(id)) this.unpin(r, id);
+		this.pinned.set(r, new Set(keep.keys()));
+		this.kept.set(r, keep);
+		this.sent.set(r, new Map(keep));
 		this.releaseResting(r);
 		const release = this.holdRelease.get(r);
 		if (release) {
@@ -526,7 +548,11 @@ export class GraphTree {
 		} catch {
 			/* ignore */
 		}
-		new Notice("ObsOrg: граф упорядочен — заметки снова свободны.");
+		new Notice(
+			keep.size
+				? `ObsOrg: граф упорядочен — заметки свободны, на месте держатся только ${keep.size} главных файлов модулей.`
+				: "ObsOrg: граф упорядочен — заметки снова свободны.",
+		);
 	}
 
 	// ------------------------------------------------------------- layout
@@ -687,9 +713,11 @@ export class GraphTree {
 		// to the index note and keeps floating freely.
 		const target = new Map(base);
 		const alive = new Set<string>();
+		this.moduleAnchors.clear();
 		for (const c of circles) {
 			const { info } = c;
 			alive.add(info.id);
+			this.moduleAnchors.set(info.id, info.anchor);
 			modules.centers.set(info.id, { x: c.x, y: c.y, hold: c.r - pad });
 			if (info.baseC) {
 				const dx = c.x - info.baseC.x;

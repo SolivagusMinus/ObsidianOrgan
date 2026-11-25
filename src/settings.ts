@@ -52,6 +52,8 @@ export interface FolderHubSettings {
 	// Graph: skill tree
 	/** "button": sort on demand, then release; "always": keep the layout pinned. */
 	layoutMode: "button" | "always";
+	/** After a sort: keep one anchor per module pinned, or release everything. */
+	afterSort: "anchors" | "all";
 	skillTreeEnabled: boolean;
 	skillTreeStyle: TreeStyle;
 	skillTreeStep: number;
@@ -150,6 +152,7 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	dailyTemplate: "",
 
 	layoutMode: "button",
+	afterSort: "anchors",
 	skillTreeEnabled: true,
 	skillTreeStyle: "radial",
 	skillTreeStep: 300,
@@ -624,8 +627,27 @@ export class FolderHubSettingTab extends PluginSettingTab {
 					.onChange(async (v) => {
 						s.layoutMode = v as FolderHubSettings["layoutMode"];
 						await save();
+						this.display();
 					}),
 			);
+
+		if (s.layoutMode === "button") {
+			new Setting(containerEl)
+				.setName("После сортировки")
+				.setDesc(
+					"Физика Obsidian тянет всё к центру, поэтому полностью отпущенные модули через пару секунд снова сбиваются в кучу. " +
+						"«Держать якоря»: на месте остаётся только главный файл каждого модуля, остальные заметки плавают вокруг него.",
+				)
+				.addDropdown((d) =>
+					d
+						.addOptions({ anchors: "Держать якоря модулей, остальное отпустить", all: "Отпустить всё" })
+						.setValue(s.afterSort)
+						.onChange(async (v) => {
+							s.afterSort = v as FolderHubSettings["afterSort"];
+							await save();
+						}),
+				);
+		}
 
 		new Setting(containerEl)
 			.setName("Раскладывать граф ветками")

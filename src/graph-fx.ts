@@ -435,7 +435,11 @@ export class GraphFx {
 			const aroundNotes = () => {
 				cx = [...pts.map((p) => p.x)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
 				cy = [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
-				R = modules.barrierRadius(pts.length, pts.map((p) => Math.hypot(p.x - cx, p.y - cy)));
+				const dists = pts.map((p) => Math.hypot(p.x - cx, p.y - cy));
+				R = modules.barrierRadius(pts.length, dists);
+				// A small module wraps all its notes, its main file included, even when
+				// links stretch it out — otherwise its own anchor ends up outside.
+				if (pts.length < 6) R = Math.max(R, ...dists);
 			};
 			if (placed?.hold) {
 				// Same centre and radius the layout reserved for this module…

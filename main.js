@@ -1327,6 +1327,13 @@ var GraphTree = class {
     this.messagesSent = 0;
     this.lastApply = { at: 0, note: "\u0435\u0449\u0451 \u043D\u0435 \u0431\u044B\u043B\u043E" };
     this.slimeFrame = 0;
+    /** When each note was last corrected by a wall (to calm notes that keep hitting it). */
+    this.wallHits = /* @__PURE__ */ new Map();
+    /** Smoothed module sizes for collisions, so jittering notes don't shake the modules. */
+    this.slimeRadius = /* @__PURE__ */ new Map();
+    this.lastSlimePush = 0;
+    /** Pushes left in this episode; refilled when the layout changes. */
+    this.slimeBudget = 12;
   }
   get app() {
     return this.plugin.app;
@@ -1517,6 +1524,7 @@ var GraphTree = class {
       this.lastNodeCount.set(r, r.nodes.length);
       this.releaseResting(r);
       this.nudgeBudget.set(r, 4);
+      this.slimeBudget = 12;
     }
     if (moved && last.size && s.animations && !reduced) {
       this.animatePins(r, last, target, now);
@@ -1674,6 +1682,8 @@ var GraphTree = class {
     this.pinned.set(r, ids);
     this.releaseResting(r);
     this.nudgeBudget.set(r, 4);
+    this.slimeBudget = 12;
+    this.wallHits.clear();
     this.lastNodeCount.set(r, r.nodes.length);
     if (s.animations && !this.plugin.motionReduced()) {
       this.animatePins(r, from, target, ids);
@@ -1778,6 +1788,17 @@ var GraphTree = class {
   positions() {
     if (!this.posCache) this.posCache = layoutSkillTree(this.buildTree(), this.layoutOptions());
     return this.posCache;
+  }
+  /** Where a module's anchor (its pinned main file) currently is, if it has one. */
+  anchorPosition(moduleId) {
+    const aid = this.moduleAnchors.get(moduleId);
+    if (!aid) return void 0;
+    const buttonMode = this.plugin.settings.layoutMode === "button";
+    for (const r of this.originals.keys()) {
+      const p = (buttonMode ? this.kept.get(r) : this.sent.get(r))?.get(aid);
+      if (p) return p;
+    }
+    return void 0;
   }
   /** Report for the diagnostics command: is the layout connected to the graph engine? */
   diagnose() {
@@ -1957,7 +1978,7 @@ var GraphTree = class {
           const dx = n.x - home.x;
           const dy = n.y - home.y;
           const d = Math.hypot(dx, dy) || 1e-3;
-          if (d > home.R) {
+          if (d > home.R * 1.05) {
             const k = home.R * (orphan ? 0.55 : 0.96) / d;
             fixes.push({ id: n.id, x: home.x + dx * k, y: home.y + dy * k, depth: d - home.R });
             continue;
@@ -1969,7 +1990,7 @@ var GraphTree = class {
           const dx = n.x - w.x;
           const dy = n.y - w.y;
           const d = Math.hypot(dx, dy) || 1e-3;
-          if (d < w.R + pad2) {
+          if (d < (w.R + pad2) * 0.95) {
             const k = (w.R + pad2 + 10) / d;
             fixes.push({ id: n.id, x: w.x + dx * k, y: w.y + dy * k, depth: w.R + pad2 - d });
             break;
@@ -1983,8 +2004,12 @@ var GraphTree = class {
       const nudge = !settle && now - (this.lastNudge.get(r) ?? 0) > 1500;
       const wake = nudge ? 0.04 : settle ? 0.02 : 0;
       for (const f of fixes.slice(0, 80)) {
-        this.pin(r, f.id, f.x, f.y, wake);
-        if (settle) resting.add(f.id);
+        const hits = (this.wallHits.get(f.id) ?? []).filter((t) => now - t < 8e3);
+        hits.push(now);
+        this.wallHits.set(f.id, hits);
+        const rest = settle || hits.length >= 3;
+        this.pin(r, f.id, f.x, f.y, rest ? Math.max(wake, 0.02) : wake);
+        if (rest) resting.add(f.id);
         else release.add(f.id);
       }
       if (nudge) {
@@ -2021,14 +2046,20 @@ var GraphTree = class {
         if (n && Number.isFinite(n.x) && Number.isFinite(n.y)) dists.push(Math.hypot(n.x - p.x, n.y - p.y));
       }
       if (!dists.length) continue;
-      circles.push({ x: p.x, y: p.y, r: modules.barrierRadius(dists.length, dists) + pad2, aid, mid, ox: p.x, oy: p.y });
+      const raw = modules.barrierRadius(dists.length, dists) + pad2;
+      const prev = this.slimeRadius.get(mid);
+      const rad2 = prev === void 0 ? raw : prev + (raw - prev) * 0.2;
+      this.slimeRadius.set(mid, rad2);
+      circles.push({ x: p.x, y: p.y, r: rad2, aid, mid, ox: p.x, oy: p.y });
     }
+    const now = performance.now();
+    if (now - this.lastSlimePush < 1200 || this.slimeBudget <= 0) return;
     let overlap = false;
     for (let i = 0; i < circles.length && !overlap; i++) {
       for (let j = i + 1; j < circles.length; j++) {
         const a = circles[i];
         const b = circles[j];
-        if (Math.hypot(a.x - b.x, a.y - b.y) < (a.r + b.r + s.moduleGap) * 0.97) {
+        if (Math.hypot(a.x - b.x, a.y - b.y) < (a.r + b.r + s.moduleGap) * 0.92) {
           overlap = true;
           break;
         }
@@ -2056,7 +2087,11 @@ var GraphTree = class {
       if (placed) modules.centers.set(c.mid, { ...placed, x: placed.x + sx, y: placed.y + sy });
       moved = true;
     }
-    if (moved) this.nudgeBudget.set(r, Math.max(this.nudgeBudget.get(r) ?? 0, 2));
+    if (moved) {
+      this.lastSlimePush = now;
+      this.slimeBudget--;
+      this.nudgeBudget.set(r, Math.max(this.nudgeBudget.get(r) ?? 0, 2));
+    }
   }
   releaseResting(r) {
     const set = this.resting.get(r);
@@ -2582,8 +2617,9 @@ var GraphFx = class {
       let cy = 0;
       let R = 0;
       const aroundNotes = () => {
-        cx = [...pts.map((p) => p.x)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
-        cy = [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
+        const anchor = this.plugin.graphTree.anchorPosition(e.def.id);
+        cx = anchor?.x ?? [...pts.map((p) => p.x)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
+        cy = anchor?.y ?? [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
         const dists = pts.map((p) => Math.hypot(p.x - cx, p.y - cy));
         R = modules.barrierRadius(pts.length, dists);
         if (pts.length < 6) R = Math.max(R, ...dists);
@@ -2614,7 +2650,7 @@ var GraphFx = class {
           st = { cx: c.x, cy: c.y, radii: target, born: now, last: now };
           layer.modState.set(e.def.id, st);
         } else {
-          const k = 1 - Math.pow(0.8, Math.min(4, (now - st.last) / 16.7));
+          const k = 1 - Math.exp(-Math.min(100, now - st.last) / 450);
           st.cx += (c.x - st.cx) * k;
           st.cy += (c.y - st.cy) * k;
           for (let i = 0; i < MOD_RAYS; i++) st.radii[i] += (target[i] - st.radii[i]) * k;

@@ -433,8 +433,11 @@ export class GraphFx {
 			let cy = 0;
 			let R = 0;
 			const aroundNotes = () => {
-				cx = [...pts.map((p) => p.x)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
-				cy = [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
+				// Centre on the module's pinned main file when it has one: it doesn't
+				// jitter, so neither does the barrier.
+				const anchor = this.plugin.graphTree.anchorPosition(e.def.id);
+				cx = anchor?.x ?? [...pts.map((p) => p.x)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
+				cy = anchor?.y ?? [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
 				const dists = pts.map((p) => Math.hypot(p.x - cx, p.y - cy));
 				R = modules.barrierRadius(pts.length, dists);
 				// A small module wraps all its notes, its main file included, even when
@@ -474,7 +477,8 @@ export class GraphFx {
 					layer.modState.set(e.def.id, st);
 				} else {
 					// Frame-rate independent smoothing (~150 ms to settle).
-					const k = 1 - Math.pow(0.8, Math.min(4, (now - st.last) / 16.7));
+					// Smooth, ~0.5 s: the barrier glides after its notes and ignores their jitter.
+					const k = 1 - Math.exp(-Math.min(100, now - st.last) / 450);
 					st.cx += (c.x - st.cx) * k;
 					st.cy += (c.y - st.cy) * k;
 					for (let i = 0; i < MOD_RAYS; i++) st.radii[i] += (target[i] - st.radii[i]) * k;

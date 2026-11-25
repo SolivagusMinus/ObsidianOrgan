@@ -318,6 +318,7 @@ export class GraphTree {
 			this.lastNodeCount.set(r, r.nodes.length);
 			this.releaseResting(r);
 			this.nudgeBudget.set(r, 4);
+			this.slimeBudget = 12;
 		}
 		// Modules bumping into each other: glide to the new places with a little
 		// springy overshoot instead of teleporting.
@@ -489,6 +490,8 @@ export class GraphTree {
 		this.pinned.set(r, ids);
 		this.releaseResting(r);
 		this.nudgeBudget.set(r, 4);
+		this.slimeBudget = 12;
+		this.wallHits.clear();
 		this.lastNodeCount.set(r, r.nodes.length);
 		if (s.animations && !this.plugin.motionReduced()) {
 			this.animatePins(r, from, target, ids);
@@ -612,6 +615,18 @@ export class GraphTree {
 	positions(): Map<string, Point> {
 		if (!this.posCache) this.posCache = layoutSkillTree(this.buildTree(), this.layoutOptions());
 		return this.posCache;
+	}
+
+	/** Where a module's anchor (its pinned main file) currently is, if it has one. */
+	anchorPosition(moduleId: string): Point | undefined {
+		const aid = this.moduleAnchors.get(moduleId);
+		if (!aid) return undefined;
+		const buttonMode = this.plugin.settings.layoutMode === "button";
+		for (const r of this.originals.keys()) {
+			const p = (buttonMode ? this.kept.get(r) : this.sent.get(r))?.get(aid);
+			if (p) return p;
+		}
+		return undefined;
 	}
 
 	/** Report for the diagnostics command: is the layout connected to the graph engine? */
@@ -824,7 +839,9 @@ export class GraphTree {
 					const dx = n.x - home.x;
 					const dy = n.y - home.y;
 					const d = Math.hypot(dx, dy) || 0.001;
-					if (d > home.R) {
+					// Hysteresis: only clearly outside (5 %), so a note held right at the
+					// edge by an outside force (e.g. a magnet) isn't corrected every tick.
+					if (d > home.R * 1.05) {
 						// Unlinked notes go well inside (not onto the wall they'd keep hitting).
 						const k = (home.R * (orphan ? 0.55 : 0.96)) / d;
 						fixes.push({ id: n.id, x: home.x + dx * k, y: home.y + dy * k, depth: d - home.R });
@@ -838,7 +855,7 @@ export class GraphTree {
 					const dx = n.x - w.x;
 					const dy = n.y - w.y;
 					const d = Math.hypot(dx, dy) || 0.001;
-					if (d < w.R + pad) {
+					if (d < (w.R + pad) * 0.95) {
 						const k = (w.R + pad + 10) / d;
 						fixes.push({ id: n.id, x: w.x + dx * k, y: w.y + dy * k, depth: w.R + pad - d });
 						break;
@@ -853,8 +870,15 @@ export class GraphTree {
 			// The wake-up rides in the same messages: a resting graph applies the fixes too.
 			const wake = nudge ? 0.04 : settle ? 0.02 : 0;
 			for (const f of fixes.slice(0, 80)) {
-				this.pin(r, f.id, f.x, f.y, wake);
-				if (settle) resting.add(f.id);
+				// A note corrected again and again in a short time is being pulled by
+				// something (links, a magnet force): let it rest at the wall now instead
+				// of yanking it back and forth.
+				const hits = (this.wallHits.get(f.id) ?? []).filter((t) => now - t < 8000);
+				hits.push(now);
+				this.wallHits.set(f.id, hits);
+				const rest = settle || hits.length >= 3;
+				this.pin(r, f.id, f.x, f.y, rest ? Math.max(wake, 0.02) : wake);
+				if (rest) resting.add(f.id);
 				else release.add(f.id);
 			}
 			if (nudge) {
@@ -865,6 +889,13 @@ export class GraphTree {
 	}
 
 	private slimeFrame = 0;
+	/** When each note was last corrected by a wall (to calm notes that keep hitting it). */
+	private wallHits = new Map<string, number[]>();
+	/** Smoothed module sizes for collisions, so jittering notes don't shake the modules. */
+	private slimeRadius = new Map<string, number>();
+	private lastSlimePush = 0;
+	/** Pushes left in this episode; refilled when the layout changes. */
+	private slimeBudget = 12;
 
 	/**
 	 * Modules as soft bodies: when two modules (measured around their anchors
@@ -894,14 +925,22 @@ export class GraphTree {
 				if (n && Number.isFinite(n.x) && Number.isFinite(n.y)) dists.push(Math.hypot(n.x - p.x, n.y - p.y));
 			}
 			if (!dists.length) continue;
-			circles.push({ x: p.x, y: p.y, r: modules.barrierRadius(dists.length, dists) + pad, aid, mid, ox: p.x, oy: p.y });
+			const raw = modules.barrierRadius(dists.length, dists) + pad;
+			const prev = this.slimeRadius.get(mid);
+			const rad = prev === undefined ? raw : prev + (raw - prev) * 0.2;
+			this.slimeRadius.set(mid, rad);
+			circles.push({ x: p.x, y: p.y, r: rad, aid, mid, ox: p.x, oy: p.y });
 		}
+		// Calm: a push at most every 1.2 s, and give up after a dozen in a row
+		// (something keeps pulling the modules together) until the layout changes.
+		const now = performance.now();
+		if (now - this.lastSlimePush < 1200 || this.slimeBudget <= 0) return;
 		let overlap = false;
 		for (let i = 0; i < circles.length && !overlap; i++) {
 			for (let j = i + 1; j < circles.length; j++) {
 				const a = circles[i];
 				const b = circles[j];
-				if (Math.hypot(a.x - b.x, a.y - b.y) < (a.r + b.r + s.moduleGap) * 0.97) {
+				if (Math.hypot(a.x - b.x, a.y - b.y) < (a.r + b.r + s.moduleGap) * 0.92) {
 					overlap = true;
 					break;
 				}
@@ -931,8 +970,12 @@ export class GraphTree {
 			if (placed) modules.centers.set(c.mid, { ...placed, x: placed.x + sx, y: placed.y + sy });
 			moved = true;
 		}
-		// Notes knocked around by the shove get a fresh chance at the walls.
-		if (moved) this.nudgeBudget.set(r, Math.max(this.nudgeBudget.get(r) ?? 0, 2));
+		if (moved) {
+			this.lastSlimePush = now;
+			this.slimeBudget--;
+			// Notes knocked around by the shove get a fresh chance at the walls.
+			this.nudgeBudget.set(r, Math.max(this.nudgeBudget.get(r) ?? 0, 2));
+		}
 	}
 
 	private releaseResting(r: GraphRenderer) {

@@ -45,6 +45,8 @@ interface FxRenderer {
 	scale?: number;
 	containerEl?: HTMLElement;
 	px?: { screen?: { width: number } };
+	/** PIXI container holding every node sprite; panned and zoomed as a whole. */
+	hanger?: { worldTransform?: { a: number; d: number; tx: number; ty: number } };
 }
 
 /** Per-graph cached lists, rebuilt only when the graph data changes. */
@@ -440,9 +442,9 @@ export class GraphFx {
 				cy = anchor?.y ?? [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
 				const dists = pts.map((p) => Math.hypot(p.x - cx, p.y - cy));
 				R = modules.barrierRadius(pts.length, dists);
-				// A small module wraps all its notes, its main file included, even when
-				// links stretch it out — otherwise its own anchor ends up outside.
-				if (pts.length < 6) R = Math.max(R, ...dists);
+				// (Small modules are not stretched to far-away notes any more: their
+				// notes are held inside instead.)
+				void dists;
 			};
 			if (placed?.hold) {
 				// Same centre and radius the layout reserved for this module…
@@ -495,6 +497,15 @@ export class GraphFx {
 	 * calls), checked against a second node; falls back to pan/scale.
 	 */
 	private mapping(r: FxRenderer, nodes: FxNode[], ratio: number) {
+		// Best source: the container all nodes are drawn in. Its transform is
+		// updated on every pan and zoom, unlike the sprites of off-screen nodes,
+		// which can keep stale (but mutually consistent) positions — that made the
+		// effects stay at the old zoom while the nodes zoomed.
+		const ht = r.hanger?.worldTransform;
+		if (ht && Number.isFinite(ht.a) && ht.a > 0 && Number.isFinite(ht.tx) && Number.isFinite(ht.ty)) {
+			this.lastMapping = "по контейнеру графа";
+			return { S: ht.a * ratio, ox: ht.tx * ratio, oy: ht.ty * ratio };
+		}
 		let S = r.scale ?? 1;
 		let ox = r.panX ?? 0;
 		let oy = r.panY ?? 0;

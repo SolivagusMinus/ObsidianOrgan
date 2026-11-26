@@ -707,7 +707,13 @@ export class GraphTree {
 				}) ?? ids[0];
 			const pinnedIds = ids.filter((id) => base.has(id));
 			const baseC = pinnedIds.length ? centroid(pinnedIds.map((id) => base.get(id)!)) : null;
-			const c0 = baseC ?? pos(anchor);
+			// Start from where the module's notes actually are (their median), not
+			// from wherever its main file happens to sit: the module then lands where
+			// its notes are drawn anyway and is only shifted enough to clear others.
+			const c0 = baseC ?? {
+				x: ids.map((id) => pos(id).x).sort((a, b) => a - b)[ids.length >> 1],
+				y: ids.map((id) => pos(id).y).sort((a, b) => a - b)[ids.length >> 1],
+			};
 			const dists = ids.map((id) => Math.hypot(pos(id).x - c0.x, pos(id).y - c0.y));
 			let extent = modules.barrierRadius(ids.length, dists);
 			// A skill-tree branch is pinned: the barrier must hold all of it.
@@ -798,6 +804,12 @@ export class GraphTree {
 			const members = modules.members();
 			const owner = new Map<string, string>();
 			for (const [id, set] of members) for (const path of set) owner.set(path, id);
+			// Members present in this graph, per module.
+			const memberCount = new Map<string, number>();
+			for (const n of r.nodes) {
+				const o = owner.get(n.id);
+				if (o) memberCount.set(o, (memberCount.get(o) ?? 0) + 1);
+			}
 			const pad = this.plugin.modules.unit * 0.6 * s.moduleSize;
 
 			// Each module's barrier: the reserved place, or (without separation) around its notes.
@@ -834,7 +846,10 @@ export class GraphTree {
 				const own = owner.get(n.id);
 				// Own wall first: a member outside its module goes back in.
 				const orphan = !linked.has(n.id);
-				const home = own && (membersRule || orphan) ? walls.find((w) => w.id === own) : undefined;
+				// Small modules (a few notes) keep all their notes with them; otherwise
+				// links to other modules drag them across the graph.
+				const small = own ? (memberCount.get(own) ?? 0) < 6 : false;
+				const home = own && (membersRule || orphan || small) ? walls.find((w) => w.id === own) : undefined;
 				if (home) {
 					const dx = n.x - home.x;
 					const dy = n.y - home.y;

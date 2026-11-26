@@ -1868,7 +1868,10 @@ var GraphTree = class {
       }) ?? ids[0];
       const pinnedIds = ids.filter((id) => base.has(id));
       const baseC = pinnedIds.length ? centroid(pinnedIds.map((id) => base.get(id))) : null;
-      const c0 = baseC ?? pos(anchor);
+      const c0 = baseC ?? {
+        x: ids.map((id) => pos(id).x).sort((a, b) => a - b)[ids.length >> 1],
+        y: ids.map((id) => pos(id).y).sort((a, b) => a - b)[ids.length >> 1]
+      };
       const dists = ids.map((id) => Math.hypot(pos(id).x - c0.x, pos(id).y - c0.y));
       let extent = modules.barrierRadius(ids.length, dists);
       if (baseC) for (const id of pinnedIds) extent = Math.max(extent, Math.hypot(base.get(id).x - baseC.x, base.get(id).y - baseC.y) + 30);
@@ -1943,6 +1946,11 @@ var GraphTree = class {
       const members = modules.members();
       const owner = /* @__PURE__ */ new Map();
       for (const [id, set] of members) for (const path of set) owner.set(path, id);
+      const memberCount = /* @__PURE__ */ new Map();
+      for (const n of r.nodes) {
+        const o = owner.get(n.id);
+        if (o) memberCount.set(o, (memberCount.get(o) ?? 0) + 1);
+      }
       const pad2 = this.plugin.modules.unit * 0.6 * s.moduleSize;
       const walls = [];
       for (const m of modules.list) {
@@ -1973,7 +1981,8 @@ var GraphTree = class {
         if (pinned?.has(n.id) || frozen?.has(n.id) || resting.has(n.id) || !Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
         const own = owner.get(n.id);
         const orphan = !linked.has(n.id);
-        const home = own && (membersRule || orphan) ? walls.find((w) => w.id === own) : void 0;
+        const small = own ? (memberCount.get(own) ?? 0) < 6 : false;
+        const home = own && (membersRule || orphan || small) ? walls.find((w) => w.id === own) : void 0;
         if (home) {
           const dx = n.x - home.x;
           const dy = n.y - home.y;
@@ -2622,7 +2631,7 @@ var GraphFx = class {
         cy = anchor?.y ?? [...pts.map((p) => p.y)].sort((a, b) => a - b)[pts.length >> 1] ?? 0;
         const dists = pts.map((p) => Math.hypot(p.x - cx, p.y - cy));
         R = modules.barrierRadius(pts.length, dists);
-        if (pts.length < 6) R = Math.max(R, ...dists);
+        void dists;
       };
       if (placed?.hold) {
         cx = placed.x;
@@ -2666,6 +2675,11 @@ var GraphFx = class {
    * calls), checked against a second node; falls back to pan/scale.
    */
   mapping(r, nodes, ratio) {
+    const ht = r.hanger?.worldTransform;
+    if (ht && Number.isFinite(ht.a) && ht.a > 0 && Number.isFinite(ht.tx) && Number.isFinite(ht.ty)) {
+      this.lastMapping = "\u043F\u043E \u043A\u043E\u043D\u0442\u0435\u0439\u043D\u0435\u0440\u0443 \u0433\u0440\u0430\u0444\u0430";
+      return { S: ht.a * ratio, ox: ht.tx * ratio, oy: ht.ty * ratio };
+    }
     let S = r.scale ?? 1;
     let ox = r.panX ?? 0;
     let oy = r.panY ?? 0;

@@ -1,7 +1,7 @@
 {
   "id": "folder-hub",
   "name": "ObsOrg",
-  "version": "1.10.2",
+  "version": "1.10.3",
   "minAppVersion": "1.4.0",
   "description": "Главный файл в каждой папке со [[ссылками]] на все её файлы, счётчик слов за день и календарь с анимациями.",
   "author": "SolivagusMinus",

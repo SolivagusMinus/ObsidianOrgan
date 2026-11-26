@@ -104,6 +104,8 @@ export class GraphTree {
 	private kept = new Map<GraphRenderer, Map<string, Point>>();
 	/** Anchor of each module from the last layout (module id → node id). */
 	private moduleAnchors = new Map<string, string>();
+	/** Graphs already sorted automatically after opening. */
+	private autoSorted = new WeakSet<GraphRenderer>();
 	/** "Sort graph" buttons added to graph view headers. */
 	private actions = new Map<GraphRenderer, HTMLElement>();
 
@@ -169,10 +171,15 @@ export class GraphTree {
 		this.depthCache = null;
 		this.posCache = null;
 		this.modLayout = null;
-		// Settings or modules changed: anchors from the last sort may be stale.
+		// Settings or modules changed: anchors from the last sort may be stale —
+		// sort those graphs again rather than leaving the modules unsorted.
+		const resort = [...this.kept.entries()].filter(([, k]) => k.size).map(([r]) => r);
 		this.kept.clear();
 		this.scan();
 		for (const r of this.originals.keys()) this.schedule(r);
+		if (this.plugin.settings.layoutMode === "button") {
+			for (const r of resort) window.setTimeout(() => this.originals.has(r) && this.sortOne(r, true), 400);
+		}
 	}
 
 	private refreshSoon() {
@@ -316,6 +323,12 @@ export class GraphTree {
 		}
 		this.grown.add(r);
 		if (this.growing.has(r)) return; // the running animation will finish the job
+		// "By button" mode: sort once by itself when the graph opens, so modules
+		// don't start out piled on top of each other.
+		if (buttonMode && s.sortOnOpen && !this.autoSorted.has(r) && this.canSort()) {
+			this.autoSorted.add(r);
+			window.setTimeout(() => this.originals.has(r) && !this.sorting.has(r) && this.sortOne(r, true), 1200);
+		}
 
 		// Obsidian reloads graph data on every save. Pins are re-sent (cheap and
 		// safe if the worker dropped them), but the physics is only woken up
@@ -491,7 +504,7 @@ export class GraphTree {
 			new Notice("ObsOrg: откройте граф, чтобы упорядочить его.");
 			return;
 		}
-		if (!s.skillTreeEnabled && !(s.modulesEnabled && s.moduleSeparate && this.plugin.modules.list.length)) {
+		if (!this.canSort()) {
 			new Notice("ObsOrg: нечего упорядочивать — включите дерево прокачки или создайте модули.");
 			return;
 		}
@@ -518,7 +531,13 @@ export class GraphTree {
 		for (const r of this.originals.keys()) this.sortOne(r);
 	}
 
-	private sortOne(r: GraphRenderer) {
+	private canSort(): boolean {
+		const s = this.plugin.settings;
+		return s.skillTreeEnabled || (s.modulesEnabled && s.moduleSeparate && this.plugin.modules.list.length > 0);
+	}
+
+	private sortOne(r: GraphRenderer, quiet = false) {
+		this.quietSort.set(r, quiet);
 		if (!r.nodes?.length) return;
 		const s = this.plugin.settings;
 		const prevTimer = this.sorting.get(r);
@@ -562,8 +581,12 @@ export class GraphTree {
 		}
 	}
 
+	private quietSort = new Map<GraphRenderer, boolean>();
+
 	private finishSort(r: GraphRenderer) {
 		this.sorting.delete(r);
+		const quiet = this.quietSort.get(r) ?? false;
+		this.quietSort.delete(r);
 		if (this.growing.has(r)) {
 			window.cancelAnimationFrame(this.growing.get(r)!);
 			this.growing.delete(r);
@@ -603,7 +626,7 @@ export class GraphTree {
 		} catch {
 			/* ignore */
 		}
-		new Notice(
+		if (!quiet) new Notice(
 			keep.size
 				? `ObsOrg: граф упорядочен — заметки свободны, на месте держатся только ${keep.size} главных файлов модулей.`
 				: "ObsOrg: граф упорядочен — заметки снова свободны.",

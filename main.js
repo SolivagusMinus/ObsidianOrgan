@@ -1465,10 +1465,13 @@ var GraphTree = class {
     this.kept = /* @__PURE__ */ new Map();
     /** Anchor of each module from the last layout (module id → node id). */
     this.moduleAnchors = /* @__PURE__ */ new Map();
+    /** Graphs already sorted automatically after opening. */
+    this.autoSorted = /* @__PURE__ */ new WeakSet();
     /** "Sort graph" buttons added to graph view headers. */
     this.actions = /* @__PURE__ */ new Map();
     this.messagesSent = 0;
     this.lastApply = { at: 0, note: "\u0435\u0449\u0451 \u043D\u0435 \u0431\u044B\u043B\u043E" };
+    this.quietSort = /* @__PURE__ */ new Map();
     // ------------------------------------------------------------- bubbles
     this.sim = /* @__PURE__ */ new Map();
     this.simTimer = null;
@@ -1536,9 +1539,13 @@ var GraphTree = class {
     this.depthCache = null;
     this.posCache = null;
     this.modLayout = null;
+    const resort = [...this.kept.entries()].filter(([, k]) => k.size).map(([r]) => r);
     this.kept.clear();
     this.scan();
     for (const r of this.originals.keys()) this.schedule(r);
+    if (this.plugin.settings.layoutMode === "button") {
+      for (const r of resort) window.setTimeout(() => this.originals.has(r) && this.sortOne(r, true), 400);
+    }
   }
   refreshSoon() {
     if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
@@ -1661,6 +1668,10 @@ var GraphTree = class {
     }
     this.grown.add(r);
     if (this.growing.has(r)) return;
+    if (buttonMode && s.sortOnOpen && !this.autoSorted.has(r) && this.canSort()) {
+      this.autoSorted.add(r);
+      window.setTimeout(() => this.originals.has(r) && !this.sorting.has(r) && this.sortOne(r, true), 1200);
+    }
     const last = this.sent.get(r) ?? /* @__PURE__ */ new Map();
     const now = /* @__PURE__ */ new Set();
     let moved = false;
@@ -1817,7 +1828,7 @@ var GraphTree = class {
       new import_obsidian5.Notice("ObsOrg: \u043E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0433\u0440\u0430\u0444, \u0447\u0442\u043E\u0431\u044B \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0438\u0442\u044C \u0435\u0433\u043E.");
       return;
     }
-    if (!s.skillTreeEnabled && !(s.modulesEnabled && s.moduleSeparate && this.plugin.modules.list.length)) {
+    if (!this.canSort()) {
       new import_obsidian5.Notice("ObsOrg: \u043D\u0435\u0447\u0435\u0433\u043E \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0438\u0432\u0430\u0442\u044C \u2014 \u0432\u043A\u043B\u044E\u0447\u0438\u0442\u0435 \u0434\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438 \u0438\u043B\u0438 \u0441\u043E\u0437\u0434\u0430\u0439\u0442\u0435 \u043C\u043E\u0434\u0443\u043B\u0438.");
       return;
     }
@@ -1842,7 +1853,12 @@ var GraphTree = class {
     }
     for (const r of this.originals.keys()) this.sortOne(r);
   }
-  sortOne(r) {
+  canSort() {
+    const s = this.plugin.settings;
+    return s.skillTreeEnabled || s.modulesEnabled && s.moduleSeparate && this.plugin.modules.list.length > 0;
+  }
+  sortOne(r, quiet = false) {
+    this.quietSort.set(r, quiet);
     if (!r.nodes?.length) return;
     const s = this.plugin.settings;
     const prevTimer = this.sorting.get(r);
@@ -1885,6 +1901,8 @@ var GraphTree = class {
   }
   finishSort(r) {
     this.sorting.delete(r);
+    const quiet = this.quietSort.get(r) ?? false;
+    this.quietSort.delete(r);
     if (this.growing.has(r)) {
       window.cancelAnimationFrame(this.growing.get(r));
       this.growing.delete(r);
@@ -1919,7 +1937,7 @@ var GraphTree = class {
       r.changed?.();
     } catch {
     }
-    new import_obsidian5.Notice(
+    if (!quiet) new import_obsidian5.Notice(
       keep.size ? `ObsOrg: \u0433\u0440\u0430\u0444 \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0435\u043D \u2014 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0441\u0432\u043E\u0431\u043E\u0434\u043D\u044B, \u043D\u0430 \u043C\u0435\u0441\u0442\u0435 \u0434\u0435\u0440\u0436\u0430\u0442\u0441\u044F \u0442\u043E\u043B\u044C\u043A\u043E ${keep.size} \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u043C\u043E\u0434\u0443\u043B\u0435\u0439.` : "ObsOrg: \u0433\u0440\u0430\u0444 \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0435\u043D \u2014 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0441\u043D\u043E\u0432\u0430 \u0441\u0432\u043E\u0431\u043E\u0434\u043D\u044B."
     );
   }
@@ -3683,6 +3701,7 @@ var DEFAULT_SETTINGS = {
   dailyTemplate: "",
   layoutMode: "button",
   afterSort: "anchors",
+  sortOnOpen: true,
   skillTreeEnabled: true,
   skillTreeStyle: "radial",
   skillTreeStep: 300,
@@ -3989,6 +4008,12 @@ var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
       })
     );
     if (s.layoutMode === "button") {
+      new import_obsidian8.Setting(containerEl).setName("\u0423\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0438\u0432\u0430\u0442\u044C \u043F\u0440\u0438 \u043E\u0442\u043A\u0440\u044B\u0442\u0438\u0438 \u0433\u0440\u0430\u0444\u0430").setDesc("\u0427\u0435\u0440\u0435\u0437 \u0441\u0435\u043A\u0443\u043D\u0434\u0443 \u043F\u043E\u0441\u043B\u0435 \u043E\u0442\u043A\u0440\u044B\u0442\u0438\u044F \u0433\u0440\u0430\u0444 \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0438\u0432\u0430\u0435\u0442\u0441\u044F \u0441\u0430\u043C (\u0431\u0435\u0437 \u0443\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u044F), \u0447\u0442\u043E\u0431\u044B \u043C\u043E\u0434\u0443\u043B\u0438 \u043D\u0435 \u0441\u0442\u043E\u044F\u043B\u0438 \u0432\u043D\u0430\u0445\u043B\u0451\u0441\u0442.").addToggle(
+        (t) => t.setValue(s.sortOnOpen).onChange(async (v) => {
+          s.sortOnOpen = v;
+          await save();
+        })
+      );
       new import_obsidian8.Setting(containerEl).setName("\u041F\u043E\u0441\u043B\u0435 \u0441\u043E\u0440\u0442\u0438\u0440\u043E\u0432\u043A\u0438").setDesc(
         "\u0424\u0438\u0437\u0438\u043A\u0430 Obsidian \u0442\u044F\u043D\u0435\u0442 \u0432\u0441\u0451 \u043A \u0446\u0435\u043D\u0442\u0440\u0443, \u043F\u043E\u044D\u0442\u043E\u043C\u0443 \u043F\u043E\u043B\u043D\u043E\u0441\u0442\u044C\u044E \u043E\u0442\u043F\u0443\u0449\u0435\u043D\u043D\u044B\u0435 \u043C\u043E\u0434\u0443\u043B\u0438 \u0447\u0435\u0440\u0435\u0437 \u043F\u0430\u0440\u0443 \u0441\u0435\u043A\u0443\u043D\u0434 \u0441\u043D\u043E\u0432\u0430 \u0441\u0431\u0438\u0432\u0430\u044E\u0442\u0441\u044F \u0432 \u043A\u0443\u0447\u0443. \xAB\u0414\u0435\u0440\u0436\u0430\u0442\u044C \u044F\u043A\u043E\u0440\u044F\xBB: \u043D\u0430 \u043C\u0435\u0441\u0442\u0435 \u043E\u0441\u0442\u0430\u0451\u0442\u0441\u044F \u0442\u043E\u043B\u044C\u043A\u043E \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B \u043A\u0430\u0436\u0434\u043E\u0433\u043E \u043C\u043E\u0434\u0443\u043B\u044F, \u043E\u0441\u0442\u0430\u043B\u044C\u043D\u044B\u0435 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u043F\u043B\u0430\u0432\u0430\u044E\u0442 \u0432\u043E\u043A\u0440\u0443\u0433 \u043D\u0435\u0433\u043E."
       ).addDropdown(

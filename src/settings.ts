@@ -54,6 +54,8 @@ export interface FolderHubSettings {
 	layoutMode: "button" | "always";
 	/** After a sort: keep one anchor per module pinned, or release everything. */
 	afterSort: "anchors" | "all";
+	/** Sort automatically when a graph opens ("by button" mode). */
+	sortOnOpen: boolean;
 	skillTreeEnabled: boolean;
 	skillTreeStyle: TreeStyle;
 	skillTreeStep: number;
@@ -159,6 +161,7 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 
 	layoutMode: "button",
 	afterSort: "anchors",
+	sortOnOpen: true,
 	skillTreeEnabled: true,
 	skillTreeStyle: "radial",
 	skillTreeStep: 300,
@@ -641,6 +644,16 @@ export class FolderHubSettingTab extends PluginSettingTab {
 			);
 
 		if (s.layoutMode === "button") {
+			new Setting(containerEl)
+				.setName("Упорядочивать при открытии графа")
+				.setDesc("Через секунду после открытия граф упорядочивается сам (без уведомления), чтобы модули не стояли внахлёст.")
+				.addToggle((t) =>
+					t.setValue(s.sortOnOpen).onChange(async (v) => {
+						s.sortOnOpen = v;
+						await save();
+					}),
+				);
+
 			new Setting(containerEl)
 				.setName("После сортировки")
 				.setDesc(

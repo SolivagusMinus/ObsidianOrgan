@@ -2,6 +2,7 @@ import { App, Notice, TFile, TFolder, View, normalizePath } from "obsidian";
 import type FolderHubPlugin from "./main";
 import { DIRECTIONS, LayoutOptions, Point, TreeNode, layoutSkillTree } from "./skilltree";
 import { Circle, centroid, separateCircles } from "./module-shapes";
+import { Bubble, bubbleRadius, spiralSpot, stepBubbles } from "./module-sim";
 
 // ---------------------------------------------------------------------------
 // Undocumented Obsidian internals (graph view). Everything is feature-checked
@@ -10,7 +11,20 @@ import { Circle, centroid, separateCircles } from "./module-shapes";
 // Obsidian itself sends while you drag a node.
 // ---------------------------------------------------------------------------
 
+/** Bubble physics state of one graph. */
+interface SimState {
+	bubbles: Bubble[];
+	key: string;
+	last: number;
+	t0: number;
+	/** Last position posted for each note (to skip tiny updates). */
+	posted: Map<string, Point>;
+	/** How long everything has been still (ms). */
+	still: number;
+}
+
 interface GraphRenderer {
+	dragNode?: { id: string } | null;
 	nodes?: { id: string; x: number; y: number }[];
 	links?: { source: { id?: string; x: number; y: number }; target: { id?: string; x: number; y: number } }[];
 	nodeLookup?: Record<string, unknown>;
@@ -118,6 +132,8 @@ export class GraphTree {
 		void this.syncColorGroups(false, false);
 		// Modules: keep member notes inside their barrier.
 		this.holdTimer = window.setInterval(() => this.holdTick(), 150);
+		// Module bubbles: their own little physics, ~20 updates a second.
+		this.plugin.registerInterval(window.setInterval(() => this.simTick(), 50));
 		this.plugin.registerInterval(this.holdTimer);
 	}
 
@@ -127,6 +143,7 @@ export class GraphTree {
 		this.holdRelease.clear();
 		for (const r of this.held.keys()) this.releaseHeld(r);
 		for (const r of this.resting.keys()) this.releaseResting(r);
+		for (const r of this.simPinned.keys()) this.releaseSim(r);
 		this.growing.forEach((id) => window.cancelAnimationFrame(id));
 		this.freezeTimers.forEach((t) => window.clearTimeout(t));
 		for (const r of [...this.originals.keys()]) {
@@ -279,7 +296,14 @@ export class GraphTree {
 		const buttonMode = s.layoutMode === "button";
 		const active = !buttonMode || this.sorting.has(r);
 		const base = active && s.skillTreeEnabled ? this.positions() : new Map<string, Point>();
-		const target = active ? this.withModules(r, base) : new Map(this.kept.get(r) ?? []);
+		let target: Map<string, Point>;
+		if (this.bubblesOn()) {
+			// Module notes are driven by the bubbles; the layout keeps the rest.
+			const members = this.plugin.modules.members();
+			target = new Map([...base].filter(([id]) => ![...members.values()].some((set) => set.has(id))));
+		} else {
+			target = active ? this.withModules(r, base) : new Map(this.kept.get(r) ?? []);
+		}
 
 		// First time this graph shows the tree: let it grow out of the centre.
 		const reduced = this.plugin.motionReduced();
@@ -469,6 +493,26 @@ export class GraphTree {
 			new Notice("ObsOrg: нечего упорядочивать — включите дерево прокачки или создайте модули.");
 			return;
 		}
+		if (this.bubblesOn()) {
+			// Bubbles: spread them out afresh and tidy their notes.
+			for (const st of this.sim.values()) {
+				const circles = st.bubbles.map((b) => ({ x: b.x, y: b.y, r: b.R, b }));
+				separateCircles(circles, s.moduleGap);
+				for (const c of circles) {
+					c.b.homeX = c.x;
+					c.b.homeY = c.y;
+					c.b.notes.forEach((p, i) => {
+						const spot = spiralSpot(i, c.b.notes.length, c.b.R);
+						p.vx += (spot.x - p.rx) * 2;
+						p.vy += (spot.y - p.ry) * 2;
+					});
+				}
+				st.still = 0;
+			}
+			if (s.skillTreeEnabled) for (const r of this.originals.keys()) this.sortOne(r);
+			new Notice("ObsOrg: модули разложены.");
+			return;
+		}
 		for (const r of this.originals.keys()) this.sortOne(r);
 	}
 
@@ -483,7 +527,13 @@ export class GraphTree {
 		this.plugin.modules.centers.clear();
 		this.sorting.set(r, -1);
 		const base = s.skillTreeEnabled ? this.positions() : new Map<string, Point>();
-		const target = this.withModules(r, base);
+		let target: Map<string, Point>;
+		if (this.bubblesOn()) {
+			const members = this.plugin.modules.members();
+			target = new Map([...base].filter(([id]) => ![...members.values()].some((set) => set.has(id))));
+		} else {
+			target = this.withModules(r, base);
+		}
 		const ids = new Set([...target.keys()].filter((id) => this.hasNode(r, id)));
 		const from = new Map<string, Point>();
 		for (const n of r.nodes) if (ids.has(n.id) && Number.isFinite(n.x)) from.set(n.id, { x: n.x, y: n.y });
@@ -556,6 +606,165 @@ export class GraphTree {
 				? `ObsOrg: граф упорядочен — заметки свободны, на месте держатся только ${keep.size} главных файлов модулей.`
 				: "ObsOrg: граф упорядочен — заметки снова свободны.",
 		);
+	}
+
+	// ------------------------------------------------------------- bubbles
+
+	private sim = new Map<GraphRenderer, SimState>();
+	/** Notes currently pinned by the bubble physics, per graph. */
+	private simPinned = new Map<GraphRenderer, Set<string>>();
+
+	bubblesOn(): boolean {
+		const s = this.plugin.settings;
+		return s.moduleBubbles && s.modulesEnabled && this.plugin.modules.list.length > 0;
+	}
+
+	/** A module's bubble (for drawing), if the bubble physics is running. */
+	bubbleOf(moduleId: string): { x: number; y: number; R: number } | undefined {
+		if (!this.bubblesOn()) return undefined;
+		for (const st of this.sim.values()) {
+			const b = st.bubbles.find((x) => x.id === moduleId);
+			if (b) return b;
+		}
+		return undefined;
+	}
+
+	/** Builds (or rebuilds, keeping positions) the bubbles from the modules. */
+	private buildSim(r: GraphRenderer, prev: SimState | undefined): SimState {
+		const s = this.plugin.settings;
+		const modules = this.plugin.modules;
+		const members = modules.members();
+		const nodes = r.nodes ?? [];
+		const byId = new Map(nodes.map((n) => [n.id, n]));
+		const median = (v: number[]) => (v.length ? [...v].sort((a, b) => a - b)[v.length >> 1] : 0);
+		const bubbles: Bubble[] = [];
+		const fresh: Bubble[] = [];
+		for (const m of modules.list) {
+			const ids = [...(members.get(m.id) ?? [])].filter((id) => byId.has(id));
+			if (!ids.length) continue;
+			const R = bubbleRadius(ids.length, modules.unit, s.moduleSize);
+			const old = prev?.bubbles.find((b) => b.id === m.id);
+			const pts = ids.map((id) => byId.get(id)!).filter((n) => Number.isFinite(n.x) && Number.isFinite(n.y));
+			const cx = old?.x ?? median(pts.map((n) => n.x));
+			const cy = old?.y ?? median(pts.map((n) => n.y));
+			const oldNotes = new Map((old?.notes ?? []).map((p) => [p.id, p]));
+			const notes = ids.map((id, i) => {
+				const keep = oldNotes.get(id);
+				if (keep) return keep;
+				const n = byId.get(id)!;
+				// Start where the note is now (clamped inside), or on a tidy spiral.
+				let rx = Number.isFinite(n.x) ? n.x - cx : spiralSpot(i, ids.length, R).x;
+				let ry = Number.isFinite(n.y) ? n.y - cy : spiralSpot(i, ids.length, R).y;
+				const d = Math.hypot(rx, ry);
+				if (d > R * 0.85) {
+					rx = (rx / d) * R * 0.85;
+					ry = (ry / d) * R * 0.85;
+				}
+				return { id, rx, ry, vx: 0, vy: 0, seed: (i * 2.399) % (Math.PI * 2) };
+			});
+			const idx = new Map(notes.map((p, i) => [p.id, i]));
+			const links: [number, number][] = [];
+			for (const l of r.links ?? []) {
+				const i = l.source.id !== undefined ? idx.get(l.source.id) : undefined;
+				const j = l.target.id !== undefined ? idx.get(l.target.id) : undefined;
+				if (i !== undefined && j !== undefined && i !== j) links.push([i, j]);
+			}
+			const b: Bubble = old
+				? { ...old, R, notes, links }
+				: { id: m.id, x: cx, y: cy, vx: 0, vy: 0, R, homeX: cx, homeY: cy, notes, links };
+			bubbles.push(b);
+			if (!old) fresh.push(b);
+		}
+		// New bubbles start apart from the others.
+		if (fresh.length) {
+			const circles = bubbles.map((b) => ({ x: b.homeX, y: b.homeY, r: b.R, b }));
+			separateCircles(circles, s.moduleGap);
+			for (const c of circles) {
+				c.b.homeX = c.x;
+				c.b.homeY = c.y;
+				if (fresh.includes(c.b)) {
+					c.b.x = c.x;
+					c.b.y = c.y;
+				}
+			}
+		}
+		return {
+			bubbles,
+			key: this.simKey(r),
+			last: performance.now(),
+			t0: prev?.t0 ?? performance.now(),
+			posted: prev?.posted ?? new Map(),
+			still: 0,
+		};
+	}
+
+	private simKey(r: GraphRenderer): string {
+		const s = this.plugin.settings;
+		return [this.plugin.modules.version, r.nodes?.length ?? 0, s.moduleSize, s.moduleGap, Math.round(this.plugin.modules.unit)].join("|");
+	}
+
+	/** One step of the bubble physics for every graph, then move the notes there. */
+	private simTick() {
+		const s = this.plugin.settings;
+		if (!this.bubblesOn()) {
+			for (const r of [...this.simPinned.keys()]) this.releaseSim(r);
+			this.sim.clear();
+			return;
+		}
+		const now = performance.now();
+		for (const r of this.originals.keys()) {
+			if (!r.nodes?.length) continue;
+			let st = this.sim.get(r);
+			if (!st || st.key !== this.simKey(r)) {
+				st = this.buildSim(r, st);
+				this.sim.set(r, st);
+			}
+			const dt = (now - st.last) / 1000;
+			st.last = now;
+			const moved = stepBubbles(st.bubbles, dt, {
+				unit: this.plugin.modules.unit,
+				gap: s.moduleGap,
+				float: s.animations ? s.moduleFloat : 0,
+				t: (now - st.t0) / 1000,
+			});
+			st.still = moved < 0.05 ? st.still + dt * 1000 : 0;
+			// Everything at rest: stop sending, so the graph can cool down.
+			if (st.still > 1500) continue;
+
+			const drag = r.dragNode?.id;
+			const pinned = this.simPinned.get(r) ?? new Set<string>();
+			const alive = new Set<string>();
+			for (const b of st.bubbles) {
+				for (const p of b.notes) {
+					alive.add(p.id);
+					if (p.id === drag) continue;
+					const x = b.x + p.rx;
+					const y = b.y + p.ry;
+					const last = st.posted.get(p.id);
+					// Only notes that moved visibly (saves thousands of messages a second).
+					if (last && Math.abs(last.x - x) < 1.5 && Math.abs(last.y - y) < 1.5 && pinned.has(p.id)) continue;
+					this.pin(r, p.id, x, y, 0.05);
+					st.posted.set(p.id, { x, y });
+					pinned.add(p.id);
+				}
+			}
+			// Notes that left every module go back to the normal physics.
+			for (const id of [...pinned]) {
+				if (!alive.has(id)) {
+					this.unpin(r, id, 0.1);
+					pinned.delete(id);
+					st.posted.delete(id);
+				}
+			}
+			this.simPinned.set(r, pinned);
+		}
+	}
+
+	private releaseSim(r: GraphRenderer) {
+		const pinned = this.simPinned.get(r);
+		if (!pinned?.size) return;
+		for (const id of pinned) this.unpin(r, id, 0.1);
+		pinned.clear();
 	}
 
 	// ------------------------------------------------------------- layout
@@ -783,7 +992,8 @@ export class GraphTree {
 			const buttonMode = s.layoutMode === "button";
 			const sorting = this.sorting.has(r);
 			// Modules keep pushing each other apart (slime), also after a sort.
-			if (++this.slimeFrame % 2 === 0) this.slimeTick(r);
+			const bubbles = this.bubblesOn() ? this.sim.get(r)?.bubbles : undefined;
+			if (!bubbles && ++this.slimeFrame % 2 === 0) this.slimeTick(r);
 			// Walls: always in "always" mode; in "by button" mode during a sort, and
 			// afterwards only for notes of OTHER modules (members float freely).
 			const anchors = buttonMode ? this.kept.get(r) : this.sent.get(r);
@@ -812,9 +1022,10 @@ export class GraphTree {
 			}
 			const pad = this.plugin.modules.unit * 0.6 * s.moduleSize;
 
-			// Each module's barrier: the reserved place, or (without separation) around its notes.
+			// Each module's barrier: its bubble, the reserved place, or around its notes.
 			const walls: { id: string; x: number; y: number; R: number }[] = [];
-			for (const m of modules.list) {
+			if (bubbles) for (const b of bubbles) walls.push({ id: b.id, x: b.x, y: b.y, R: b.R });
+			for (const m of bubbles ? [] : modules.list) {
 				const placed = s.moduleSeparate ? modules.centers.get(m.id) : undefined;
 				if (placed?.hold) {
 					walls.push({ id: m.id, x: placed.x, y: placed.y, R: placed.hold });
@@ -849,6 +1060,8 @@ export class GraphTree {
 				// Small modules (a few notes) keep all their notes with them; otherwise
 				// links to other modules drag them across the graph.
 				const small = own ? (memberCount.get(own) ?? 0) < 6 : false;
+				// With bubbles, module notes are moved by the bubble physics, not by walls.
+				if (bubbles && own) continue;
 				const home = own && (membersRule || orphan || small) ? walls.find((w) => w.id === own) : undefined;
 				if (home) {
 					const dx = n.x - home.x;

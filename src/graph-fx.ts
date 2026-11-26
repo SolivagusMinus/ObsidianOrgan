@@ -1,7 +1,7 @@
 import { Platform, View } from "obsidian";
 import type FolderHubPlugin from "./main";
 import { Quality, drawRay } from "./rays";
-import { centroid, drawBoundary, elasticOut, fillOutline, moduleOutline, polarRadii, slimeClamp } from "./module-shapes";
+import { centroid, circlePoints, drawBoundary, elasticOut, fillOutline, moduleOutline, polarRadii, slimeClamp } from "./module-shapes";
 import type { ModuleDef } from "./modules";
 
 // ---------------------------------------------------------------------------
@@ -446,6 +446,23 @@ export class GraphFx {
 				// notes are held inside instead.)
 				void dists;
 			};
+			const bubble = this.plugin.graphTree.bubbleOf(e.def.id);
+			if (bubble) {
+				// Bubble physics: the barrier IS the container — its own fixed size,
+				// right where the bubble is (no shrink-wrapping around the notes).
+				const pts2 = circlePoints({ x: bubble.x, y: bubble.y }, bubble.R, 48);
+				const target = polarRadii(pts2, { x: bubble.x, y: bubble.y }, MOD_RAYS);
+				if (!st) {
+					st = { cx: bubble.x, cy: bubble.y, radii: target, born: now, last: now };
+					layer.modState.set(e.def.id, st);
+				} else {
+					st.cx = bubble.x;
+					st.cy = bubble.y;
+					st.radii = target;
+				}
+				st.last = now;
+				return st;
+			}
 			if (placed?.hold) {
 				// Same centre and radius the layout reserved for this module…
 				cx = placed.x;
@@ -627,7 +644,8 @@ export class GraphFx {
 			// All barriers first, so each can press against its neighbours ("slime").
 			const states = mods.entries.map((e) => this.stepModule(layer, e, now));
 			const maxRad = states.map((st) => (st ? Math.max(...st.radii) : 0));
-			const slime = s.moduleSeparate;
+			// Bubbles never overlap (their physics keeps them apart), so no flattening.
+			const slime = s.moduleSeparate && !this.plugin.graphTree.bubblesOn();
 			const gapWorld = 3 / Math.max(S, 1e-6);
 			mods.entries.forEach((e, idx) => {
 				const st = states[idx];

@@ -1277,6 +1277,149 @@ function slimeClamp(c, R, a, r, neighbours, gap) {
   return out;
 }
 
+// src/module-sim.ts
+function bubbleRadius(count, unit, size = 1) {
+  return unit * (1.5 + 0.6 * Math.sqrt(Math.max(1, count))) * size;
+}
+function spiralSpot(i, n, R) {
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  const r = R * 0.8 * Math.sqrt((i + 0.5) / Math.max(1, n));
+  return { x: Math.cos(i * golden) * r, y: Math.sin(i * golden) * r };
+}
+function stepBubbles(bubbles, dt, o) {
+  const h = Math.min(0.05, Math.max(1e-3, dt));
+  let maxMove = 0;
+  for (const b of bubbles) {
+    const k = 1.2;
+    b.vx += (b.homeX - b.x) * k * h;
+    b.vy += (b.homeY - b.y) * k * h;
+    const damp = Math.exp(-3 * h);
+    b.vx *= damp;
+    b.vy *= damp;
+    b.x += b.vx * h;
+    b.y += b.vy * h;
+  }
+  for (let it = 0; it < 4; it++) {
+    for (let i = 0; i < bubbles.length; i++) {
+      for (let j = i + 1; j < bubbles.length; j++) {
+        const a = bubbles[i];
+        const b = bubbles[j];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let d = Math.hypot(dx, dy);
+        const need = a.R + b.R + o.gap;
+        if (d >= need) continue;
+        if (d < 1e-6) {
+          dx = 1;
+          dy = 0;
+          d = 1;
+        }
+        const push = need - d;
+        const wa = b.R * b.R / (a.R * a.R + b.R * b.R);
+        const nx = dx / d;
+        const ny = dy / d;
+        a.x -= nx * push * wa;
+        a.y -= ny * push * wa;
+        b.x += nx * push * (1 - wa);
+        b.y += ny * push * (1 - wa);
+        const rel = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+        if (rel < 0) {
+          a.vx += nx * rel * wa;
+          a.vy += ny * rel * wa;
+          b.vx -= nx * rel * (1 - wa);
+          b.vy -= ny * rel * (1 - wa);
+        }
+      }
+    }
+  }
+  const u = o.unit;
+  for (const b of bubbles) {
+    const n = b.notes.length;
+    const wall = Math.max(u * 0.3, b.R - u * 0.35);
+    const minGap = Math.max(u * 0.75, b.R * 1.5 / Math.sqrt(Math.max(1, n)));
+    for (const [i, j] of b.links ?? []) {
+      const p = b.notes[i];
+      const q = b.notes[j];
+      if (!p || !q) continue;
+      const dx = q.rx - p.rx;
+      const dy = q.ry - p.ry;
+      const d = Math.hypot(dx, dy) || 1e-3;
+      const f = (d - u * 0.9) * 1.5;
+      p.vx += dx / d * f * h;
+      p.vy += dy / d * f * h;
+      q.vx -= dx / d * f * h;
+      q.vy -= dy / d * f * h;
+    }
+    const cell = minGap;
+    const grid = /* @__PURE__ */ new Map();
+    b.notes.forEach((p, i) => {
+      const key = `${Math.floor(p.rx / cell)},${Math.floor(p.ry / cell)}`;
+      const list = grid.get(key);
+      if (list) list.push(i);
+      else grid.set(key, [i]);
+    });
+    for (let i = 0; i < n; i++) {
+      const p = b.notes[i];
+      const gx = Math.floor(p.rx / cell);
+      const gy = Math.floor(p.ry / cell);
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const list = grid.get(`${gx + ox},${gy + oy}`);
+          if (!list) continue;
+          for (const j of list) {
+            if (j <= i) continue;
+            const q = b.notes[j];
+            let dx = q.rx - p.rx;
+            let dy = q.ry - p.ry;
+            let d = Math.hypot(dx, dy);
+            if (d >= minGap) continue;
+            if (d < 1e-6) {
+              dx = Math.cos(i + j);
+              dy = Math.sin(i + j);
+              d = 1e-3;
+            }
+            const f = (minGap - d) / minGap * u * 6;
+            p.vx -= dx / d * f * h;
+            p.vy -= dy / d * f * h;
+            q.vx += dx / d * f * h;
+            q.vy += dy / d * f * h;
+          }
+        }
+      }
+    }
+    for (const p of b.notes) {
+      p.vx += -p.rx * 0.08 * h;
+      p.vy += -p.ry * 0.08 * h;
+      if (o.float > 0) {
+        const s = p.seed;
+        p.vx += Math.sin(o.t * 0.7 + s) * u * 0.9 * o.float * h;
+        p.vy += Math.cos(o.t * 0.6 + s * 1.3) * u * 0.9 * o.float * h;
+      }
+      const damp = Math.exp(-2.5 * h);
+      p.vx *= damp;
+      p.vy *= damp;
+      const ox = p.rx;
+      const oy = p.ry;
+      p.rx += p.vx * h;
+      p.ry += p.vy * h;
+      const d = Math.hypot(p.rx, p.ry);
+      if (d > wall) {
+        const nx = p.rx / d;
+        const ny = p.ry / d;
+        p.rx = nx * wall;
+        p.ry = ny * wall;
+        const vr = p.vx * nx + p.vy * ny;
+        if (vr > 0) {
+          p.vx -= 1.6 * vr * nx;
+          p.vy -= 1.6 * vr * ny;
+        }
+      }
+      maxMove = Math.max(maxMove, Math.hypot(p.rx - ox, p.ry - oy));
+    }
+  }
+  return maxMove;
+}
+
 // src/graph.ts
 var hexToRgb = (hex) => {
   const h = hex.replace("#", "");
@@ -1326,6 +1469,10 @@ var GraphTree = class {
     this.actions = /* @__PURE__ */ new Map();
     this.messagesSent = 0;
     this.lastApply = { at: 0, note: "\u0435\u0449\u0451 \u043D\u0435 \u0431\u044B\u043B\u043E" };
+    // ------------------------------------------------------------- bubbles
+    this.sim = /* @__PURE__ */ new Map();
+    /** Notes currently pinned by the bubble physics, per graph. */
+    this.simPinned = /* @__PURE__ */ new Map();
     this.slimeFrame = 0;
     /** When each note was last corrected by a wall (to calm notes that keep hitting it). */
     this.wallHits = /* @__PURE__ */ new Map();
@@ -1354,6 +1501,7 @@ var GraphTree = class {
     this.scan();
     void this.syncColorGroups(false, false);
     this.holdTimer = window.setInterval(() => this.holdTick(), 150);
+    this.plugin.registerInterval(window.setInterval(() => this.simTick(), 50));
     this.plugin.registerInterval(this.holdTimer);
   }
   stop() {
@@ -1362,6 +1510,7 @@ var GraphTree = class {
     this.holdRelease.clear();
     for (const r of this.held.keys()) this.releaseHeld(r);
     for (const r of this.resting.keys()) this.releaseResting(r);
+    for (const r of this.simPinned.keys()) this.releaseSim(r);
     this.growing.forEach((id) => window.cancelAnimationFrame(id));
     this.freezeTimers.forEach((t) => window.clearTimeout(t));
     for (const r of [...this.originals.keys()]) {
@@ -1494,7 +1643,13 @@ var GraphTree = class {
     const buttonMode = s.layoutMode === "button";
     const active = !buttonMode || this.sorting.has(r);
     const base = active && s.skillTreeEnabled ? this.positions() : /* @__PURE__ */ new Map();
-    const target = active ? this.withModules(r, base) : new Map(this.kept.get(r) ?? []);
+    let target;
+    if (this.bubblesOn()) {
+      const members = this.plugin.modules.members();
+      target = new Map([...base].filter(([id]) => ![...members.values()].some((set) => set.has(id))));
+    } else {
+      target = active ? this.withModules(r, base) : new Map(this.kept.get(r) ?? []);
+    }
     const reduced = this.plugin.motionReduced();
     if (!buttonMode && target.size && !this.grown.has(r) && s.graphGrow && s.animations && !reduced) {
       this.grown.add(r);
@@ -1663,6 +1818,25 @@ var GraphTree = class {
       new import_obsidian5.Notice("ObsOrg: \u043D\u0435\u0447\u0435\u0433\u043E \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0438\u0432\u0430\u0442\u044C \u2014 \u0432\u043A\u043B\u044E\u0447\u0438\u0442\u0435 \u0434\u0435\u0440\u0435\u0432\u043E \u043F\u0440\u043E\u043A\u0430\u0447\u043A\u0438 \u0438\u043B\u0438 \u0441\u043E\u0437\u0434\u0430\u0439\u0442\u0435 \u043C\u043E\u0434\u0443\u043B\u0438.");
       return;
     }
+    if (this.bubblesOn()) {
+      for (const st of this.sim.values()) {
+        const circles = st.bubbles.map((b) => ({ x: b.x, y: b.y, r: b.R, b }));
+        separateCircles(circles, s.moduleGap);
+        for (const c of circles) {
+          c.b.homeX = c.x;
+          c.b.homeY = c.y;
+          c.b.notes.forEach((p, i) => {
+            const spot = spiralSpot(i, c.b.notes.length, c.b.R);
+            p.vx += (spot.x - p.rx) * 2;
+            p.vy += (spot.y - p.ry) * 2;
+          });
+        }
+        st.still = 0;
+      }
+      if (s.skillTreeEnabled) for (const r of this.originals.keys()) this.sortOne(r);
+      new import_obsidian5.Notice("ObsOrg: \u043C\u043E\u0434\u0443\u043B\u0438 \u0440\u0430\u0437\u043B\u043E\u0436\u0435\u043D\u044B.");
+      return;
+    }
     for (const r of this.originals.keys()) this.sortOne(r);
   }
   sortOne(r) {
@@ -1675,7 +1849,13 @@ var GraphTree = class {
     this.plugin.modules.centers.clear();
     this.sorting.set(r, -1);
     const base = s.skillTreeEnabled ? this.positions() : /* @__PURE__ */ new Map();
-    const target = this.withModules(r, base);
+    let target;
+    if (this.bubblesOn()) {
+      const members = this.plugin.modules.members();
+      target = new Map([...base].filter(([id]) => ![...members.values()].some((set) => set.has(id))));
+    } else {
+      target = this.withModules(r, base);
+    }
     const ids = new Set([...target.keys()].filter((id) => this.hasNode(r, id)));
     const from = /* @__PURE__ */ new Map();
     for (const n of r.nodes) if (ids.has(n.id) && Number.isFinite(n.x)) from.set(n.id, { x: n.x, y: n.y });
@@ -1739,6 +1919,145 @@ var GraphTree = class {
     new import_obsidian5.Notice(
       keep.size ? `ObsOrg: \u0433\u0440\u0430\u0444 \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0435\u043D \u2014 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0441\u0432\u043E\u0431\u043E\u0434\u043D\u044B, \u043D\u0430 \u043C\u0435\u0441\u0442\u0435 \u0434\u0435\u0440\u0436\u0430\u0442\u0441\u044F \u0442\u043E\u043B\u044C\u043A\u043E ${keep.size} \u0433\u043B\u0430\u0432\u043D\u044B\u0445 \u0444\u0430\u0439\u043B\u043E\u0432 \u043C\u043E\u0434\u0443\u043B\u0435\u0439.` : "ObsOrg: \u0433\u0440\u0430\u0444 \u0443\u043F\u043E\u0440\u044F\u0434\u043E\u0447\u0435\u043D \u2014 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0441\u043D\u043E\u0432\u0430 \u0441\u0432\u043E\u0431\u043E\u0434\u043D\u044B."
     );
+  }
+  bubblesOn() {
+    const s = this.plugin.settings;
+    return s.moduleBubbles && s.modulesEnabled && this.plugin.modules.list.length > 0;
+  }
+  /** A module's bubble (for drawing), if the bubble physics is running. */
+  bubbleOf(moduleId) {
+    if (!this.bubblesOn()) return void 0;
+    for (const st of this.sim.values()) {
+      const b = st.bubbles.find((x) => x.id === moduleId);
+      if (b) return b;
+    }
+    return void 0;
+  }
+  /** Builds (or rebuilds, keeping positions) the bubbles from the modules. */
+  buildSim(r, prev) {
+    const s = this.plugin.settings;
+    const modules = this.plugin.modules;
+    const members = modules.members();
+    const nodes = r.nodes ?? [];
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const median = (v) => v.length ? [...v].sort((a, b) => a - b)[v.length >> 1] : 0;
+    const bubbles = [];
+    const fresh = [];
+    for (const m of modules.list) {
+      const ids = [...members.get(m.id) ?? []].filter((id) => byId.has(id));
+      if (!ids.length) continue;
+      const R = bubbleRadius(ids.length, modules.unit, s.moduleSize);
+      const old = prev?.bubbles.find((b2) => b2.id === m.id);
+      const pts = ids.map((id) => byId.get(id)).filter((n) => Number.isFinite(n.x) && Number.isFinite(n.y));
+      const cx = old?.x ?? median(pts.map((n) => n.x));
+      const cy = old?.y ?? median(pts.map((n) => n.y));
+      const oldNotes = new Map((old?.notes ?? []).map((p) => [p.id, p]));
+      const notes = ids.map((id, i) => {
+        const keep = oldNotes.get(id);
+        if (keep) return keep;
+        const n = byId.get(id);
+        let rx = Number.isFinite(n.x) ? n.x - cx : spiralSpot(i, ids.length, R).x;
+        let ry = Number.isFinite(n.y) ? n.y - cy : spiralSpot(i, ids.length, R).y;
+        const d = Math.hypot(rx, ry);
+        if (d > R * 0.85) {
+          rx = rx / d * R * 0.85;
+          ry = ry / d * R * 0.85;
+        }
+        return { id, rx, ry, vx: 0, vy: 0, seed: i * 2.399 % (Math.PI * 2) };
+      });
+      const idx = new Map(notes.map((p, i) => [p.id, i]));
+      const links = [];
+      for (const l of r.links ?? []) {
+        const i = l.source.id !== void 0 ? idx.get(l.source.id) : void 0;
+        const j = l.target.id !== void 0 ? idx.get(l.target.id) : void 0;
+        if (i !== void 0 && j !== void 0 && i !== j) links.push([i, j]);
+      }
+      const b = old ? { ...old, R, notes, links } : { id: m.id, x: cx, y: cy, vx: 0, vy: 0, R, homeX: cx, homeY: cy, notes, links };
+      bubbles.push(b);
+      if (!old) fresh.push(b);
+    }
+    if (fresh.length) {
+      const circles = bubbles.map((b) => ({ x: b.homeX, y: b.homeY, r: b.R, b }));
+      separateCircles(circles, s.moduleGap);
+      for (const c of circles) {
+        c.b.homeX = c.x;
+        c.b.homeY = c.y;
+        if (fresh.includes(c.b)) {
+          c.b.x = c.x;
+          c.b.y = c.y;
+        }
+      }
+    }
+    return {
+      bubbles,
+      key: this.simKey(r),
+      last: performance.now(),
+      t0: prev?.t0 ?? performance.now(),
+      posted: prev?.posted ?? /* @__PURE__ */ new Map(),
+      still: 0
+    };
+  }
+  simKey(r) {
+    const s = this.plugin.settings;
+    return [this.plugin.modules.version, r.nodes?.length ?? 0, s.moduleSize, s.moduleGap, Math.round(this.plugin.modules.unit)].join("|");
+  }
+  /** One step of the bubble physics for every graph, then move the notes there. */
+  simTick() {
+    const s = this.plugin.settings;
+    if (!this.bubblesOn()) {
+      for (const r of [...this.simPinned.keys()]) this.releaseSim(r);
+      this.sim.clear();
+      return;
+    }
+    const now = performance.now();
+    for (const r of this.originals.keys()) {
+      if (!r.nodes?.length) continue;
+      let st = this.sim.get(r);
+      if (!st || st.key !== this.simKey(r)) {
+        st = this.buildSim(r, st);
+        this.sim.set(r, st);
+      }
+      const dt = (now - st.last) / 1e3;
+      st.last = now;
+      const moved = stepBubbles(st.bubbles, dt, {
+        unit: this.plugin.modules.unit,
+        gap: s.moduleGap,
+        float: s.animations ? s.moduleFloat : 0,
+        t: (now - st.t0) / 1e3
+      });
+      st.still = moved < 0.05 ? st.still + dt * 1e3 : 0;
+      if (st.still > 1500) continue;
+      const drag = r.dragNode?.id;
+      const pinned = this.simPinned.get(r) ?? /* @__PURE__ */ new Set();
+      const alive = /* @__PURE__ */ new Set();
+      for (const b of st.bubbles) {
+        for (const p of b.notes) {
+          alive.add(p.id);
+          if (p.id === drag) continue;
+          const x = b.x + p.rx;
+          const y = b.y + p.ry;
+          const last = st.posted.get(p.id);
+          if (last && Math.abs(last.x - x) < 1.5 && Math.abs(last.y - y) < 1.5 && pinned.has(p.id)) continue;
+          this.pin(r, p.id, x, y, 0.05);
+          st.posted.set(p.id, { x, y });
+          pinned.add(p.id);
+        }
+      }
+      for (const id of [...pinned]) {
+        if (!alive.has(id)) {
+          this.unpin(r, id, 0.1);
+          pinned.delete(id);
+          st.posted.delete(id);
+        }
+      }
+      this.simPinned.set(r, pinned);
+    }
+  }
+  releaseSim(r) {
+    const pinned = this.simPinned.get(r);
+    if (!pinned?.size) return;
+    for (const id of pinned) this.unpin(r, id, 0.1);
+    pinned.clear();
   }
   // ------------------------------------------------------------- layout
   /** Folder tree of index notes; folders without an index are skipped through. */
@@ -1932,7 +2251,8 @@ var GraphTree = class {
       this.releaseHeld(r);
       const buttonMode = s.layoutMode === "button";
       const sorting = this.sorting.has(r);
-      if (++this.slimeFrame % 2 === 0) this.slimeTick(r);
+      const bubbles = this.bubblesOn() ? this.sim.get(r)?.bubbles : void 0;
+      if (!bubbles && ++this.slimeFrame % 2 === 0) this.slimeTick(r);
       const anchors = buttonMode ? this.kept.get(r) : this.sent.get(r);
       const outsidersRule = !buttonMode || sorting || !!anchors?.size;
       const membersRule = !buttonMode || sorting;
@@ -1953,7 +2273,8 @@ var GraphTree = class {
       }
       const pad2 = this.plugin.modules.unit * 0.6 * s.moduleSize;
       const walls = [];
-      for (const m of modules.list) {
+      if (bubbles) for (const b of bubbles) walls.push({ id: b.id, x: b.x, y: b.y, R: b.R });
+      for (const m of bubbles ? [] : modules.list) {
         const placed = s.moduleSeparate ? modules.centers.get(m.id) : void 0;
         if (placed?.hold) {
           walls.push({ id: m.id, x: placed.x, y: placed.y, R: placed.hold });
@@ -1982,6 +2303,7 @@ var GraphTree = class {
         const own = owner.get(n.id);
         const orphan = !linked.has(n.id);
         const small = own ? (memberCount.get(own) ?? 0) < 6 : false;
+        if (bubbles && own) continue;
         const home = own && (membersRule || orphan || small) ? walls.find((w) => w.id === own) : void 0;
         if (home) {
           const dx = n.x - home.x;
@@ -2633,6 +2955,21 @@ var GraphFx = class {
         R = modules.barrierRadius(pts.length, dists);
         void dists;
       };
+      const bubble = this.plugin.graphTree.bubbleOf(e.def.id);
+      if (bubble) {
+        const pts2 = circlePoints({ x: bubble.x, y: bubble.y }, bubble.R, 48);
+        const target = polarRadii(pts2, { x: bubble.x, y: bubble.y }, MOD_RAYS);
+        if (!st) {
+          st = { cx: bubble.x, cy: bubble.y, radii: target, born: now, last: now };
+          layer.modState.set(e.def.id, st);
+        } else {
+          st.cx = bubble.x;
+          st.cy = bubble.y;
+          st.radii = target;
+        }
+        st.last = now;
+        return st;
+      }
       if (placed?.hold) {
         cx = placed.x;
         cy = placed.y;
@@ -2780,7 +3117,7 @@ var GraphFx = class {
       const labelBoxes = [];
       const states = mods.entries.map((e) => this.stepModule(layer, e, now));
       const maxRad = states.map((st) => st ? Math.max(...st.radii) : 0);
-      const slime = s.moduleSeparate;
+      const slime = s.moduleSeparate && !this.plugin.graphTree.bubblesOn();
       const gapWorld = 3 / Math.max(S, 1e-6);
       mods.entries.forEach((e, idx) => {
         const st = states[idx];
@@ -3373,6 +3710,8 @@ var DEFAULT_SETTINGS = {
   moduleLine: "zigzag",
   moduleLineWidth: 1,
   moduleSolid: true,
+  moduleBubbles: true,
+  moduleFloat: 0.25,
   moduleSize: 1,
   moduleFill: true,
   moduleLabels: true,
@@ -3876,6 +4215,23 @@ var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
         await changed();
       })
     );
+    new import_obsidian8.Setting(containerEl).setName("\u041C\u043E\u0434\u0443\u043B\u0438-\u043F\u0443\u0437\u044B\u0440\u0438").setDesc(
+      "\u041C\u043E\u0434\u0443\u043B\u044C \u2014 \u043F\u0443\u0437\u044B\u0440\u044C \u0441\u0432\u043E\u0435\u0433\u043E \u0440\u0430\u0437\u043C\u0435\u0440\u0430 (\u043F\u043E \u0447\u0438\u0441\u043B\u0443 \u0437\u0430\u043C\u0435\u0442\u043E\u043A): \u0435\u0433\u043E \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u043F\u043B\u0430\u0432\u0430\u044E\u0442 \u0432\u043D\u0443\u0442\u0440\u0438 \u0438 \u043E\u0442\u0441\u043A\u0430\u043A\u0438\u0432\u0430\u044E\u0442 \u043E\u0442 \u0441\u0442\u0435\u043D\u043A\u0438, \u043F\u0443\u0437\u044B\u0440\u0438 \u0441\u0442\u0430\u043B\u043A\u0438\u0432\u0430\u044E\u0442\u0441\u044F \u0438 \u0440\u0430\u0441\u0442\u0430\u043B\u043A\u0438\u0432\u0430\u044E\u0442 \u0434\u0440\u0443\u0433 \u0434\u0440\u0443\u0433\u0430, \u043D\u0435 \u043D\u0430\u043A\u043B\u0430\u0434\u044B\u0432\u0430\u044F\u0441\u044C \u0438 \u043D\u0435 \u0441\u0436\u0438\u043C\u0430\u044F\u0441\u044C. \u0417\u0430\u043C\u0435\u0442\u043A\u0438 \u0432\u043D\u0435 \u043C\u043E\u0434\u0443\u043B\u0435\u0439 \u0436\u0438\u0432\u0443\u0442 \u043E\u0431\u044B\u0447\u043D\u043E\u0439 \u0444\u0438\u0437\u0438\u043A\u043E\u0439 \u0433\u0440\u0430\u0444\u0430."
+    ).addToggle(
+      (t) => t.setValue(s.moduleBubbles).onChange(async (v) => {
+        s.moduleBubbles = v;
+        await changed();
+        this.display();
+      })
+    );
+    if (s.moduleBubbles) {
+      new import_obsidian8.Setting(containerEl).setName("\u041F\u043B\u0430\u0432\u0430\u043D\u0438\u0435 \u0437\u0430\u043C\u0435\u0442\u043E\u043A").setDesc("\u041D\u0430\u0441\u043A\u043E\u043B\u044C\u043A\u043E \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0434\u0440\u0435\u0439\u0444\u0443\u044E\u0442 \u0432\u043D\u0443\u0442\u0440\u0438 \u043F\u0443\u0437\u044B\u0440\u044F. 0 \u2014 \u0443\u0441\u043F\u043E\u043A\u0430\u0438\u0432\u0430\u044E\u0442\u0441\u044F \u0438 \u0437\u0430\u043C\u0438\u0440\u0430\u044E\u0442 (\u043C\u0435\u043D\u044C\u0448\u0435 \u043D\u0430\u0433\u0440\u0443\u0437\u043A\u0430, \u043E\u0441\u043E\u0431\u0435\u043D\u043D\u043E \u043D\u0430 \u0442\u0435\u043B\u0435\u0444\u043E\u043D\u0435).").addSlider(
+        (sl) => sl.setLimits(0, 1, 0.05).setValue(s.moduleFloat).setDynamicTooltip().onChange(async (v) => {
+          s.moduleFloat = v;
+          await changed();
+        })
+      );
+    }
     new import_obsidian8.Setting(containerEl).setName("\u041E\u0442\u0434\u0435\u043B\u044C\u043D\u043E\u0435 \u043C\u0435\u0441\u0442\u043E \u0434\u043B\u044F \u043A\u0430\u0436\u0434\u043E\u0433\u043E \u043C\u043E\u0434\u0443\u043B\u044F").setDesc(
       "\u041C\u043E\u0434\u0443\u043B\u0438 \u043D\u0435 \u0437\u0430\u0445\u043E\u0434\u044F\u0442 \u0434\u0440\u0443\u0433 \u0432 \u0434\u0440\u0443\u0433\u0430: \u0438\u0445 \u0440\u0430\u0437\u0434\u0432\u0438\u0433\u0430\u0435\u0442, \u043F\u043E\u043A\u0430 \u0431\u0430\u0440\u044C\u0435\u0440\u044B \u043D\u0435 \u043F\u0435\u0440\u0435\u0441\u0442\u0430\u043D\u0443\u0442 \u043F\u0435\u0440\u0435\u0441\u0435\u043A\u0430\u0442\u044C\u0441\u044F (\u0441\u0442\u043E\u044F\u0442\u044C \u0432\u043F\u043B\u043E\u0442\u043D\u0443\u044E \u043C\u043E\u0436\u043D\u043E). \u0417\u0430\u043C\u0435\u0442\u043A\u0430 \u0432\u0445\u043E\u0434\u0438\u0442 \u0442\u043E\u043B\u044C\u043A\u043E \u0432 \u043E\u0434\u0438\u043D \u043C\u043E\u0434\u0443\u043B\u044C \u2014 \u0441\u0430\u043C\u044B\u0439 \u043A\u043E\u043D\u043A\u0440\u0435\u0442\u043D\u044B\u0439 (\u043F\u043E\u0434\u043F\u0430\u043F\u043A\u0430 \u0432\u0430\u0436\u043D\u0435\u0435 \u043F\u0430\u043F\u043A\u0438, \u0442\u0435\u0433 \u0432\u0430\u0436\u043D\u0435\u0435 \u043F\u0430\u043F\u043A\u0438). \u0427\u0443\u0436\u0438\u0435 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u0432\u044B\u0442\u0430\u043B\u043A\u0438\u0432\u0430\u044E\u0442\u0441\u044F \u0437\u0430 \u0431\u0430\u0440\u044C\u0435\u0440."
     ).addToggle(

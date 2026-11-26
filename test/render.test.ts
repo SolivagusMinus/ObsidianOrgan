@@ -332,3 +332,37 @@ test("slime contact: touching barriers meet at a flat shared edge", () => {
 	// the bigger module gets more room: the edge moves towards the smaller one
 	assert.ok(slimeClamp(a, 140, 0, 140, [{ x: 150, y: 0, R: 60 }], 0) > 75);
 });
+
+// ---------------------------------------------------------------- bubbles (module physics)
+import { Bubble, bubbleRadius, spiralSpot, stepBubbles } from "../src/module-sim";
+
+const mkBubble = (id: string, x: number, n: number, unit = 60): Bubble => {
+	const R = bubbleRadius(n, unit);
+	return {
+		id, x, y: 0, vx: 0, vy: 0, R, homeX: x, homeY: 0,
+		notes: Array.from({ length: n }, (_, i) => ({ id: `${id}${i}`, ...((p) => ({ rx: p.x, ry: p.y }))(spiralSpot(i, n, R)), vx: 0, vy: 0, seed: i })),
+	};
+};
+
+test("bubbles: notes never leave, bubbles never overlap or shrink", () => {
+	// three bubbles started on top of each other, notes kicked outwards
+	const bs = [mkBubble("a", 0, 40), mkBubble("b", 30, 4), mkBubble("c", -20, 12)];
+	const radii = bs.map((b) => b.R);
+	bs.forEach((b) => b.notes.forEach((p) => { p.vx = (p.rx || 1) * 50; p.vy = (p.ry || 1) * 50; }));
+	for (let i = 0; i < 600; i++) stepBubbles(bs, 1 / 30, { unit: 60, gap: 10, float: 0.5, t: i / 30 });
+	assert.deepEqual(bs.map((b) => b.R), radii, "sizes are fixed");
+	for (let i = 0; i < bs.length; i++)
+		for (let j = i + 1; j < bs.length; j++) {
+			const d = Math.hypot(bs[i].x - bs[j].x, bs[i].y - bs[j].y);
+			assert.ok(d >= bs[i].R + bs[j].R + 10 - 1, `bubbles ${i}/${j} apart: ${d.toFixed(0)}`);
+		}
+	for (const b of bs) for (const p of b.notes) assert.ok(Math.hypot(p.rx, p.ry) <= b.R, "note inside its bubble");
+});
+
+test("bubbles: without drift everything comes to rest", () => {
+	const bs = [mkBubble("a", 0, 20), mkBubble("b", 500, 6)];
+	let move = Infinity;
+	for (let i = 0; i < 900; i++) move = stepBubbles(bs, 1 / 30, { unit: 60, gap: 10, float: 0, t: i / 30 });
+	assert.ok(move < 0.05, `at rest (${move})`);
+	assert.ok(bubbleRadius(100, 60) > bubbleRadius(4, 60));
+});

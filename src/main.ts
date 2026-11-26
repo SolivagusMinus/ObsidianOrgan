@@ -268,6 +268,12 @@ export default class FolderHubPlugin extends Plugin {
 		this.settings.branchDirections = { ...(settings.branchDirections ?? {}) };
 		this.settings.managedGraphQueries = [...(settings.managedGraphQueries ?? [])];
 		this.settings.modules = (settings.modules ?? []).map((m) => ({ ...m }));
+		// Migration 2: bubbles were on by default in 1.11 and misplaced notes in
+		// real graphs — switch them off once (they stay available as an option).
+		if ((settings.settingsRev ?? 0) < 2) {
+			this.settings.moduleBubbles = false;
+			this.settings.settingsRev = 2;
+		}
 		this.lastCalendarSig = this.calendarSignature();
 		this.lastTreeSig = this.treeSignature();
 	}

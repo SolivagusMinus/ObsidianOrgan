@@ -94,8 +94,10 @@ export interface FolderHubSettings {
 	moduleLineWidth: number;
 	/** Solid barriers: members can't leave their module, other notes can't get in. */
 	moduleSolid: boolean;
-	/** Modules as bubbles with their own physics (notes float inside, bubbles collide). */
+	/** Modules as bubbles with their own physics (notes float inside, bubbles collide). Experimental. */
 	moduleBubbles: boolean;
+	/** Settings migrations already applied. */
+	settingsRev: number;
 	/** 0..1 — how much notes drift inside their bubble. */
 	moduleFloat: number;
 	moduleSize: number;
@@ -190,8 +192,9 @@ export const DEFAULT_SETTINGS: FolderHubSettings = {
 	moduleLine: "zigzag",
 	moduleLineWidth: 1,
 	moduleSolid: true,
-	moduleBubbles: true,
+	moduleBubbles: false,
 	moduleFloat: 0.25,
+	settingsRev: 2,
 	moduleSize: 1,
 	moduleFill: true,
 	moduleLabels: true,
@@ -1049,7 +1052,7 @@ export class FolderHubSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Модули-пузыри")
+			.setName("Модули-пузыри (экспериментально)")
 			.setDesc(
 				"Модуль — пузырь своего размера (по числу заметок): его заметки плавают внутри и отскакивают от стенки, " +
 					"пузыри сталкиваются и расталкивают друг друга, не накладываясь и не сжимаясь. Заметки вне модулей живут обычной физикой графа.",

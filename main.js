@@ -3713,8 +3713,9 @@ var DEFAULT_SETTINGS = {
   moduleLine: "zigzag",
   moduleLineWidth: 1,
   moduleSolid: true,
-  moduleBubbles: true,
+  moduleBubbles: false,
   moduleFloat: 0.25,
+  settingsRev: 2,
   moduleSize: 1,
   moduleFill: true,
   moduleLabels: true,
@@ -4218,7 +4219,7 @@ var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
         await changed();
       })
     );
-    new import_obsidian8.Setting(containerEl).setName("\u041C\u043E\u0434\u0443\u043B\u0438-\u043F\u0443\u0437\u044B\u0440\u0438").setDesc(
+    new import_obsidian8.Setting(containerEl).setName("\u041C\u043E\u0434\u0443\u043B\u0438-\u043F\u0443\u0437\u044B\u0440\u0438 (\u044D\u043A\u0441\u043F\u0435\u0440\u0438\u043C\u0435\u043D\u0442\u0430\u043B\u044C\u043D\u043E)").setDesc(
       "\u041C\u043E\u0434\u0443\u043B\u044C \u2014 \u043F\u0443\u0437\u044B\u0440\u044C \u0441\u0432\u043E\u0435\u0433\u043E \u0440\u0430\u0437\u043C\u0435\u0440\u0430 (\u043F\u043E \u0447\u0438\u0441\u043B\u0443 \u0437\u0430\u043C\u0435\u0442\u043E\u043A): \u0435\u0433\u043E \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u043F\u043B\u0430\u0432\u0430\u044E\u0442 \u0432\u043D\u0443\u0442\u0440\u0438 \u0438 \u043E\u0442\u0441\u043A\u0430\u043A\u0438\u0432\u0430\u044E\u0442 \u043E\u0442 \u0441\u0442\u0435\u043D\u043A\u0438, \u043F\u0443\u0437\u044B\u0440\u0438 \u0441\u0442\u0430\u043B\u043A\u0438\u0432\u0430\u044E\u0442\u0441\u044F \u0438 \u0440\u0430\u0441\u0442\u0430\u043B\u043A\u0438\u0432\u0430\u044E\u0442 \u0434\u0440\u0443\u0433 \u0434\u0440\u0443\u0433\u0430, \u043D\u0435 \u043D\u0430\u043A\u043B\u0430\u0434\u044B\u0432\u0430\u044F\u0441\u044C \u0438 \u043D\u0435 \u0441\u0436\u0438\u043C\u0430\u044F\u0441\u044C. \u0417\u0430\u043C\u0435\u0442\u043A\u0438 \u0432\u043D\u0435 \u043C\u043E\u0434\u0443\u043B\u0435\u0439 \u0436\u0438\u0432\u0443\u0442 \u043E\u0431\u044B\u0447\u043D\u043E\u0439 \u0444\u0438\u0437\u0438\u043A\u043E\u0439 \u0433\u0440\u0430\u0444\u0430."
     ).addToggle(
       (t) => t.setValue(s.moduleBubbles).onChange(async (v) => {
@@ -4558,6 +4559,10 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
     this.settings.branchDirections = { ...settings.branchDirections ?? {} };
     this.settings.managedGraphQueries = [...settings.managedGraphQueries ?? []];
     this.settings.modules = (settings.modules ?? []).map((m) => ({ ...m }));
+    if ((settings.settingsRev ?? 0) < 2) {
+      this.settings.moduleBubbles = false;
+      this.settings.settingsRev = 2;
+    }
     this.lastCalendarSig = this.calendarSignature();
     this.lastTreeSig = this.treeSignature();
   }

@@ -133,12 +133,14 @@ export class GraphTree {
 		// Modules: keep member notes inside their barrier.
 		this.holdTimer = window.setInterval(() => this.holdTick(), 150);
 		// Module bubbles: their own little physics, ~20 updates a second.
-		this.plugin.registerInterval(window.setInterval(() => this.simTick(), 50));
+		this.simTimer = window.setInterval(() => this.simTick(), 50);
+		this.plugin.registerInterval(this.simTimer);
 		this.plugin.registerInterval(this.holdTimer);
 	}
 
 	stop() {
 		if (this.holdTimer !== null) window.clearInterval(this.holdTimer);
+		if (this.simTimer !== null) window.clearInterval(this.simTimer);
 		for (const [r, ids] of this.holdRelease) for (const id of ids) this.unpin(r, id);
 		this.holdRelease.clear();
 		for (const r of this.held.keys()) this.releaseHeld(r);
@@ -611,6 +613,7 @@ export class GraphTree {
 	// ------------------------------------------------------------- bubbles
 
 	private sim = new Map<GraphRenderer, SimState>();
+	private simTimer: number | null = null;
 	/** Notes currently pinned by the bubble physics, per graph. */
 	private simPinned = new Map<GraphRenderer, Set<string>>();
 

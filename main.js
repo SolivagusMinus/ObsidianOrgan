@@ -1471,6 +1471,7 @@ var GraphTree = class {
     this.lastApply = { at: 0, note: "\u0435\u0449\u0451 \u043D\u0435 \u0431\u044B\u043B\u043E" };
     // ------------------------------------------------------------- bubbles
     this.sim = /* @__PURE__ */ new Map();
+    this.simTimer = null;
     /** Notes currently pinned by the bubble physics, per graph. */
     this.simPinned = /* @__PURE__ */ new Map();
     this.slimeFrame = 0;
@@ -1501,11 +1502,13 @@ var GraphTree = class {
     this.scan();
     void this.syncColorGroups(false, false);
     this.holdTimer = window.setInterval(() => this.holdTick(), 150);
-    this.plugin.registerInterval(window.setInterval(() => this.simTick(), 50));
+    this.simTimer = window.setInterval(() => this.simTick(), 50);
+    this.plugin.registerInterval(this.simTimer);
     this.plugin.registerInterval(this.holdTimer);
   }
   stop() {
     if (this.holdTimer !== null) window.clearInterval(this.holdTimer);
+    if (this.simTimer !== null) window.clearInterval(this.simTimer);
     for (const [r, ids] of this.holdRelease) for (const id of ids) this.unpin(r, id);
     this.holdRelease.clear();
     for (const r of this.held.keys()) this.releaseHeld(r);

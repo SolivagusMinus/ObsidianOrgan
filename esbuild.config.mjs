@@ -12,6 +12,7 @@ if (mode === "test") {
 		format: "esm",
 		outdir: "test-dist",
 		outExtension: { ".js": ".mjs" },
+		alias: { obsidian: "./test/obsidian-stub.ts" },
 		logLevel: "info",
 	});
 	process.exit(0);

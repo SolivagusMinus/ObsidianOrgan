@@ -1183,7 +1183,35 @@ export class FolderHubSettingTab extends PluginSettingTab {
 						.setIcon("trash-2")
 						.setTooltip("Удалить модуль")
 						.onClick(async () => {
-							s.modules.splice(i, 1);
+							// Its sub-modules move up one level instead of disappearing.
+							this.plugin.modules.remove(m.id);
+							await changed();
+							this.display();
+						}),
+				);
+
+			// Sub-module: divides a module into chapters/topics inside its barrier.
+			const mods = this.plugin.modules;
+			const below = new Set([m.id, ...mods.descendants(m.id).map((d) => d.id)]);
+			const parentOptions: Record<string, string> = { "": "— нет, отдельный модуль —" };
+			for (const o of s.modules) {
+				if (below.has(o.id)) continue; // not itself or its own sub-modules (no loops)
+				parentOptions[o.id] = `${"› ".repeat(mods.depth(o.id))}${o.name || "Без названия"}`;
+			}
+			new Setting(box)
+				.setName("Внутри модуля")
+				.setDesc(
+					m.parent && mods.parentOf(m.id)
+						? "Подмодуль: лежит внутри барьера родителя и берёт только его заметки (глава, тема)."
+						: "Сделать подмодулем: он разделит выбранный модуль на части внутри его барьера.",
+				)
+				.addDropdown((d) =>
+					d
+						.addOptions(parentOptions)
+						.setValue(m.parent && parentOptions[m.parent] ? m.parent : "")
+						.onChange(async (v) => {
+							m.parent = v || undefined;
+							mods.invalidate();
 							await changed();
 							this.display();
 						}),

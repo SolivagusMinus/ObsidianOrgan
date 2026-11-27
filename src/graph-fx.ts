@@ -67,6 +67,9 @@ interface Lists {
 /** A module's member nodes in one graph. */
 interface ModEntry {
 	def: ModuleDef;
+	/** Parent module id (sub-modules) and depth in the module tree. */
+	parent?: string;
+	depth: number;
 	nodes: FxNode[];
 	colorFn: (a: number) => string;
 }
@@ -400,19 +403,21 @@ export class GraphFx {
 	private modEntries(layer: Layer, lists: Lists): ModCache {
 		const modules = this.plugin.modules;
 		const defs = this.plugin.settings.modules;
-		const key = defs.map((d) => `${d.id}|${d.color}|${d.line}|${d.kind}|${d.value}`).join(";");
+		const key = defs.map((d) => `${d.id}|${d.color}|${d.line}|${d.kind}|${d.value}|${d.parent ?? ""}`).join(";");
 		const c = layer.mods;
 		if (c && c.version === modules.version && c.defsRef === defs && c.defsKey === key && c.listsRef === lists) return c;
-		const members = modules.members();
 		const entries: ModEntry[] = [];
 		for (const def of defs) {
-			const set = members.get(def.id);
-			if (!set?.size) continue;
+			// A barrier holds its sub-modules' notes too.
+			const set = modules.allMembers(def.id);
+			if (!set.size) continue;
 			const nodes: FxNode[] = [];
 			for (const [id, n] of lists.byId) if (set.has(id)) nodes.push(n);
 			if (!nodes.length) continue;
-			entries.push({ def, nodes, colorFn: this.rgbaFn(def.color) });
+			entries.push({ def, parent: modules.parentOf(def.id)?.id, depth: modules.depth(def.id), nodes, colorFn: this.rgbaFn(def.color) });
 		}
+		// Parents are drawn first, their sub-modules on top.
+		entries.sort((a, b) => a.depth - b.depth);
 		// Forget barriers of modules that are gone, so they animate in again if re-added.
 		const alive = new Set(entries.map((e) => e.def.id));
 		for (const id of [...layer.modState.keys()]) if (!alive.has(id)) layer.modState.delete(id);
@@ -421,14 +426,14 @@ export class GraphFx {
 	}
 
 	/** Moves the barrier's radii towards the current outline of its notes. */
-	private stepModule(layer: Layer, e: ModEntry, now: number): ModState {
+	private stepModule(layer: Layer, e: ModEntry, now: number, kids: ModState[] = []): ModState {
 		const s = this.plugin.settings;
 		let st = layer.modState.get(e.def.id);
 		// Big modules: recompute the target every few frames (blending hides it).
 		const recompute = !st || e.nodes.length <= 400 || layer.frame % 3 === 0;
 		if (recompute) {
 			let pts = e.nodes.map((n) => ({ x: n.x, y: n.y })).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
-			const pad = this.plugin.modules.unit * 0.6 * s.moduleSize;
+			const pad = this.plugin.modules.unit * 0.6 * s.moduleSize * (e.depth ? 0.5 : 1);
 			const modules = this.plugin.modules;
 			const placed = s.moduleSeparate ? modules.centers.get(e.def.id) : undefined;
 			let cx = 0;
@@ -474,6 +479,12 @@ export class GraphFx {
 				if (pts.length && inPlace < Math.max(1, Math.ceil(pts.length * 0.3))) aroundNotes();
 			} else {
 				aroundNotes();
+			}
+			// A parent's barrier goes around its sub-modules' barriers, never through them.
+			for (const k of kids) {
+				const kr = Math.max(...k.radii) + pad * 0.3;
+				R = Math.max(R, Math.hypot(k.cx - cx, k.cy - cy) + kr);
+				pts.push(...circlePoints({ x: k.cx, y: k.cy }, kr, 12));
 			}
 			// Notes dragged far away by links to other modules stay outside the
 			// barrier instead of stretching it into a band.
@@ -642,7 +653,14 @@ export class GraphFx {
 			const intro = s.animations ? s.moduleIntro : "none";
 			const labelBoxes: { x: number; y: number; w: number; h: number }[] = [];
 			// All barriers first, so each can press against its neighbours ("slime").
-			const states = mods.entries.map((e) => this.stepModule(layer, e, now));
+			// Sub-modules first (they come last), so their parents can wrap around them.
+			const states: ModState[] = new Array(mods.entries.length);
+			for (let i = mods.entries.length - 1; i >= 0; i--) {
+				const e = mods.entries[i];
+				const kids: ModState[] = [];
+				for (let j = i + 1; j < mods.entries.length; j++) if (mods.entries[j].parent === e.def.id && states[j]) kids.push(states[j]);
+				states[i] = this.stepModule(layer, e, now, kids);
+			}
 			const maxRad = states.map((st) => (st ? Math.max(...st.radii) : 0));
 			// Bubbles never overlap (their physics keeps them apart), so no flattening.
 			const slime = s.moduleSeparate && !this.plugin.graphTree.bubblesOn();
@@ -650,8 +668,10 @@ export class GraphFx {
 			mods.entries.forEach((e, idx) => {
 				const st = states[idx];
 				if (!st) return;
+				// Only siblings press against each other: a sub-module lies inside its
+				// parent, not against it.
 				const neighbours = slime
-					? states.flatMap((o, j) => (o && j !== idx ? [{ x: o.cx, y: o.cy, R: maxRad[j] }] : []))
+					? states.flatMap((o, j) => (o && j !== idx && mods.entries[j].parent === e.parent ? [{ x: o.cx, y: o.cy, R: maxRad[j] }] : []))
 					: [];
 				const age = (now - st.born) / 1000;
 
@@ -696,7 +716,8 @@ export class GraphFx {
 					color: e.colorFn,
 					t,
 					animate,
-					width: s.moduleLineWidth,
+					// Sub-modules: thinner lines, so chapters read as parts of the book.
+					width: s.moduleLineWidth * Math.pow(0.7, e.depth),
 					seed: idx + 1,
 				});
 				ctx.restore();
@@ -719,7 +740,7 @@ export class GraphFx {
 					const top = screen[0]; // index 0 points straight up
 					const label = `${e.def.name} · ${e.nodes.length}`;
 					ctx.globalAlpha = fade;
-					ctx.font = "600 12px var(--font-interface, sans-serif)";
+					ctx.font = `600 ${e.depth ? 11 : 12}px var(--font-interface, sans-serif)`;
 					const tw = ctx.measureText(label).width;
 					const lx = Math.min(Math.max(top.x - tw / 2, 4), w - tw - 4);
 					let ly = Math.max(top.y - 10, 16);

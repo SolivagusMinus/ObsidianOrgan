@@ -103,6 +103,18 @@ export default class FolderHubPlugin extends Plugin {
 			},
 		});
 		this.addCommand({
+			id: "submodule-from-current-folder",
+			name: "Граф: сделать папку текущей заметки подмодулем",
+			checkCallback: (checking) => {
+				const folder = this.app.workspace.getActiveFile()?.parent;
+				if (!folder || folder.isRoot()) return false;
+				const around = this.modules.moduleAroundFolder(folder);
+				if (!around) return false;
+				if (!checking) void this.toggleFolderModule(folder, true, around.id);
+				return true;
+			},
+		});
+		this.addCommand({
 			id: "toggle-modules",
 			name: "Граф: показать/скрыть модули",
 			callback: async () => {
@@ -223,13 +235,24 @@ export default class FolderHubPlugin extends Plugin {
 							.onClick(() => new ChooseIndexModal(this, file).open()),
 					);
 				}
-				const isModule = !!this.modules.findFolderModule(file);
+				const own = this.modules.findFolderModule(file);
+				const isModule = !!own;
 				menu.addItem((i) =>
 					i
 						.setTitle(isModule ? "Убрать модуль графа" : "Сделать модулем графа")
 						.setIcon(isModule ? "circle-off" : "circle-dashed")
 						.onClick(() => this.toggleFolderModule(file, !isModule)),
 				);
+				// A sub-folder of a module can become its sub-module (a chapter/topic).
+				const around = this.modules.moduleAroundFolder(file);
+				if (around && own?.parent !== around.id) {
+					menu.addItem((i) =>
+						i
+							.setTitle(`Сделать подмодулем «${around.name}»`)
+							.setIcon("circle-dot")
+							.onClick(() => this.toggleFolderModule(file, true, around.id)),
+					);
+				}
 			}),
 		);
 
@@ -314,7 +337,7 @@ export default class FolderHubPlugin extends Plugin {
 		return JSON.stringify([
 			s.skillTreeEnabled, s.skillTreeStyle, s.skillTreeStep, s.skillTreeSpread,
 			s.skillTreePinFiles, s.branchDirections, s.indexName, s.excludedFolders, s.graphFreeze,
-			s.moduleSeparate, s.moduleGap, s.moduleSize, s.modulesEnabled, s.modules.map((m) => [m.id, m.kind, m.value]),
+			s.moduleSeparate, s.moduleGap, s.moduleSize, s.modulesEnabled, s.modules.map((m) => [m.id, m.kind, m.value, m.parent ?? ""]),
 			s.layoutMode,
 		]);
 	}
@@ -337,10 +360,11 @@ export default class FolderHubPlugin extends Plugin {
 		}, 1000);
 	}
 
-	async toggleFolderModule(folder: TFolder, on: boolean) {
+	async toggleFolderModule(folder: TFolder, on: boolean, parentId?: string) {
 		if (on) {
-			const m = this.modules.addFolderModule(folder);
-			new Notice(`Модуль «${m.name}» добавлен в граф`);
+			const m = this.modules.addFolderModule(folder, parentId);
+			const parent = this.modules.parentOf(m.id);
+			new Notice(parent ? `Подмодуль «${m.name}» добавлен в модуль «${parent.name}»` : `Модуль «${m.name}» добавлен в граф`);
 		} else {
 			const m = this.modules.findFolderModule(folder);
 			if (m) this.modules.remove(m.id);

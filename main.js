@@ -1477,7 +1477,19 @@ var GraphTree = class {
     this.simTimer = null;
     /** Notes currently pinned by the bubble physics, per graph. */
     this.simPinned = /* @__PURE__ */ new Map();
+    // ------------------------------------------------------------- modules
+    /**
+     * Gives every module its own place: module circles (barrier radius + padding)
+     * are pushed apart until they don't overlap (touching is fine), starting from
+     * where they are now so the layout only shifts as much as needed. A module
+     * whose notes are pinned by the skill tree moves as a whole (the branch keeps
+     * its shape); otherwise one anchor note (the folder's index note if it is in
+     * the module) is pinned at the module's place and holding keeps the rest around it.
+     */
+    this.unitChanged = -Infinity;
     this.slimeFrame = 0;
+    /** Where each resting note was pinned. */
+    this.restAt = /* @__PURE__ */ new Map();
     /** When each note was last corrected by a wall (to calm notes that keep hitting it). */
     this.wallHits = /* @__PURE__ */ new Map();
     /** Smoothed module sizes for collisions, so jittering notes don't shake the modules. */
@@ -1958,14 +1970,14 @@ var GraphTree = class {
   buildSim(r, prev) {
     const s = this.plugin.settings;
     const modules = this.plugin.modules;
-    const members = modules.members();
     const nodes = r.nodes ?? [];
     const byId = new Map(nodes.map((n) => [n.id, n]));
     const median = (v) => v.length ? [...v].sort((a, b) => a - b)[v.length >> 1] : 0;
     const bubbles = [];
     const fresh = [];
     for (const m of modules.list) {
-      const ids = [...members.get(m.id) ?? []].filter((id) => byId.has(id));
+      if (modules.parentOf(m.id)) continue;
+      const ids = [...modules.allMembers(m.id)].filter((id) => byId.has(id));
       if (!ids.length) continue;
       const R = bubbleRadius(ids.length, modules.unit, s.moduleSize);
       const old = prev?.bubbles.find((b2) => b2.id === m.id);
@@ -2163,15 +2175,6 @@ var GraphTree = class {
     out.push(`\u2022 \u041A\u043E\u043C\u0430\u043D\u0434 \u0434\u0432\u0438\u0436\u043A\u0443: ${this.messagesSent}; \u043F\u043E\u0441\u043B\u0435\u0434\u043D\u044F\u044F \u0440\u0430\u0441\u043A\u043B\u0430\u0434\u043A\u0430: ${this.lastApply.at ? `${Math.round((performance.now() - this.lastApply.at) / 1e3)} \u0441 \u043D\u0430\u0437\u0430\u0434 \u2014 ${this.lastApply.note}` : this.lastApply.note}`);
     return out;
   }
-  // ------------------------------------------------------------- modules
-  /**
-   * Gives every module its own place: module circles (barrier radius + padding)
-   * are pushed apart until they don't overlap (touching is fine), starting from
-   * where they are now so the layout only shifts as much as needed. A module
-   * whose notes are pinned by the skill tree moves as a whole (the branch keeps
-   * its shape); otherwise one anchor note (the folder's index note if it is in
-   * the module) is pinned at the module's place and holding keeps the rest around it.
-   */
   withModules(r, base) {
     const s = this.plugin.settings;
     const modules = this.plugin.modules;
@@ -2182,67 +2185,119 @@ var GraphTree = class {
     const members = modules.members();
     const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
     const pad2 = this.plugin.modules.unit * 0.6 * s.moduleSize;
+    const owner = /* @__PURE__ */ new Map();
+    for (const [id, set] of members) for (const p of set) owner.set(p, id);
     const lens = [];
     const links = r.links ?? [];
     for (let i = 0; i < links.length && lens.length < 400; i += Math.max(1, Math.floor(links.length / 400))) {
       const l = links[i];
+      const a = l.source.id ? owner.get(l.source.id) : void 0;
+      const b = l.target.id ? owner.get(l.target.id) : void 0;
+      if (a && b && a !== b) continue;
       const d = Math.hypot(l.source.x - l.target.x, l.source.y - l.target.y);
       if (Number.isFinite(d) && d > 0) lens.push(d);
     }
     if (lens.length >= 5) {
       lens.sort((a, b) => a - b);
       const u = lens[lens.length >> 1];
-      if (Math.abs(u - modules.unit) / modules.unit > 0.2) modules.unit = Math.max(10, u);
+      const now = performance.now();
+      if (Math.abs(u - modules.unit) / modules.unit > 0.2) {
+        if (u < modules.unit || this.unitChanged === -Infinity) {
+          modules.unit = Math.max(10, u);
+          this.unitChanged = now;
+        } else if (now - this.unitChanged > 1e4) {
+          modules.unit = Math.min(u, modules.unit * 1.3);
+          this.unitChanged = now;
+        }
+      }
     }
     const pos = (id) => {
       const p = base.get(id) ?? nodeById.get(id);
       return Number.isFinite(p.x) && Number.isFinite(p.y) ? p : { x: 0, y: 0 };
     };
-    const infos = [];
+    const isIndex = (id) => {
+      const f = this.app.vault.getAbstractFileByPath(id);
+      return f instanceof import_obsidian5.TFile && this.plugin.isIndexNote(f);
+    };
+    const median = (v) => [...v].sort((a, b) => a - b)[v.length >> 1];
+    const infos = /* @__PURE__ */ new Map();
     for (const m of modules.list) {
-      const ids = [...members.get(m.id) ?? []].filter((id) => nodeById.has(id));
-      if (!ids.length) continue;
-      const anchor = ids.find((id) => {
-        const f = this.app.vault.getAbstractFileByPath(id);
-        return f instanceof import_obsidian5.TFile && this.plugin.isIndexNote(f);
-      }) ?? ids[0];
-      const pinnedIds = ids.filter((id) => base.has(id));
+      const all = [...modules.allMembers(m.id)].filter((id) => nodeById.has(id));
+      if (!all.length) continue;
+      const own = [...members.get(m.id) ?? []].filter((id) => nodeById.has(id));
+      const anchor = own.find(isIndex) ?? own[0] ?? "";
+      const pinnedIds = all.filter((id) => base.has(id));
       const baseC = pinnedIds.length ? centroid(pinnedIds.map((id) => base.get(id))) : null;
-      const c0 = baseC ?? {
-        x: ids.map((id) => pos(id).x).sort((a, b) => a - b)[ids.length >> 1],
-        y: ids.map((id) => pos(id).y).sort((a, b) => a - b)[ids.length >> 1]
-      };
-      const dists = ids.map((id) => Math.hypot(pos(id).x - c0.x, pos(id).y - c0.y));
-      let extent = modules.barrierRadius(ids.length, dists);
+      const cm = { x: median(all.map((id) => pos(id).x)), y: median(all.map((id) => pos(id).y)) };
+      const c0 = baseC ?? cm;
+      const dists = all.map((id) => Math.hypot(pos(id).x - cm.x, pos(id).y - cm.y));
+      let extent = modules.barrierRadius(all.length, dists);
       if (baseC) for (const id of pinnedIds) extent = Math.max(extent, Math.hypot(base.get(id).x - baseC.x, base.get(id).y - baseC.y) + 30);
-      infos.push({ id: m.id, ids, anchor, baseC, c0, bucket: Math.ceil(Math.log(Math.max(20, extent)) / Math.log(1.25)) });
+      const ownR = own.length ? modules.barrierRadius(own.length, own.map((id) => Math.hypot(pos(id).x - cm.x, pos(id).y - cm.y))) * 0.6 : 0;
+      infos.set(m.id, { id: m.id, own, all, anchor, baseC, c0, extent, ownR, children: [], parent: null, R: extent, rel: { x: 0, y: 0 } });
     }
-    const key = [modules.version, s.moduleSize, s.moduleGap, nodeById.size, infos.map((i) => `${i.id}:${i.bucket}:${i.anchor}`).join(",")].join("|");
+    for (const info of infos.values()) {
+      const p = modules.parentOf(info.id);
+      const pi = p ? infos.get(p.id) : void 0;
+      if (pi) {
+        info.parent = pi;
+        pi.children.push(info);
+      }
+    }
+    const quant = (r2) => Math.pow(1.25, Math.ceil(Math.log(Math.max(20, r2)) / Math.log(1.25)));
+    const arrange = (info) => {
+      for (const c of info.children) arrange(c);
+      let R = info.extent;
+      if (info.children.length) {
+        const inner = pad2 * 0.5;
+        const circles2 = info.children.map((c) => ({ x: c.c0.x, y: c.c0.y, r: c.R + inner, c }));
+        const middle = info.ownR ? { x: info.c0.x, y: info.c0.y, r: info.ownR, c: null } : null;
+        if (middle) circles2.push(middle);
+        separateCircles(circles2, s.moduleGap * 0.5);
+        const o = middle ?? info.c0;
+        for (const k of circles2) {
+          if (!k.c) continue;
+          k.c.rel = { x: k.x - o.x, y: k.y - o.y };
+          R = Math.max(R, Math.hypot(k.c.rel.x, k.c.rel.y) + k.r + inner);
+        }
+      }
+      info.R = quant(R);
+    };
+    const roots = [...infos.values()].filter((i) => !i.parent);
+    roots.forEach(arrange);
+    const key = [
+      modules.version,
+      s.moduleSize,
+      s.moduleGap,
+      nodeById.size,
+      [...infos.values()].map((i) => `${i.id}:${Math.round(i.R)}:${i.anchor}:${i.parent?.id ?? ""}`).join(",")
+    ].join("|");
     if (this.modLayout && this.modLayout.key === key && this.modLayout.base === base) return this.modLayout.target;
-    const circles = infos.map((info) => {
+    const circles = roots.map((info) => {
       const start = modules.centers.get(info.id) ?? info.c0;
-      return { x: start.x, y: start.y, r: Math.pow(1.25, info.bucket) + pad2, info };
+      return { x: start.x, y: start.y, r: info.R + pad2, info };
     });
     separateCircles(circles, s.moduleGap);
     const target = new Map(base);
     const alive = /* @__PURE__ */ new Set();
     this.moduleAnchors.clear();
-    for (const c of circles) {
-      const { info } = c;
+    const place = (info, x, y) => {
       alive.add(info.id);
-      this.moduleAnchors.set(info.id, info.anchor);
-      modules.centers.set(info.id, { x: c.x, y: c.y, hold: c.r - pad2 });
+      if (info.anchor) this.moduleAnchors.set(info.id, info.anchor);
+      modules.centers.set(info.id, { x, y, hold: info.R });
       if (info.baseC) {
-        const dx = c.x - info.baseC.x;
-        const dy = c.y - info.baseC.y;
-        for (const id of info.ids) {
+        const dx = x - info.c0.x;
+        const dy = y - info.c0.y;
+        for (const id of info.own) {
           const p = base.get(id);
           if (p) target.set(id, { x: p.x + dx, y: p.y + dy });
         }
-      } else {
-        target.set(info.anchor, { x: c.x, y: c.y });
+      } else if (info.anchor) {
+        target.set(info.anchor, { x, y });
       }
-    }
+      for (const c of info.children) place(c, x + c.rel.x, y + c.rel.y);
+    };
+    for (const c of circles) place(c.info, c.x, c.y);
     for (const id of [...modules.centers.keys()]) if (!alive.has(id)) modules.centers.delete(id);
     this.modLayout = { key, base, target };
     return target;
@@ -2294,23 +2349,36 @@ var GraphTree = class {
       }
       const pad2 = this.plugin.modules.unit * 0.6 * s.moduleSize;
       const walls = [];
-      if (bubbles) for (const b of bubbles) walls.push({ id: b.id, x: b.x, y: b.y, R: b.R });
+      if (bubbles) for (const b of bubbles) walls.push({ id: b.id, x: b.x, y: b.y, R: b.R, pad: pad2, depth: 0 });
       for (const m of bubbles ? [] : modules.list) {
+        const depth = modules.depth(m.id);
+        const wpad = depth ? pad2 * 0.5 : pad2;
         const placed = s.moduleSeparate ? modules.centers.get(m.id) : void 0;
         if (placed?.hold) {
-          walls.push({ id: m.id, x: placed.x, y: placed.y, R: placed.hold });
+          walls.push({ id: m.id, x: placed.x, y: placed.y, R: placed.hold, pad: wpad, depth });
           continue;
         }
-        const set = members.get(m.id);
+        const set = modules.allMembers(m.id);
         const nodes = set?.size ? r.nodes.filter((n) => set.has(n.id) && Number.isFinite(n.x)) : [];
         if (!nodes.length) continue;
         const anchorId = this.moduleAnchors.get(m.id);
         const ap = anchorId ? anchors?.get(anchorId) : void 0;
         const x = ap?.x ?? median(nodes.map((n) => n.x));
         const y = ap?.y ?? median(nodes.map((n) => n.y));
-        walls.push({ id: m.id, x, y, R: modules.barrierRadius(nodes.length, nodes.map((n) => Math.hypot(n.x - x, n.y - y))) });
+        walls.push({ id: m.id, x, y, R: modules.barrierRadius(nodes.length, nodes.map((n) => Math.hypot(n.x - x, n.y - y))), pad: wpad, depth });
       }
       if (!walls.length) continue;
+      walls.sort((a, b) => a.depth - b.depth);
+      const homeChain = /* @__PURE__ */ new Map();
+      const chainOf = (own) => {
+        let c = homeChain.get(own);
+        if (!c) {
+          c = /* @__PURE__ */ new Set([own]);
+          for (let p = modules.parentOf(own); p && c.size <= modules.list.length; p = modules.parentOf(p.id)) c.add(p.id);
+          homeChain.set(own, c);
+        }
+        return c;
+      };
       const resting = this.resting.get(r) ?? /* @__PURE__ */ new Set();
       this.resting.set(r, resting);
       const linked = /* @__PURE__ */ new Set();
@@ -2320,8 +2388,18 @@ var GraphTree = class {
       }
       const fixes = [];
       for (const n of r.nodes) {
-        if (pinned?.has(n.id) || frozen?.has(n.id) || resting.has(n.id) || !Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
         const own = owner.get(n.id);
+        if (resting.has(n.id) && own && !pinned?.has(n.id) && !bubbles && (membersRule || !linked.has(n.id) || (memberCount.get(own) ?? 0) < 6)) {
+          const home2 = walls.find((w) => w.id === own);
+          const at = this.restAt.get(n.id);
+          if (home2 && at && Math.hypot(at.x - home2.x, at.y - home2.y) > home2.R * 1.1) {
+            resting.delete(n.id);
+            this.restAt.delete(n.id);
+            this.unpin(r, n.id);
+            continue;
+          }
+        }
+        if (pinned?.has(n.id) || frozen?.has(n.id) || resting.has(n.id) || !Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
         const orphan = !linked.has(n.id);
         const small = own ? (memberCount.get(own) ?? 0) < 6 : false;
         if (bubbles && own) continue;
@@ -2337,14 +2415,15 @@ var GraphTree = class {
           }
         }
         if (!outsidersRule) continue;
+        const chain = own ? chainOf(own) : void 0;
         for (const w of walls) {
-          if (w.id === own) continue;
+          if (chain?.has(w.id)) continue;
           const dx = n.x - w.x;
           const dy = n.y - w.y;
           const d = Math.hypot(dx, dy) || 1e-3;
-          if (d < (w.R + pad2) * 0.95) {
-            const k = (w.R + pad2 + 10) / d;
-            fixes.push({ id: n.id, x: w.x + dx * k, y: w.y + dy * k, depth: w.R + pad2 - d });
+          if (d < (w.R + w.pad) * 0.95) {
+            const k = (w.R + w.pad + 10) / d;
+            fixes.push({ id: n.id, x: w.x + dx * k, y: w.y + dy * k, depth: w.R + w.pad - d });
             break;
           }
         }
@@ -2361,8 +2440,10 @@ var GraphTree = class {
         this.wallHits.set(f.id, hits);
         const rest = settle || hits.length >= 3;
         this.pin(r, f.id, f.x, f.y, rest ? Math.max(wake, 0.02) : wake);
-        if (rest) resting.add(f.id);
-        else release.add(f.id);
+        if (rest) {
+          resting.add(f.id);
+          this.restAt.set(f.id, { x: f.x, y: f.y });
+        } else release.add(f.id);
       }
       if (nudge) {
         this.lastNudge.set(r, now);
@@ -2384,49 +2465,76 @@ var GraphTree = class {
     const buttonMode = s.layoutMode === "button";
     const anchors = buttonMode ? this.kept.get(r) : this.sent.get(r);
     if (!anchors?.size) return;
-    const members = modules.members();
     const pad2 = modules.unit * 0.6 * s.moduleSize;
     const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
     const circles = [];
     for (const [mid, aid] of this.moduleAnchors) {
       const p = anchors.get(aid);
-      const set = members.get(mid);
-      if (!p || !set) continue;
+      if (!p) continue;
+      const set = modules.allMembers(mid);
       const dists = [];
       for (const id of set) {
         const n = nodeById.get(id);
         if (n && Number.isFinite(n.x) && Number.isFinite(n.y)) dists.push(Math.hypot(n.x - p.x, n.y - p.y));
       }
       if (!dists.length) continue;
-      const raw = modules.barrierRadius(dists.length, dists) + pad2;
+      const depth = modules.depth(mid);
+      const raw = modules.barrierRadius(dists.length, dists) + (depth ? pad2 * 0.5 : pad2);
       const prev = this.slimeRadius.get(mid);
-      const rad2 = prev === void 0 ? raw : prev + (raw - prev) * 0.2;
+      let rad2 = prev === void 0 ? raw : prev + (raw - prev) * 0.2;
       this.slimeRadius.set(mid, rad2);
-      circles.push({ x: p.x, y: p.y, r: rad2, aid, mid, ox: p.x, oy: p.y });
+      const placed = modules.centers.get(mid);
+      if (placed?.hold) rad2 = Math.max(rad2, placed.hold + (depth ? pad2 * 0.5 : pad2));
+      circles.push({ x: p.x, y: p.y, r: rad2, aid, mid, ox: p.x, oy: p.y, parent: modules.parentOf(mid)?.id, depth });
     }
+    const groups = /* @__PURE__ */ new Map();
+    for (const c of circles) {
+      const k = c.parent ?? "";
+      const g = groups.get(k);
+      if (g) g.push(c);
+      else groups.set(k, [c]);
+    }
+    const gapOf = (parent) => parent ? s.moduleGap * 0.5 : s.moduleGap;
     const now = performance.now();
     if (now - this.lastSlimePush < 1200 || this.slimeBudget <= 0) return;
+    const treeMode = !buttonMode && s.skillTreeEnabled;
     let overlap = false;
-    for (let i = 0; i < circles.length && !overlap; i++) {
-      for (let j = i + 1; j < circles.length; j++) {
-        const a = circles[i];
-        const b = circles[j];
-        if (Math.hypot(a.x - b.x, a.y - b.y) < (a.r + b.r + s.moduleGap) * 0.92) {
-          overlap = true;
-          break;
+    for (const [k, g] of groups) {
+      for (let i = 0; i < g.length && !overlap; i++) {
+        for (let j = i + 1; j < g.length; j++) {
+          if (Math.hypot(g[i].x - g[j].x, g[i].y - g[j].y) < (g[i].r + g[j].r + gapOf(k)) * 0.92) {
+            overlap = true;
+            break;
+          }
         }
       }
+      if (overlap) break;
     }
     if (!overlap) return;
-    separateCircles(circles, s.moduleGap, 40);
+    const byId = new Map(circles.map((c) => [c.mid, c]));
+    const keys = [...groups.keys()].sort((a, b) => (a ? modules.depth(a) + 1 : 0) - (b ? modules.depth(b) + 1 : 0));
+    for (const k of keys) {
+      const g = groups.get(k);
+      const parent = k ? byId.get(k) : void 0;
+      if (parent) {
+        const sx = parent.x - parent.ox;
+        const sy = parent.y - parent.oy;
+        for (const c of g) {
+          c.x += sx;
+          c.y += sy;
+        }
+      }
+      separateCircles(g, gapOf(k), 40);
+    }
     let moved = false;
+    const own = modules.members();
     for (const c of circles) {
       const dx = c.x - c.ox;
       const dy = c.y - c.oy;
       if (Math.hypot(dx, dy) < 1) continue;
       const sx = dx * 0.35;
       const sy = dy * 0.35;
-      const ids = !buttonMode && s.skillTreeEnabled ? [...members.get(c.mid) ?? []].filter((id) => anchors.has(id)) : [c.aid];
+      const ids = treeMode ? [...own.get(c.mid) ?? []].filter((id) => anchors.has(id)) : [c.aid];
       for (const id of ids) {
         const old = anchors.get(id);
         const p = { x: old.x + sx, y: old.y + sy };
@@ -2937,32 +3045,32 @@ var GraphFx = class {
   modEntries(layer, lists) {
     const modules = this.plugin.modules;
     const defs = this.plugin.settings.modules;
-    const key = defs.map((d) => `${d.id}|${d.color}|${d.line}|${d.kind}|${d.value}`).join(";");
+    const key = defs.map((d) => `${d.id}|${d.color}|${d.line}|${d.kind}|${d.value}|${d.parent ?? ""}`).join(";");
     const c = layer.mods;
     if (c && c.version === modules.version && c.defsRef === defs && c.defsKey === key && c.listsRef === lists) return c;
-    const members = modules.members();
     const entries = [];
     for (const def of defs) {
-      const set = members.get(def.id);
-      if (!set?.size) continue;
+      const set = modules.allMembers(def.id);
+      if (!set.size) continue;
       const nodes = [];
       for (const [id, n] of lists.byId) if (set.has(id)) nodes.push(n);
       if (!nodes.length) continue;
-      entries.push({ def, nodes, colorFn: this.rgbaFn(def.color) });
+      entries.push({ def, parent: modules.parentOf(def.id)?.id, depth: modules.depth(def.id), nodes, colorFn: this.rgbaFn(def.color) });
     }
+    entries.sort((a, b) => a.depth - b.depth);
     const alive = new Set(entries.map((e) => e.def.id));
     for (const id of [...layer.modState.keys()]) if (!alive.has(id)) layer.modState.delete(id);
     layer.mods = { version: modules.version, defsRef: defs, defsKey: key, listsRef: lists, entries };
     return layer.mods;
   }
   /** Moves the barrier's radii towards the current outline of its notes. */
-  stepModule(layer, e, now) {
+  stepModule(layer, e, now, kids = []) {
     const s = this.plugin.settings;
     let st = layer.modState.get(e.def.id);
     const recompute = !st || e.nodes.length <= 400 || layer.frame % 3 === 0;
     if (recompute) {
       let pts = e.nodes.map((n) => ({ x: n.x, y: n.y })).filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
-      const pad2 = this.plugin.modules.unit * 0.6 * s.moduleSize;
+      const pad2 = this.plugin.modules.unit * 0.6 * s.moduleSize * (e.depth ? 0.5 : 1);
       const modules = this.plugin.modules;
       const placed = s.moduleSeparate ? modules.centers.get(e.def.id) : void 0;
       let cx = 0;
@@ -2999,6 +3107,11 @@ var GraphFx = class {
         if (pts.length && inPlace < Math.max(1, Math.ceil(pts.length * 0.3))) aroundNotes();
       } else {
         aroundNotes();
+      }
+      for (const k of kids) {
+        const kr = Math.max(...k.radii) + pad2 * 0.3;
+        R = Math.max(R, Math.hypot(k.cx - cx, k.cy - cy) + kr);
+        pts.push(...circlePoints({ x: k.cx, y: k.cy }, kr, 12));
       }
       const core = pts.filter((p) => Math.hypot(p.x - cx, p.y - cy) <= R);
       pts = core.length ? core : [{ x: cx, y: cy }];
@@ -3136,14 +3249,20 @@ var GraphFx = class {
       const animate = s.moduleAnimate && s.animations;
       const intro = s.animations ? s.moduleIntro : "none";
       const labelBoxes = [];
-      const states = mods.entries.map((e) => this.stepModule(layer, e, now));
+      const states = new Array(mods.entries.length);
+      for (let i = mods.entries.length - 1; i >= 0; i--) {
+        const e = mods.entries[i];
+        const kids = [];
+        for (let j = i + 1; j < mods.entries.length; j++) if (mods.entries[j].parent === e.def.id && states[j]) kids.push(states[j]);
+        states[i] = this.stepModule(layer, e, now, kids);
+      }
       const maxRad = states.map((st) => st ? Math.max(...st.radii) : 0);
       const slime = s.moduleSeparate && !this.plugin.graphTree.bubblesOn();
       const gapWorld = 3 / Math.max(S, 1e-6);
       mods.entries.forEach((e, idx) => {
         const st = states[idx];
         if (!st) return;
-        const neighbours = slime ? states.flatMap((o, j) => o && j !== idx ? [{ x: o.cx, y: o.cy, R: maxRad[j] }] : []) : [];
+        const neighbours = slime ? states.flatMap((o, j) => o && j !== idx && mods.entries[j].parent === e.parent ? [{ x: o.cx, y: o.cy, R: maxRad[j] }] : []) : [];
         const age = (now - st.born) / 1e3;
         const scale = intro === "bubble" ? elasticOut(Math.min(1, age / 1.1)) : 1;
         let wobble = animate ? 0.012 : 0;
@@ -3180,7 +3299,8 @@ var GraphFx = class {
           color: e.colorFn,
           t,
           animate,
-          width: s.moduleLineWidth,
+          // Sub-modules: thinner lines, so chapters read as parts of the book.
+          width: s.moduleLineWidth * Math.pow(0.7, e.depth),
           seed: idx + 1
         });
         ctx.restore();
@@ -3200,7 +3320,7 @@ var GraphFx = class {
           const top = screen[0];
           const label = `${e.def.name} \xB7 ${e.nodes.length}`;
           ctx.globalAlpha = fade;
-          ctx.font = "600 12px var(--font-interface, sans-serif)";
+          ctx.font = `600 ${e.depth ? 11 : 12}px var(--font-interface, sans-serif)`;
           const tw = ctx.measureText(label).width;
           const lx = Math.min(Math.max(top.x - tw / 2, 4), w - tw - 4);
           let ly = Math.max(top.y - 10, 16);
@@ -3344,6 +3464,8 @@ var GraphModules = class {
     this.extra = /* @__PURE__ */ new Map();
     /** Where each module sits in the graph after separation (graph units). */
     this.centers = /* @__PURE__ */ new Map();
+    this.allFor = null;
+    this.allCache = /* @__PURE__ */ new Map();
     /** Typical link length of the current graph (graph units); measured by the layout. */
     this.unit = 60;
   }
@@ -3405,13 +3527,87 @@ var GraphModules = class {
       }
       out.set(m.id, set);
     }
-    const specificity = (m) => m.kind === "tag" ? 1e3 : (0, import_obsidian7.normalizePath)(m.value || "/").split("/").length;
+    for (const m of [...this.list].sort((a, b) => this.depth(a.id) - this.depth(b.id))) {
+      const p = this.parentOf(m.id);
+      if (!p) continue;
+      const mine = out.get(m.id);
+      const theirs = out.get(p.id);
+      if (mine && theirs) {
+        for (const path of [...mine]) if (!theirs.has(path)) mine.delete(path);
+      }
+    }
+    const specificity = (m) => this.depth(m.id) * 1e4 + (m.kind === "tag" ? 1e3 : (0, import_obsidian7.normalizePath)(m.value || "/").split("/").length);
     const order = [...this.list].sort((a, b) => specificity(b) - specificity(a));
     const owner = /* @__PURE__ */ new Map();
     for (const m of order) for (const path of out.get(m.id) ?? []) if (!owner.has(path)) owner.set(path, m.id);
     for (const [id, set] of out) for (const path of [...set]) if (owner.get(path) !== id) set.delete(path);
     this.cache = out;
     return out;
+  }
+  // ------------------------------------------------------- module tree
+  /** The parent module, if this is a sub-module (ignores broken or cyclic links). */
+  parentOf(id) {
+    const m = this.list.find((x) => x.id === id);
+    if (!m?.parent) return void 0;
+    const p = this.list.find((x) => x.id === m.parent);
+    if (!p) return void 0;
+    let cur = p;
+    for (let i = 0; i <= this.list.length && cur; i++) {
+      if (cur.id === id) return void 0;
+      cur = cur.parent ? this.list.find((x) => x.id === cur.parent) : void 0;
+    }
+    return p;
+  }
+  /** 0 for top-level modules, 1 for their sub-modules, … */
+  depth(id) {
+    let d = 0;
+    for (let p = this.parentOf(id); p && d <= this.list.length; p = this.parentOf(p.id)) d++;
+    return d;
+  }
+  children(id) {
+    return this.list.filter((m) => this.parentOf(m.id)?.id === id);
+  }
+  /** This module and every module below it. */
+  descendants(id) {
+    const out = [];
+    const walk = (pid) => {
+      for (const c of this.children(pid)) {
+        out.push(c);
+        walk(c.id);
+      }
+    };
+    walk(id);
+    return out;
+  }
+  /**
+   * Notes of a module including those of its sub-modules (what its barrier
+   * holds). Cached until membership changes — don't modify the returned set.
+   */
+  allMembers(id) {
+    const members = this.members();
+    if (this.allFor !== members) {
+      this.allFor = members;
+      this.allCache.clear();
+    }
+    let out = this.allCache.get(id);
+    if (!out) {
+      out = new Set(members.get(id) ?? []);
+      for (const d of this.descendants(id)) for (const p of members.get(d.id) ?? []) out.add(p);
+      this.allCache.set(id, out);
+    }
+    return out;
+  }
+  /** Deepest folder module whose folder contains `folder` (candidate parent for a sub-module). */
+  moduleAroundFolder(folder) {
+    let best;
+    for (const m of this.list) {
+      if (m.kind !== "folder" || !m.value.trim()) continue;
+      const p = (0, import_obsidian7.normalizePath)(m.value);
+      if (folder.path !== p && folder.path.startsWith(p + "/")) {
+        if (!best || p.length > (0, import_obsidian7.normalizePath)(best.value).length) best = m;
+      }
+    }
+    return best;
   }
   /** Barrier radius in graph units: grows with the number of notes, plus any widening. */
   radius(id, count) {
@@ -3463,13 +3659,18 @@ var GraphModules = class {
   }
   /** Colour groups for modules that paint their nodes, most specific first. */
   colorGroups() {
-    const depth = (m) => m.kind === "folder" ? m.value.split("/").length : 100;
+    const depth = (m) => this.depth(m.id) * 1e3 + (m.kind === "folder" ? m.value.split("/").length : 100);
     return this.list.filter((m) => m.colorNodes).sort((a, b) => depth(b) - depth(a)).map((m) => ({ query: this.query(m), color: m.color })).filter((g) => !!g.query);
   }
   /** Creates a module for a folder (or returns the existing one). */
-  addFolderModule(folder) {
+  addFolderModule(folder, parent) {
     const existing = this.list.find((m2) => m2.kind === "folder" && m2.value === folder.path);
-    if (existing) return existing;
+    if (existing) {
+      const below = /* @__PURE__ */ new Set([existing.id, ...this.descendants(existing.id).map((d) => d.id)]);
+      if (parent !== void 0 && !(parent && below.has(parent))) existing.parent = parent || void 0;
+      this.invalidate();
+      return existing;
+    }
     const m = {
       id: newModuleId(),
       name: folder.name,
@@ -3477,7 +3678,8 @@ var GraphModules = class {
       value: folder.path,
       color: MODULE_COLORS[this.list.length % MODULE_COLORS.length],
       colorNodes: true,
-      line: "default"
+      line: "default",
+      parent: parent || void 0
     };
     this.list.push(m);
     this.invalidate();
@@ -3487,7 +3689,9 @@ var GraphModules = class {
     return this.list.find((m) => m.kind === "folder" && m.value === folder.path);
   }
   remove(id) {
-    const i = this.list.findIndex((m) => m.id === id);
+    const m = this.list.find((x) => x.id === id);
+    for (const c of this.list) if (c.parent === id) c.parent = m?.parent;
+    const i = this.list.findIndex((x) => x.id === id);
     if (i >= 0) this.list.splice(i, 1);
     this.invalidate();
   }
@@ -4317,7 +4521,24 @@ var FolderHubSettingTab = class extends import_obsidian8.PluginSettingTab {
         })
       ).addExtraButton(
         (b) => b.setIcon("trash-2").setTooltip("\u0423\u0434\u0430\u043B\u0438\u0442\u044C \u043C\u043E\u0434\u0443\u043B\u044C").onClick(async () => {
-          s.modules.splice(i, 1);
+          this.plugin.modules.remove(m.id);
+          await changed();
+          this.display();
+        })
+      );
+      const mods = this.plugin.modules;
+      const below = /* @__PURE__ */ new Set([m.id, ...mods.descendants(m.id).map((d) => d.id)]);
+      const parentOptions = { "": "\u2014 \u043D\u0435\u0442, \u043E\u0442\u0434\u0435\u043B\u044C\u043D\u044B\u0439 \u043C\u043E\u0434\u0443\u043B\u044C \u2014" };
+      for (const o of s.modules) {
+        if (below.has(o.id)) continue;
+        parentOptions[o.id] = `${"\u203A ".repeat(mods.depth(o.id))}${o.name || "\u0411\u0435\u0437 \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u044F"}`;
+      }
+      new import_obsidian8.Setting(box).setName("\u0412\u043D\u0443\u0442\u0440\u0438 \u043C\u043E\u0434\u0443\u043B\u044F").setDesc(
+        m.parent && mods.parentOf(m.id) ? "\u041F\u043E\u0434\u043C\u043E\u0434\u0443\u043B\u044C: \u043B\u0435\u0436\u0438\u0442 \u0432\u043D\u0443\u0442\u0440\u0438 \u0431\u0430\u0440\u044C\u0435\u0440\u0430 \u0440\u043E\u0434\u0438\u0442\u0435\u043B\u044F \u0438 \u0431\u0435\u0440\u0451\u0442 \u0442\u043E\u043B\u044C\u043A\u043E \u0435\u0433\u043E \u0437\u0430\u043C\u0435\u0442\u043A\u0438 (\u0433\u043B\u0430\u0432\u0430, \u0442\u0435\u043C\u0430)." : "\u0421\u0434\u0435\u043B\u0430\u0442\u044C \u043F\u043E\u0434\u043C\u043E\u0434\u0443\u043B\u0435\u043C: \u043E\u043D \u0440\u0430\u0437\u0434\u0435\u043B\u0438\u0442 \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u044B\u0439 \u043C\u043E\u0434\u0443\u043B\u044C \u043D\u0430 \u0447\u0430\u0441\u0442\u0438 \u0432\u043D\u0443\u0442\u0440\u0438 \u0435\u0433\u043E \u0431\u0430\u0440\u044C\u0435\u0440\u0430."
+      ).addDropdown(
+        (d) => d.addOptions(parentOptions).setValue(m.parent && parentOptions[m.parent] ? m.parent : "").onChange(async (v) => {
+          m.parent = v || void 0;
+          mods.invalidate();
           await changed();
           this.display();
         })
@@ -4443,6 +4664,18 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
       }
     });
     this.addCommand({
+      id: "submodule-from-current-folder",
+      name: "\u0413\u0440\u0430\u0444: \u0441\u0434\u0435\u043B\u0430\u0442\u044C \u043F\u0430\u043F\u043A\u0443 \u0442\u0435\u043A\u0443\u0449\u0435\u0439 \u0437\u0430\u043C\u0435\u0442\u043A\u0438 \u043F\u043E\u0434\u043C\u043E\u0434\u0443\u043B\u0435\u043C",
+      checkCallback: (checking) => {
+        const folder = this.app.workspace.getActiveFile()?.parent;
+        if (!folder || folder.isRoot()) return false;
+        const around = this.modules.moduleAroundFolder(folder);
+        if (!around) return false;
+        if (!checking) void this.toggleFolderModule(folder, true, around.id);
+        return true;
+      }
+    });
+    this.addCommand({
       id: "toggle-modules",
       name: "\u0413\u0440\u0430\u0444: \u043F\u043E\u043A\u0430\u0437\u0430\u0442\u044C/\u0441\u043A\u0440\u044B\u0442\u044C \u043C\u043E\u0434\u0443\u043B\u0438",
       callback: async () => {
@@ -4549,10 +4782,17 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
             (i) => i.setTitle("\u0412\u044B\u0431\u0440\u0430\u0442\u044C \u0433\u043B\u0430\u0432\u043D\u044B\u0439 \u0444\u0430\u0439\u043B\u2026").setIcon("list-checks").onClick(() => new ChooseIndexModal(this, file).open())
           );
         }
-        const isModule = !!this.modules.findFolderModule(file);
+        const own = this.modules.findFolderModule(file);
+        const isModule = !!own;
         menu.addItem(
           (i) => i.setTitle(isModule ? "\u0423\u0431\u0440\u0430\u0442\u044C \u043C\u043E\u0434\u0443\u043B\u044C \u0433\u0440\u0430\u0444\u0430" : "\u0421\u0434\u0435\u043B\u0430\u0442\u044C \u043C\u043E\u0434\u0443\u043B\u0435\u043C \u0433\u0440\u0430\u0444\u0430").setIcon(isModule ? "circle-off" : "circle-dashed").onClick(() => this.toggleFolderModule(file, !isModule))
         );
+        const around = this.modules.moduleAroundFolder(file);
+        if (around && own?.parent !== around.id) {
+          menu.addItem(
+            (i) => i.setTitle(`\u0421\u0434\u0435\u043B\u0430\u0442\u044C \u043F\u043E\u0434\u043C\u043E\u0434\u0443\u043B\u0435\u043C \xAB${around.name}\xBB`).setIcon("circle-dot").onClick(() => this.toggleFolderModule(file, true, around.id))
+          );
+        }
       })
     );
     this.app.workspace.onLayoutReady(() => {
@@ -4632,7 +4872,7 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
       s.moduleGap,
       s.moduleSize,
       s.modulesEnabled,
-      s.modules.map((m) => [m.id, m.kind, m.value]),
+      s.modules.map((m) => [m.id, m.kind, m.value, m.parent ?? ""]),
       s.layoutMode
     ]);
   }
@@ -4652,10 +4892,11 @@ var FolderHubPlugin = class extends import_obsidian10.Plugin {
       void this.graphTree.syncColorGroups(false, false);
     }, 1e3);
   }
-  async toggleFolderModule(folder, on) {
+  async toggleFolderModule(folder, on, parentId) {
     if (on) {
-      const m = this.modules.addFolderModule(folder);
-      new import_obsidian10.Notice(`\u041C\u043E\u0434\u0443\u043B\u044C \xAB${m.name}\xBB \u0434\u043E\u0431\u0430\u0432\u043B\u0435\u043D \u0432 \u0433\u0440\u0430\u0444`);
+      const m = this.modules.addFolderModule(folder, parentId);
+      const parent = this.modules.parentOf(m.id);
+      new import_obsidian10.Notice(parent ? `\u041F\u043E\u0434\u043C\u043E\u0434\u0443\u043B\u044C \xAB${m.name}\xBB \u0434\u043E\u0431\u0430\u0432\u043B\u0435\u043D \u0432 \u043C\u043E\u0434\u0443\u043B\u044C \xAB${parent.name}\xBB` : `\u041C\u043E\u0434\u0443\u043B\u044C \xAB${m.name}\xBB \u0434\u043E\u0431\u0430\u0432\u043B\u0435\u043D \u0432 \u0433\u0440\u0430\u0444`);
     } else {
       const m = this.modules.findFolderModule(folder);
       if (m) this.modules.remove(m.id);

@@ -13,6 +13,8 @@ export interface ModuleDef {
 	colorNodes: boolean;
 	/** Boundary line; "default" uses the global setting. */
 	line: LineStyle | "default";
+	/** Parent module id: this module is a sub-module drawn inside it (topics/chapters). */
+	parent?: string;
 }
 
 /** Distinct, colour-blind-safe defaults for new modules (cycled). */
@@ -108,13 +110,98 @@ export class GraphModules {
 		// Each note belongs to one module only — the most specific one — so
 		// modules never sit inside each other: a sub-folder module takes its
 		// notes away from the parent folder's module; a tag module wins over folders.
-		const specificity = (m: ModuleDef) => (m.kind === "tag" ? 1000 : normalizePath(m.value || "/").split("/").length);
+		// Sub-modules only take notes that belong to their parent (folder or tag).
+		for (const m of [...this.list].sort((a, b) => this.depth(a.id) - this.depth(b.id))) {
+			const p = this.parentOf(m.id);
+			if (!p) continue;
+			const mine = out.get(m.id);
+			const theirs = out.get(p.id);
+			if (mine && theirs) for (const path of [...mine]) if (!theirs.has(path)) mine.delete(path);
+		}
+		// Deepest in the module tree wins, then the most specific (tag > deeper folder).
+		const specificity = (m: ModuleDef) =>
+			this.depth(m.id) * 10000 + (m.kind === "tag" ? 1000 : normalizePath(m.value || "/").split("/").length);
 		const order = [...this.list].sort((a, b) => specificity(b) - specificity(a));
 		const owner = new Map<string, string>();
 		for (const m of order) for (const path of out.get(m.id) ?? []) if (!owner.has(path)) owner.set(path, m.id);
 		for (const [id, set] of out) for (const path of [...set]) if (owner.get(path) !== id) set.delete(path);
 		this.cache = out;
 		return out;
+	}
+
+	// ------------------------------------------------------- module tree
+
+	/** The parent module, if this is a sub-module (ignores broken or cyclic links). */
+	parentOf(id: string): ModuleDef | undefined {
+		const m = this.list.find((x) => x.id === id);
+		if (!m?.parent) return undefined;
+		const p = this.list.find((x) => x.id === m.parent);
+		if (!p) return undefined;
+		// Guard against cycles (a → b → a): walk up at most list.length steps.
+		let cur: ModuleDef | undefined = p;
+		for (let i = 0; i <= this.list.length && cur; i++) {
+			if (cur.id === id) return undefined;
+			cur = cur.parent ? this.list.find((x) => x.id === cur!.parent) : undefined;
+		}
+		return p;
+	}
+
+	/** 0 for top-level modules, 1 for their sub-modules, … */
+	depth(id: string): number {
+		let d = 0;
+		for (let p = this.parentOf(id); p && d <= this.list.length; p = this.parentOf(p.id)) d++;
+		return d;
+	}
+
+	children(id: string): ModuleDef[] {
+		return this.list.filter((m) => this.parentOf(m.id)?.id === id);
+	}
+
+	/** This module and every module below it. */
+	descendants(id: string): ModuleDef[] {
+		const out: ModuleDef[] = [];
+		const walk = (pid: string) => {
+			for (const c of this.children(pid)) {
+				out.push(c);
+				walk(c.id);
+			}
+		};
+		walk(id);
+		return out;
+	}
+
+	/**
+	 * Notes of a module including those of its sub-modules (what its barrier
+	 * holds). Cached until membership changes — don't modify the returned set.
+	 */
+	allMembers(id: string): Set<string> {
+		const members = this.members();
+		if (this.allFor !== members) {
+			this.allFor = members;
+			this.allCache.clear();
+		}
+		let out = this.allCache.get(id);
+		if (!out) {
+			out = new Set(members.get(id) ?? []);
+			for (const d of this.descendants(id)) for (const p of members.get(d.id) ?? []) out.add(p);
+			this.allCache.set(id, out);
+		}
+		return out;
+	}
+	private allFor: Map<string, Set<string>> | null = null;
+	private allCache = new Map<string, Set<string>>();
+
+	/** Deepest folder module whose folder contains `folder` (candidate parent for a sub-module). */
+	moduleAroundFolder(folder: TFolder): ModuleDef | undefined {
+		let best: ModuleDef | undefined;
+		for (const m of this.list) {
+			if (m.kind !== "folder" || !m.value.trim()) continue;
+			const p = normalizePath(m.value);
+			if (folder.path !== p && folder.path.startsWith(p + "/")) {
+				if (!best || p.length > normalizePath(best.value).length) best = m;
+			}
+		}
+		return best;
 	}
 
 	/** Barrier radius in graph units: grows with the number of notes, plus any widening. */
@@ -179,7 +266,8 @@ export class GraphModules {
 
 	/** Colour groups for modules that paint their nodes, most specific first. */
 	colorGroups(): { query: string; color: string }[] {
-		const depth = (m: ModuleDef) => (m.kind === "folder" ? m.value.split("/").length : 100);
+		// Deeper modules first: a sub-module's colour wins over its parent's.
+		const depth = (m: ModuleDef) => this.depth(m.id) * 1000 + (m.kind === "folder" ? m.value.split("/").length : 100);
 		return this.list
 			.filter((m) => m.colorNodes)
 			.sort((a, b) => depth(b) - depth(a))
@@ -188,9 +276,15 @@ export class GraphModules {
 	}
 
 	/** Creates a module for a folder (or returns the existing one). */
-	addFolderModule(folder: TFolder): ModuleDef {
+	addFolderModule(folder: TFolder, parent?: string): ModuleDef {
 		const existing = this.list.find((m) => m.kind === "folder" && m.value === folder.path);
-		if (existing) return existing;
+		if (existing) {
+			// Never under itself or one of its own sub-modules (that would be a loop).
+			const below = new Set([existing.id, ...this.descendants(existing.id).map((d) => d.id)]);
+			if (parent !== undefined && !(parent && below.has(parent))) existing.parent = parent || undefined;
+			this.invalidate();
+			return existing;
+		}
 		const m: ModuleDef = {
 			id: newModuleId(),
 			name: folder.name,
@@ -199,6 +293,7 @@ export class GraphModules {
 			color: MODULE_COLORS[this.list.length % MODULE_COLORS.length],
 			colorNodes: true,
 			line: "default",
+			parent: parent || undefined,
 		};
 		this.list.push(m);
 		this.invalidate();
@@ -210,7 +305,10 @@ export class GraphModules {
 	}
 
 	remove(id: string) {
-		const i = this.list.findIndex((m) => m.id === id);
+		const m = this.list.find((x) => x.id === id);
+		// Its sub-modules move up one level instead of disappearing.
+		for (const c of this.list) if (c.parent === id) c.parent = m?.parent;
+		const i = this.list.findIndex((x) => x.id === id);
 		if (i >= 0) this.list.splice(i, 1);
 		this.invalidate();
 	}

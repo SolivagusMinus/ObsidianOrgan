@@ -659,14 +659,15 @@ export class GraphTree {
 	private buildSim(r: GraphRenderer, prev: SimState | undefined): SimState {
 		const s = this.plugin.settings;
 		const modules = this.plugin.modules;
-		const members = modules.members();
 		const nodes = r.nodes ?? [];
 		const byId = new Map(nodes.map((n) => [n.id, n]));
 		const median = (v: number[]) => (v.length ? [...v].sort((a, b) => a - b)[v.length >> 1] : 0);
 		const bubbles: Bubble[] = [];
 		const fresh: Bubble[] = [];
+		// Bubbles are top-level modules; a sub-module's notes float in its parent's bubble.
 		for (const m of modules.list) {
-			const ids = [...(members.get(m.id) ?? [])].filter((id) => byId.has(id));
+			if (modules.parentOf(m.id)) continue;
+			const ids = [...modules.allMembers(m.id)].filter((id) => byId.has(id));
 			if (!ids.length) continue;
 			const R = bubbleRadius(ids.length, modules.unit, s.moduleSize);
 			const old = prev?.bubbles.find((b) => b.id === m.id);
@@ -898,6 +899,8 @@ export class GraphTree {
 	 * its shape); otherwise one anchor note (the folder's index note if it is in
 	 * the module) is pinned at the module's place and holding keeps the rest around it.
 	 */
+	private unitChanged = -Infinity;
+
 	private withModules(r: GraphRenderer, base: Map<string, Point>): Map<string, Point> {
 		const s = this.plugin.settings;
 		const modules = this.plugin.modules;
@@ -908,11 +911,17 @@ export class GraphTree {
 		const members = modules.members();
 		const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
 		const pad = this.plugin.modules.unit * 0.6 * s.moduleSize;
-		// Graph scale: median link length (a sample is enough).
+		// Graph scale: median link length (a sample is enough). Links between
+		// different modules don't count — the barriers keep them stretched.
+		const owner = new Map<string, string>();
+		for (const [id, set] of members) for (const p of set) owner.set(p, id);
 		const lens: number[] = [];
 		const links = r.links ?? [];
 		for (let i = 0; i < links.length && lens.length < 400; i += Math.max(1, Math.floor(links.length / 400))) {
 			const l = links[i];
+			const a = l.source.id ? owner.get(l.source.id) : undefined;
+			const b = l.target.id ? owner.get(l.target.id) : undefined;
+			if (a && b && a !== b) continue;
 			const d = Math.hypot(l.source.x - l.target.x, l.source.y - l.target.y);
 			if (Number.isFinite(d) && d > 0) lens.push(d);
 		}
@@ -920,7 +929,19 @@ export class GraphTree {
 			lens.sort((a, b) => a - b);
 			const u = lens[lens.length >> 1];
 			// Follow slowly and only on real change, so the layout doesn't wobble.
-			if (Math.abs(u - modules.unit) / modules.unit > 0.2) modules.unit = Math.max(10, u);
+			// Growing is limited (30 % at a time, not more often than every 10 s):
+			// right after a re-layout links are still stretched, and trusting that
+			// would blow the layout up — which stretches them even more.
+			const now = performance.now();
+			if (Math.abs(u - modules.unit) / modules.unit > 0.2) {
+				if (u < modules.unit || this.unitChanged === -Infinity) {
+					modules.unit = Math.max(10, u);
+					this.unitChanged = now;
+				} else if (now - this.unitChanged > 10000) {
+					modules.unit = Math.min(u, modules.unit * 1.3);
+					this.unitChanged = now;
+				}
+			}
 		}
 		const pos = (id: string): Point => {
 			const p = base.get(id) ?? nodeById.get(id)!;
@@ -929,63 +950,127 @@ export class GraphTree {
 		};
 
 		// Measure each module as it really is: an anchor (its index note) and
-		// how far most of its notes sit from it. Sizes are bucketed in 25 %
-		// steps so the layout is only redone when a cluster really grows/shrinks.
-		const infos: { id: string; ids: string[]; anchor: string; baseC: Point | null; c0: Point; bucket: number }[] = [];
+		// how far most of its notes sit from it. A module's notes include those of
+		// its sub-modules. Sizes are bucketed in 25 % steps so the layout is only
+		// redone when a cluster really grows/shrinks.
+		interface Info {
+			id: string;
+			own: string[];
+			all: string[];
+			anchor: string;
+			baseC: Point | null;
+			c0: Point;
+			extent: number;
+			ownR: number;
+			children: Info[];
+			parent: Info | null;
+			R: number;
+			/** Centre relative to the parent's centre, once arranged inside it. */
+			rel: Point;
+		}
+		const isIndex = (id: string) => {
+			const f = this.app.vault.getAbstractFileByPath(id);
+			return f instanceof TFile && this.plugin.isIndexNote(f);
+		};
+		const median = (v: number[]) => [...v].sort((a, b) => a - b)[v.length >> 1];
+		const infos = new Map<string, Info>();
 		for (const m of modules.list) {
-			const ids = [...(members.get(m.id) ?? [])].filter((id) => nodeById.has(id));
-			if (!ids.length) continue;
-			const anchor =
-				ids.find((id) => {
-					const f = this.app.vault.getAbstractFileByPath(id);
-					return f instanceof TFile && this.plugin.isIndexNote(f);
-				}) ?? ids[0];
-			const pinnedIds = ids.filter((id) => base.has(id));
+			const all = [...modules.allMembers(m.id)].filter((id) => nodeById.has(id));
+			if (!all.length) continue;
+			const own = [...(members.get(m.id) ?? [])].filter((id) => nodeById.has(id));
+			// The anchor is one of the module's OWN notes (never a sub-module's — that
+			// one is pinned by the sub-module). A module made only of sub-modules has
+			// none: they hold it in place.
+			const anchor = own.find(isIndex) ?? own[0] ?? "";
+			const pinnedIds = all.filter((id) => base.has(id));
 			const baseC = pinnedIds.length ? centroid(pinnedIds.map((id) => base.get(id)!)) : null;
 			// Start from where the module's notes actually are (their median), not
-			// from wherever its main file happens to sit: the module then lands where
-			// its notes are drawn anyway and is only shifted enough to clear others.
-			const c0 = baseC ?? {
-				x: ids.map((id) => pos(id).x).sort((a, b) => a - b)[ids.length >> 1],
-				y: ids.map((id) => pos(id).y).sort((a, b) => a - b)[ids.length >> 1],
-			};
-			const dists = ids.map((id) => Math.hypot(pos(id).x - c0.x, pos(id).y - c0.y));
-			let extent = modules.barrierRadius(ids.length, dists);
+			// from wherever its main file happens to sit.
+			const cm = { x: median(all.map((id) => pos(id).x)), y: median(all.map((id) => pos(id).y)) };
+			const c0 = baseC ?? cm;
+			// Size from how the notes are spread around their own middle — not from
+			// how far they still are from where the skill tree is about to put them.
+			const dists = all.map((id) => Math.hypot(pos(id).x - cm.x, pos(id).y - cm.y));
+			let extent = modules.barrierRadius(all.length, dists);
 			// A skill-tree branch is pinned: the barrier must hold all of it.
 			if (baseC) for (const id of pinnedIds) extent = Math.max(extent, Math.hypot(base.get(id)!.x - baseC.x, base.get(id)!.y - baseC.y) + 30);
-			infos.push({ id: m.id, ids, anchor, baseC, c0, bucket: Math.ceil(Math.log(Math.max(20, extent)) / Math.log(1.25)) });
+			// Room for the module's own notes (its main file…) in the middle, so its
+			// sub-modules are arranged around them, not on top of them.
+			const ownR = own.length ? modules.barrierRadius(own.length, own.map((id) => Math.hypot(pos(id).x - cm.x, pos(id).y - cm.y))) * 0.6 : 0;
+			infos.set(m.id, { id: m.id, own, all, anchor, baseC, c0, extent, ownR, children: [], parent: null, R: extent, rel: { x: 0, y: 0 } });
 		}
-		const key = [modules.version, s.moduleSize, s.moduleGap, nodeById.size, infos.map((i) => `${i.id}:${i.bucket}:${i.anchor}`).join(",")].join("|");
+		for (const info of infos.values()) {
+			const p = modules.parentOf(info.id);
+			const pi = p ? infos.get(p.id) : undefined;
+			if (pi) {
+				info.parent = pi;
+				pi.children.push(info);
+			}
+		}
+		const quant = (r: number) => Math.pow(1.25, Math.ceil(Math.log(Math.max(20, r)) / Math.log(1.25)));
+		// Bottom-up: arrange sub-modules inside their parent without overlaps; the
+		// parent grows so that all of them fit.
+		const arrange = (info: Info) => {
+			for (const c of info.children) arrange(c);
+			let R = info.extent;
+			if (info.children.length) {
+				const inner = pad * 0.5;
+				const circles: (Circle & { c: Info | null })[] = info.children.map((c) => ({ x: c.c0.x, y: c.c0.y, r: c.R + inner, c }));
+				// The parent's own notes keep the middle.
+				const middle = info.ownR ? { x: info.c0.x, y: info.c0.y, r: info.ownR, c: null } : null;
+				if (middle) circles.push(middle);
+				// Siblings never overlap (with the skill tree each one's branch moves
+				// along with it, keeping its shape).
+				separateCircles(circles, s.moduleGap * 0.5);
+				const o = middle ?? info.c0;
+				for (const k of circles) {
+					if (!k.c) continue;
+					k.c.rel = { x: k.x - o.x, y: k.y - o.y };
+					R = Math.max(R, Math.hypot(k.c.rel.x, k.c.rel.y) + k.r + inner);
+				}
+			}
+			info.R = quant(R);
+		};
+		const roots = [...infos.values()].filter((i) => !i.parent);
+		roots.forEach(arrange);
+
+		const key = [
+			modules.version, s.moduleSize, s.moduleGap, nodeById.size,
+			[...infos.values()].map((i) => `${i.id}:${Math.round(i.R)}:${i.anchor}:${i.parent?.id ?? ""}`).join(","),
+		].join("|");
 		if (this.modLayout && this.modLayout.key === key && this.modLayout.base === base) return this.modLayout.target;
 
-		const circles: (Circle & { info: (typeof infos)[number] })[] = infos.map((info) => {
+		// Top level: push modules apart; sub-modules travel with their parent.
+		const circles = roots.map((info) => {
 			const start = modules.centers.get(info.id) ?? info.c0;
-			return { x: start.x, y: start.y, r: Math.pow(1.25, info.bucket) + pad, info };
+			return { x: start.x, y: start.y, r: info.R + pad, info };
 		});
 		separateCircles(circles, s.moduleGap);
 
 		// Only anchors move: one pinned note per module (or the module's skill
-		// branch as a whole). The rest of the module follows through its links
-		// to the index note and keeps floating freely.
+		// branch as a whole). The rest follows through its links and floats.
 		const target = new Map(base);
 		const alive = new Set<string>();
 		this.moduleAnchors.clear();
-		for (const c of circles) {
-			const { info } = c;
+		const place = (info: Info, x: number, y: number) => {
 			alive.add(info.id);
-			this.moduleAnchors.set(info.id, info.anchor);
-			modules.centers.set(info.id, { x: c.x, y: c.y, hold: c.r - pad });
+			if (info.anchor) this.moduleAnchors.set(info.id, info.anchor);
+			modules.centers.set(info.id, { x, y, hold: info.R });
 			if (info.baseC) {
-				const dx = c.x - info.baseC.x;
-				const dy = c.y - info.baseC.y;
-				for (const id of info.ids) {
+				// Skill tree: the module's own part of the branch moves as one (its
+				// sub-modules' parts move with them, by their own shift).
+				const dx = x - info.c0.x;
+				const dy = y - info.c0.y;
+				for (const id of info.own) {
 					const p = base.get(id);
 					if (p) target.set(id, { x: p.x + dx, y: p.y + dy });
 				}
-			} else {
-				target.set(info.anchor, { x: c.x, y: c.y });
+			} else if (info.anchor) {
+				target.set(info.anchor, { x, y });
 			}
-		}
+			for (const c of info.children) place(c, x + c.rel.x, y + c.rel.y);
+		};
+		for (const c of circles) place(c.info, c.x, c.y);
 		for (const id of [...modules.centers.keys()]) if (!alive.has(id)) modules.centers.delete(id);
 		this.modLayout = { key, base, target };
 		return target;
@@ -1049,15 +1134,19 @@ export class GraphTree {
 			const pad = this.plugin.modules.unit * 0.6 * s.moduleSize;
 
 			// Each module's barrier: its bubble, the reserved place, or around its notes.
-			const walls: { id: string; x: number; y: number; R: number }[] = [];
-			if (bubbles) for (const b of bubbles) walls.push({ id: b.id, x: b.x, y: b.y, R: b.R });
+			const walls: { id: string; x: number; y: number; R: number; pad: number; depth: number }[] = [];
+			if (bubbles) for (const b of bubbles) walls.push({ id: b.id, x: b.x, y: b.y, R: b.R, pad, depth: 0 });
 			for (const m of bubbles ? [] : modules.list) {
+				const depth = modules.depth(m.id);
+				// Sub-modules sit inside their parent: a thinner margin around them.
+				const wpad = depth ? pad * 0.5 : pad;
 				const placed = s.moduleSeparate ? modules.centers.get(m.id) : undefined;
 				if (placed?.hold) {
-					walls.push({ id: m.id, x: placed.x, y: placed.y, R: placed.hold });
+					walls.push({ id: m.id, x: placed.x, y: placed.y, R: placed.hold, pad: wpad, depth });
 					continue;
 				}
-				const set = members.get(m.id);
+				// A module's barrier holds its sub-modules' notes too.
+				const set = modules.allMembers(m.id);
 				const nodes = set?.size ? r.nodes.filter((n) => set.has(n.id) && Number.isFinite(n.x)) : [];
 				if (!nodes.length) continue;
 				// After a sort the module's anchor (its pinned main file) is its centre.
@@ -1065,9 +1154,23 @@ export class GraphTree {
 				const ap = anchorId ? anchors?.get(anchorId) : undefined;
 				const x = ap?.x ?? median(nodes.map((n) => n.x));
 				const y = ap?.y ?? median(nodes.map((n) => n.y));
-				walls.push({ id: m.id, x, y, R: modules.barrierRadius(nodes.length, nodes.map((n) => Math.hypot(n.x - x, n.y - y))) });
+				walls.push({ id: m.id, x, y, R: modules.barrierRadius(nodes.length, nodes.map((n) => Math.hypot(n.x - x, n.y - y))), pad: wpad, depth });
 			}
 			if (!walls.length) continue;
+			// Outer barriers first: a stranger is pushed out of the whole module, not
+			// just out of one of its chapters.
+			walls.sort((a, b) => a.depth - b.depth);
+			// A note's own module and the modules around it (its parents) are "home".
+			const homeChain = new Map<string, Set<string>>();
+			const chainOf = (own: string) => {
+				let c = homeChain.get(own);
+				if (!c) {
+					c = new Set([own]);
+					for (let p = modules.parentOf(own); p && c.size <= modules.list.length; p = modules.parentOf(p.id)) c.add(p.id);
+					homeChain.set(own, c);
+				}
+				return c;
+			};
 
 			const resting = this.resting.get(r) ?? new Set<string>();
 			this.resting.set(r, resting);
@@ -1079,8 +1182,24 @@ export class GraphTree {
 			}
 			const fixes: { id: string; x: number; y: number; depth: number }[] = [];
 			for (const n of r.nodes) {
-				if (pinned?.has(n.id) || frozen?.has(n.id) || resting.has(n.id) || !Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
 				const own = owner.get(n.id);
+				// A note resting at its module's wall stays only while that wall is
+				// still there: if the module moved away (pushed by a neighbour), let
+				// it go so it is put back inside on the next tick.
+				// (Only where the wall would pull it back in — otherwise it would be
+				// released and caught again over and over.)
+				if (resting.has(n.id) && own && !pinned?.has(n.id) && !bubbles && (membersRule || !linked.has(n.id) || (memberCount.get(own) ?? 0) < 6)) {
+					const home = walls.find((w) => w.id === own);
+					// Where it was put to rest (the node's own x/y lag behind the physics worker).
+					const at = this.restAt.get(n.id);
+					if (home && at && Math.hypot(at.x - home.x, at.y - home.y) > home.R * 1.1) {
+						resting.delete(n.id);
+						this.restAt.delete(n.id);
+						this.unpin(r, n.id);
+						continue;
+					}
+				}
+				if (pinned?.has(n.id) || frozen?.has(n.id) || resting.has(n.id) || !Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
 				// Own wall first: a member outside its module goes back in.
 				const orphan = !linked.has(n.id);
 				// Small modules (a few notes) keep all their notes with them; otherwise
@@ -1103,15 +1222,17 @@ export class GraphTree {
 					}
 				}
 				if (!outsidersRule) continue;
-				// Then other modules' walls: nobody else gets in.
+				// Then other modules' walls: nobody else gets in (its own module and the
+				// modules around it don't count — a chapter's note lives in its book).
+				const chain = own ? chainOf(own) : undefined;
 				for (const w of walls) {
-					if (w.id === own) continue;
+					if (chain?.has(w.id)) continue;
 					const dx = n.x - w.x;
 					const dy = n.y - w.y;
 					const d = Math.hypot(dx, dy) || 0.001;
-					if (d < (w.R + pad) * 0.95) {
-						const k = (w.R + pad + 10) / d;
-						fixes.push({ id: n.id, x: w.x + dx * k, y: w.y + dy * k, depth: w.R + pad - d });
+					if (d < (w.R + w.pad) * 0.95) {
+						const k = (w.R + w.pad + 10) / d;
+						fixes.push({ id: n.id, x: w.x + dx * k, y: w.y + dy * k, depth: w.R + w.pad - d });
 						break;
 					}
 				}
@@ -1132,8 +1253,10 @@ export class GraphTree {
 				this.wallHits.set(f.id, hits);
 				const rest = settle || hits.length >= 3;
 				this.pin(r, f.id, f.x, f.y, rest ? Math.max(wake, 0.02) : wake);
-				if (rest) resting.add(f.id);
-				else release.add(f.id);
+				if (rest) {
+					resting.add(f.id);
+					this.restAt.set(f.id, { x: f.x, y: f.y });
+				} else release.add(f.id);
 			}
 			if (nudge) {
 				this.lastNudge.set(r, now);
@@ -1143,6 +1266,8 @@ export class GraphTree {
 	}
 
 	private slimeFrame = 0;
+	/** Where each resting note was pinned. */
+	private restAt = new Map<string, Point>();
 	/** When each note was last corrected by a wall (to calm notes that keep hitting it). */
 	private wallHits = new Map<string, number[]>();
 	/** Smoothed module sizes for collisions, so jittering notes don't shake the modules. */
@@ -1165,53 +1290,92 @@ export class GraphTree {
 		const buttonMode = s.layoutMode === "button";
 		const anchors = buttonMode ? this.kept.get(r) : this.sent.get(r);
 		if (!anchors?.size) return;
-		const members = modules.members();
 		const pad = modules.unit * 0.6 * s.moduleSize;
 		const nodeById = new Map(r.nodes.map((n) => [n.id, n]));
-		const circles: (Circle & { aid: string; mid: string; ox: number; oy: number })[] = [];
+		type SC = Circle & { aid: string; mid: string; ox: number; oy: number; parent?: string; depth: number };
+		const circles: SC[] = [];
 		for (const [mid, aid] of this.moduleAnchors) {
 			const p = anchors.get(aid);
-			const set = members.get(mid);
-			if (!p || !set) continue;
+			if (!p) continue;
+			// A module is as big as all its notes, its sub-modules' included.
+			const set = modules.allMembers(mid);
 			const dists: number[] = [];
 			for (const id of set) {
 				const n = nodeById.get(id);
 				if (n && Number.isFinite(n.x) && Number.isFinite(n.y)) dists.push(Math.hypot(n.x - p.x, n.y - p.y));
 			}
 			if (!dists.length) continue;
-			const raw = modules.barrierRadius(dists.length, dists) + pad;
+			const depth = modules.depth(mid);
+			const raw = modules.barrierRadius(dists.length, dists) + (depth ? pad * 0.5 : pad);
 			const prev = this.slimeRadius.get(mid);
-			const rad = prev === undefined ? raw : prev + (raw - prev) * 0.2;
+			let rad = prev === undefined ? raw : prev + (raw - prev) * 0.2;
 			this.slimeRadius.set(mid, rad);
-			circles.push({ x: p.x, y: p.y, r: rad, aid, mid, ox: p.x, oy: p.y });
+			// Never smaller than the place the layout reserved for it, so this
+			// doesn't squeeze sub-modules the layout had put side by side.
+			const placed = modules.centers.get(mid);
+			if (placed?.hold) rad = Math.max(rad, placed.hold + (depth ? pad * 0.5 : pad));
+			circles.push({ x: p.x, y: p.y, r: rad, aid, mid, ox: p.x, oy: p.y, parent: modules.parentOf(mid)?.id, depth });
 		}
+		// Only siblings collide: top-level modules with each other, sub-modules
+		// with the other sub-modules of the same parent (inside it).
+		const groups = new Map<string, SC[]>();
+		for (const c of circles) {
+			const k = c.parent ?? "";
+			const g = groups.get(k);
+			if (g) g.push(c);
+			else groups.set(k, [c]);
+		}
+		const gapOf = (parent: string) => (parent ? s.moduleGap * 0.5 : s.moduleGap);
 		// Calm: a push at most every 1.2 s, and give up after a dozen in a row
 		// (something keeps pulling the modules together) until the layout changes.
 		const now = performance.now();
 		if (now - this.lastSlimePush < 1200 || this.slimeBudget <= 0) return;
+		// With the skill tree kept pinned ("always"), branches keep their shape:
+		// only top-level modules move, each with its whole branch.
+		const treeMode = !buttonMode && s.skillTreeEnabled;
 		let overlap = false;
-		for (let i = 0; i < circles.length && !overlap; i++) {
-			for (let j = i + 1; j < circles.length; j++) {
-				const a = circles[i];
-				const b = circles[j];
-				if (Math.hypot(a.x - b.x, a.y - b.y) < (a.r + b.r + s.moduleGap) * 0.92) {
-					overlap = true;
-					break;
+		for (const [k, g] of groups) {
+			for (let i = 0; i < g.length && !overlap; i++) {
+				for (let j = i + 1; j < g.length; j++) {
+					if (Math.hypot(g[i].x - g[j].x, g[i].y - g[j].y) < (g[i].r + g[j].r + gapOf(k)) * 0.92) {
+						overlap = true;
+						break;
+					}
 				}
 			}
+			if (overlap) break;
 		}
 		if (!overlap) return;
-		separateCircles(circles, s.moduleGap, 40);
+		const byId = new Map(circles.map((c) => [c.mid, c]));
+		// Top-down: a parent's shove carries its sub-modules along, then siblings
+		// are separated. (A parent's barrier wraps around its sub-modules, so they
+		// aren't squeezed to fit inside it.)
+		const keys = [...groups.keys()].sort((a, b) => (a ? modules.depth(a) + 1 : 0) - (b ? modules.depth(b) + 1 : 0));
+		for (const k of keys) {
+			const g = groups.get(k)!;
+			const parent = k ? byId.get(k) : undefined;
+			if (parent) {
+				const sx = parent.x - parent.ox;
+				const sy = parent.y - parent.oy;
+				for (const c of g) {
+					c.x += sx;
+					c.y += sy;
+				}
+			}
+			separateCircles(g, gapOf(k), 40);
+		}
 		let moved = false;
+		const own = modules.members();
 		for (const c of circles) {
 			const dx = c.x - c.ox;
 			const dy = c.y - c.oy;
 			if (Math.hypot(dx, dy) < 1) continue;
-			// Springy: cover a third of the way each tick. With the skill tree kept
-			// pinned ("always"), the module's whole branch moves, keeping its shape.
+			// Springy: cover a third of the way each tick.
 			const sx = dx * 0.35;
 			const sy = dy * 0.35;
-			const ids = !buttonMode && s.skillTreeEnabled ? [...(members.get(c.mid) ?? [])].filter((id) => anchors.has(id)) : [c.aid];
+			// With the skill tree pinned, the module's own part of its branch moves
+			// (its sub-modules' parts move by their own shift, which includes this one).
+			const ids = treeMode ? [...(own.get(c.mid) ?? [])].filter((id) => anchors.has(id)) : [c.aid];
 			for (const id of ids) {
 				const old = anchors.get(id)!;
 				const p = { x: old.x + sx, y: old.y + sy };

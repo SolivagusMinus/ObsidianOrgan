@@ -366,3 +366,74 @@ test("bubbles: without drift everything comes to rest", () => {
 	assert.ok(move < 0.05, `at rest (${move})`);
 	assert.ok(bubbleRadius(100, 60) > bubbleRadius(4, 60));
 });
+
+// ---- module tree (sub-modules)
+import { GraphModules, ModuleDef } from "../src/modules";
+
+function modulesWith(defs: Partial<ModuleDef>[], paths: string[], tags: Record<string, string[]> = {}) {
+	const files = paths.map((path) => ({ path, extension: "md" }));
+	const list = defs.map((d, i) => ({ id: `m${i}`, name: `M${i}`, kind: "folder", value: "", color: "#000", colorNodes: false, line: "default", ...d })) as ModuleDef[];
+	const plugin = {
+		settings: { modules: list, moduleSize: 1 },
+		app: {
+			vault: { getFiles: () => files },
+			metadataCache: { getFileCache: (f: { path: string }) => ({ tags: tags[f.path] ?? [] }), unresolvedLinks: {} },
+		},
+	};
+	return { gm: new GraphModules(plugin as never), list };
+}
+
+test("sub-modules: a note belongs to the deepest module, the parent holds them all", () => {
+	const { gm } = modulesWith(
+		[
+			{ id: "book", value: "Book" },
+			{ id: "ch1", value: "Book/Ch1", parent: "book" },
+			{ id: "ch2", value: "Book/Ch2", parent: "book" },
+			{ id: "t21", value: "Book/Ch2/T1", parent: "ch2" },
+		],
+		["Book/Book.md", "Book/Ch1/a.md", "Book/Ch1/b.md", "Book/Ch2/c.md", "Book/Ch2/T1/d.md", "Other/x.md"],
+	);
+	const m = gm.members();
+	assert.deepEqual([...m.get("book")!], ["Book/Book.md"]);
+	assert.deepEqual([...m.get("ch1")!].sort(), ["Book/Ch1/a.md", "Book/Ch1/b.md"]);
+	assert.deepEqual([...m.get("ch2")!], ["Book/Ch2/c.md"]);
+	assert.deepEqual([...m.get("t21")!], ["Book/Ch2/T1/d.md"]);
+	assert.equal(gm.allMembers("book").size, 5);
+	assert.equal(gm.allMembers("ch2").size, 2);
+	assert.equal(gm.depth("t21"), 2);
+	assert.deepEqual(gm.children("book").map((c) => c.id), ["ch1", "ch2"]);
+	assert.deepEqual(gm.descendants("book").map((c) => c.id).sort(), ["ch1", "ch2", "t21"]);
+});
+
+test("sub-modules: a tag sub-module only takes its parent's notes", () => {
+	const { gm } = modulesWith(
+		[
+			{ id: "book", value: "Book" },
+			{ id: "hard", kind: "tag", value: "hard", parent: "book" },
+		],
+		["Book/a.md", "Book/b.md", "Elsewhere/c.md"],
+		{ "Book/a.md": ["#hard"], "Elsewhere/c.md": ["#hard"] },
+	);
+	const m = gm.members();
+	assert.deepEqual([...m.get("hard")!], ["Book/a.md"]);
+	assert.deepEqual([...m.get("book")!], ["Book/b.md"]);
+});
+
+test("sub-modules: loops are ignored, removing a parent lifts its children", () => {
+	const { gm, list } = modulesWith(
+		[
+			{ id: "a", value: "A", parent: "b" },
+			{ id: "b", value: "A/B", parent: "a" },
+			{ id: "top", value: "T" },
+			{ id: "mid", value: "T/M", parent: "top" },
+			{ id: "low", value: "T/M/L", parent: "mid" },
+		],
+		["A/x.md", "A/B/y.md", "T/M/L/z.md"],
+	);
+	assert.equal(gm.parentOf("a"), undefined);
+	assert.equal(gm.parentOf("b"), undefined);
+	assert.deepEqual([...gm.members().get("b")!], ["A/B/y.md"]);
+	gm.remove("mid");
+	assert.equal(list.find((m) => m.id === "low")!.parent, "top");
+	assert.deepEqual([...gm.allMembers("top")], ["T/M/L/z.md"]);
+});
